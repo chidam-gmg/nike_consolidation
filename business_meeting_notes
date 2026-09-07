@@ -1,0 +1,154 @@
+Consolidation
+1. store to store
+2. dc to store -- why is this consolidation -- but thats ok its just naming
+
+Current Process:
+
+1. starting point is atp
+2. site master -- store grade at category  -- check if we need to create -- can take this as input too
+3. store grading is at business category -- modified
+4. in process -- where its downloaded  -- sto creation 14 days -- 
+5. 4 weeks sales -- check if to include ecom & marketplace
+6. check apo at generic level so no replenishment happens 
+7. 14 days sale using ros
+8. flexibility to choose which season to be part of -- nfs / prime door  --- what seasons to be included for consolidation & replenishment -- tbd with category heads
+9. store capacity -- that will be the upper cap for movement
+10. 
+
+
+Data needed
+1. ATP - store X articel level - Time refreshed -   anji from bw to databricks -- sap_gmg_datalake.bronze.atp_detail 
+2. Site master -- prod_mena.gold.mena_sports_store_master_view
+3. Article master -- prod_mena.gold.mena_sports_product_master_view
+4. item level Sales data (pos) -- mena_gold_catalog.d365.mena_sports_sales_view
+5. item level Sales data (sap) -- sap_gmg_datalake.silver.fct_sap_sales_detail_v
+
+6. Intransit data -- 
+select * from prod_mena.silver.combined_inventory
+where stock_type ='sports' and stor_loc = '' and date = current_date()-->> this will give intransit
+
+7. Auto pull out (APO) data
+8. Store capacity - not included in calculation but good to have - from business -- park it later
+9. full size definition - from business
+10. pricing -- markdown / full price -- prod_mena.gold.sports_retail_prices
+11. GRN information
+
+
+Proposed Simple logic:
+
+1. Define cover at store X article level -- 
+2. check which article X store has slow moving or dead stock
+3. check if that article is moving in other stores and has better probability to sell
+4. Check conditions for moving stocks 
+5. ensure sufficient cover is there at donor store if there is some sales
+
+Business constraints
+1. ensure full size curve is maintained at stores
+2. Cover of more than 30 days is slow moving
+3. Ensure first grn to store is atleast 14 days from current date else flag as new_to_store and dont consider for computation
+4. Ensure article and its generic (parent) is not part of pullout for the receiving store
+5. 
+
+
+Other tables:
+1. Sto table -- planning_solution.replenishment.sto_table
+2. Inbound table -- planning_solution.replenishment.ibd_table
+3. Outbound table -- planning_solution.replenishment.obd_table
+
+data needed from business:
+1. whats the lead time ?
+2. movement cost
+3. 
+
+
+Mapping files to be maintained
+1. Brand mapping -- to filter articles  --- share the brand list - from nidhin
+2. category converter -- get from nidhin  -- ongoing maintenance
+3. full size vs cut size definition
+
+
+clarification
+1. scope
+2. ongoing maintenance -- mapping & category converter
+3. 
+
+
+
+23-07-2026
+Store priority to decide:
+1. if receiving store is a priority store -- then donor should give all stock even if it means the donor cover drops to zero  -- in case its less 7 days cover on donor store and receiving store is of higher priority
+2. 2 actions from consolidation --- move to store or move back to dc (apo)
+3. right now keep as is ---- later feasibility to add APO 
+4. in case of generic level size moving -- what will happen if receving store has more stock in other sizes?
+5. add article description (name ) in the tables
+6. check nike airforce article - nkcw2288-111 check in other tab
+7. check nike dalma allocation --- it has allocated the -- if possible move from 1 store 
+8. show intransit and atp separate in table 
+9. only atp need to be considered and not intransit
+10. add apo -- at generic X store level in the tables
+11. 
+
+
+
+
+24-07-2026
+1. if donor store results in less than full size then send all the sizes (including fringe sizes)--- check if any other receiving store needs other sizes or send all sizes to the identified receiving stores.. if nothing is feasible mark the movement as held - check donor & receiver size curve post movement -- NKCW5190-010, NKAO0664-222
+2. NKfq2989-013 --- receiver atp is incorrect -- it needs to sum from all the donors and not at row level
+3. b & C doors to have less than 1 threshold compared to A & A+ doors for size curve definition --- eg if greater than 3 is threshold for A+ door, it should be greater than 2 for other grade stores
+4. add article level filter in held & not moved tabs
+5. see if we can export all articles in held & not moved table --  -- currently only 5k lines
+6. double check store list --- converse is sss -- verify store master column
+
+
+28-07-2026
+1. Division -- footwear , apparel, accesories  -- to the export -- done
+2. add generic ros -- to the export -- done
+3. NKIM0693-45102 -- this size is not present in the 1172 store -- and has ros -- but not present in recommended moves -- there are stores with dead stock but still not moved
+4. NKIO4160-323 -- 1172 is not filled for Large for 1172 -- because atp is 0 -- so its never picking it -- but has ros -- fundamental thing -- if present in warehouse not recommend since this is only consolidation - but if not present in warehouse then its a clear demand that current logic is missing
+5. Extending above scenario, if article is not present in warehouse and has no ros -- move if its current season to A+ doors from other doors to make it full size
+6. intransit to be considered for receiving the store -- but not for the donor stores 
+7. check stores which are not active -- check with anji
+
+
+
+NKCW2288-111
+
+
+28-07-2026 -- evening
+
+1. NKIM0693-45102 --- should fulfill till atp is there --- two transfer triggering one for A+ cover & other for oos demand
+2. remove season - store constraint 
+3.  2D22 -- ksa warehouse -- to saudi stores
+
+
+make changes to the definition text alon and no code changes
+In-transit — units on the way to the store (latest snapshot). Shown for context only — NOT used in any calculation.  -- change this definition to say that its used in receiving store
+Season-freshness rule — listed stores may only receive current-or-newer seasons (premium stores: current season only; others: current + one season back). Stores not on the list accept any season. Keeps stale stock out of fresh doors. -- remove this
+ 
+
+
+
+NKfq2989-013
+NKIM0693-45102
+NKIO4160-323 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

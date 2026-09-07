@@ -1,0 +1,27 @@
+# --- standard excludes (added on git init) ---
+# OS / editor
+.DS_Store
+._*
+Thumbs.db
+# Office lock/temp files
+~$*
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# Node
+node_modules/
+# Secrets / local config
+.env
+.env.*
+*.key
+credentials/
+.databricks/
+.claude/settings.local.json
+# Large PowerBI binaries & caches (exceed GitHub 100MB limit)
+*.pbix
+*.abf
+.pbi/

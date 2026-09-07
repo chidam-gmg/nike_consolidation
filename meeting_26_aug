@@ -1,0 +1,6 @@
+meeting -- 26 aug
+1. receiver store -- check if receiver has more than threshold then transfer.. for excess transfer keep 1 unit to cover for full size and transfer rest as per recommendation
+2. double check on what all distribution channel included in the sales query
+3. keep a blanket number -- if recommended qty is > 3 -- cap at 3 -- park this for replenishment
+4. available sizes post movement -- add two columns to export
+5. 

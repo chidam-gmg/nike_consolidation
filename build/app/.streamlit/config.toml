@@ -1,0 +1,12 @@
+# GMG Brand Book V6 — INFORM end. Forces light mode + brand palette so Streamlit's native
+# widgets (inputs, buttons, tiles) render on-brand instead of the default dark/red theme.
+[theme]
+base = "light"
+primaryColor = "#2658F2"              # Cobalt — primary CTA (Run), accents
+backgroundColor = "#FFFFFF"           # Bright White — canvas
+secondaryBackgroundColor = "#E9EFEF"  # Light Silver — inputs, tiles, table zebra
+textColor = "#20274C"                 # Sapphire — text, headings
+font = "sans serif"
+
+[server]
+headless = true

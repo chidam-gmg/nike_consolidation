@@ -1,0 +1,107 @@
+
+Table 1 :
+sap_gmg_datalake.bronze.atp_detail
+
+Description : Contains the atp (available to promise) data for the sports business. This is Stock on hand minus all soft reservations -- the atp is the quantity that can be sold to customer at any point
+
+storage location - SL01 = sellable location
+product_size = '-' represents 0.5
+unit_cost_aed - all aed converted cost -- use this column
+unit_cost - local currency (store currency)
+
+
+
+Column details :
+
+Table 2 : 
+prod_mena.gold.mena_sports_store_master_view
+
+/BIC/ZBU --- business unit
+PLANTCAT - A=store ; B=warehouse
+/BIC/ZCH_CL_GR - store grading
+
+
+Description : Contains the store master
+
+Table 3 :
+prod_mena.gold.mena_sports_product_master_view
+
+Description : Contains the article master
+
+
+RT_SIZE - size column
+RT_SEAYR - current season year
+RF_SEASON - current season
+
+/BIC/ZCHSEASYR -- original season year
+/BIC/ZCHSEASON -- original season 
+
+MATL_CAT : 00 = single article -- eg equipment
+01= generic article -- parent article
+02 = variant article -- child article
+RT_CONFMAT - generic artilce
+MATERIAL - variant article
+BASE_UOM - ST is unit (piece)
+
+
+
+Table 4 :
+mena_gold_catalog.d365.mena_sports_sales_view
+ 
+Description : Contains item level Sales data from Point of sales (D365) system
+
+RECEIPTNUMBER : join key between sap & pos
+
+ 
+Table 5 : 
+sap_gmg_datalake.silver.fct_sap_sales_detail_v
+
+Description : Contains item level Sales data from SAP system
+
+
+Table 6 :
+
+prod_mena.silver.combined_inventory
+
+Description : Contains Intransit data - stock_type ='sports' and stor_loc = '' and date = current_date() use this as filter to get intransit
+
+
+Table 7 :
+
+planning_solution.replenishment.sto_table
+
+Description : Stock Transfer Order (STO) header/lines - the PRIMARY transfer table. One STO can have many lines
+(one per article). Trace the full journey source -> destination via sto_number across obd_table (outbound)
+and ibd_table (inbound).
+
+sto_number - the STO id (join key to obd_table / ibd_table)
+created_date - STO create date, STRING format YYYYMMDD (e.g. '20260806')
+transfer_type - SAP transfer type code (ZICT / ZIAP = store-to-store; ZICR/ZTLT/ZCCR/ZIPT = DC->store replenishment; etc.)
+source_location - sending site (PLANT)   |   destination_location - receiving site (PLANT)
+article - variant article   |   sto_qty - qty requested on the line
+obd_status / ibd_status - roll-up status of the outbound / inbound leg (Completed / ...)
+
+STORE-TO-STORE TRANSFERS = source_location AND destination_location are BOTH PLANTCAT='A' stores
+(join both to Table 2 store master). Both PLANTCAT='B' or B->A = warehouse/DC replenishment (exclude for
+store-to-store). No cost column - approximate value via atp_detail.unit_cost_aed joined on article.
+
+
+Table 8 :
+
+planning_solution.replenishment.obd_table
+
+Description : OUTBOUND delivery details for an STO (pick / pack / PGI = dispatch). Join to Table 7 on sto_number (+ sto_line_number).
+
+obd_number - outbound delivery id   |   obd_created_date (DATE)   |   obd_qty   |   obd_status ('C' = completed)
+pick_pack_plan_timestamp / pick_pack_completion_timestamp / pgi_timestamp - PGI = Post Goods Issue = stock dispatched from source
+
+
+Table 9 :
+
+planning_solution.replenishment.ibd_table
+
+Description : INBOUND delivery details for an STO (goods receipt at destination). Join to Table 7 on sto_number (+ sto_line_number).
+
+ibd_number - inbound delivery id   |   ibd_created_date (DATE)   |   ibd_qty   |   ibd_status
+grn_qty - qty actually received (GRN)   |   grn_timestamp - Goods Receipt time at destination (transfer complete)
+
