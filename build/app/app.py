@@ -6,6 +6,7 @@ GMG Brand Book V6, INFORM end: Sapphire #20274C, Cobalt #2658F2, Light Silver #E
 Burnt Copper #B15940. Economics columns are PROVISIONAL (movement cost / probability-to-sell pending).
 """
 import io
+import os
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -13,6 +14,11 @@ import pandas as pd
 import streamlit as st
 
 import databricks_io as dbio
+import agent_view
+
+# DEV preview (separate Databricks app, APP_MODE=dev): read-only — no runs, no config writes, so it can sit on
+# live data without ever touching the shared config tables or triggering the production job.
+DEV = os.environ.get("APP_MODE", "").strip().lower() == "dev"
 
 
 def human_ts(iso: str) -> str:
@@ -51,6 +57,17 @@ def get_brands(computed_at: str, run_id=None):
         return dbio.load_brands(run_id=run_id)
     except Exception:
         return []
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def get_agent_runs():
+    """Recent job runs with task timings (short TTL: the board should follow new runs)."""
+    return dbio.agent_job_runs(30)
+
+
+@st.cache_data(show_spinner=False)
+def get_agent_metrics(run_id=None, computed_at: str = ""):
+    return dbio.agent_run_metrics(run_id)
 
 
 @st.cache_data(show_spinner=False)
@@ -169,6 +186,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if DEV:
+    st.warning("DEV PREVIEW — read-only copy on live data. Running the engine and config uploads are disabled here.")
+
 # ATP freshness stamp — snapshot the run used + when that snapshot was loaded upstream (etl_timetsamp)
 try:
     _atp = dbio.load_atp_info()
@@ -240,14 +260,14 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                "no upload needed. The active store list, size-curve and BU-eligibility can be replaced below.")
     uc = st.columns(3)
     up_size = uc[0].file_uploader(
-        "Full / cut-size definition", type="csv", key="up_size",
+        "Full / cut-size definition", type="csv", key="up_size", disabled=DEV,
         help="CSV, one row per key size, headers: division, ah2_description, gender, size, threshold — ALL genders "
              "incl. KIDS in one file. Adult: one ladder per division / ah2 / gender (adult apparel ah2 = APPAREL). "
              "KIDS: ah2 = sub-category (e.g. HOODIES, SANDALS); the ladder is sub-category + age band (from the "
              "kids size → age band mapping below). A store×style is FULL size when its in-stock key sizes > threshold. "
              "The upload REPLACES the whole definition, so download the current one, edit it, and re-upload the full file.")
-    up_bu = uc[1].file_uploader("BU-eligibility matrix", type="csv", key="up_bu")
-    up_stores = uc[2].file_uploader("Active store list (grades)", type=["csv", "xlsx"], key="up_stores")
+    up_bu = uc[1].file_uploader("BU-eligibility matrix", type="csv", key="up_bu", disabled=DEV)
+    up_stores = uc[2].file_uploader("Active store list (grades)", type=["csv", "xlsx"], key="up_stores", disabled=DEV)
 
     # full/cut-size definition: download the current one; validate any upload BEFORE it can replace the live table
     _sc_live, size_df, size_err = None, None, False
@@ -260,7 +280,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
         uc[0].caption("Current definition unavailable (sign-in/consent may be needed).")
     # kids size -> age band (id1) mapping: resolves which kids ladder a size belongs to (download / upload)
     up_bands = uc[0].file_uploader(
-        "Kids size → age band (id1)", type="csv", key="up_bands",
+        "Kids size → age band (id1)", type="csv", key="up_bands", disabled=DEV,
         help="CSV, headers: size, id1 — one row per kids size and age band (e.g. 2T,l · 1C,CRIB · 1C,T). A size may "
              "sit in several bands; each style is placed in the band that best fits its size range. "
              "The upload REPLACES the whole mapping.")
@@ -353,7 +373,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
             "Categories to run", _run_cat_opts, key="run_categories", placeholder="All categories",
             help="Scope THIS run to selected business categories (e.g. FOOTBALL). Empty = all categories. "
                  "Moves, replenishment, held and not-moved are all limited to these categories.")
-        if rc[2].button("↺ Reset store list to baseline", key="reset_stores", use_container_width=True):
+        if rc[2].button("↺ Reset store list to baseline", key="reset_stores", use_container_width=True, disabled=DEV):
             try:
                 n = dbio.reset_store_grades_to_baseline()
                 st.success(f"Store list reset to governed baseline ({n} stores)."); st.rerun()
@@ -363,7 +383,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
     running = ss.run_state == "running"
     if size_err:
         st.error("Run is disabled until the size-definition / kids age-band file is fixed (or removed from the uploader).")
-    if st.button("▶ Run stock movement", type="primary", disabled=cover_err or running or size_err,
+    if st.button("▶ Run stock movement", type="primary", disabled=DEV or cover_err or running or size_err,
                  use_container_width=True):
         with st.spinner("Submitting job…"):
             try:
@@ -454,6 +474,10 @@ if ss.run_state == "running":
                 cols[1].markdown(f"[Open in Databricks ↗]({ss.run_url})")
             if cols[2].button("↻ Refresh now"):
                 st.rerun()
+        try:   # agent lab, live: same board, current task states (no replay while running)
+            agent_view.render(dbio.agent_job_run(ss.run_id), {}, live=True)
+        except Exception:
+            pass
         time.sleep(4)
         st.rerun()
 
@@ -571,8 +595,26 @@ elif ss.run_state == "results":
 Every store×size sits in exactly one **Action**: **move** (to action), **held** (would move but a soft guard blocked it — size-curve break / season-freshness / APO — with an indicative qty for a business call), or **dont move** (no receiving store needs the size / new-to-store / retained & selling within cover).
         """)
 
-    tab_all, tab_replen = st.tabs(
-        ["🧾  Store consolidation", "🔁  Replenishment (DC→Store)"])
+    tab_agent, tab_all, tab_replen = st.tabs(
+        ["Agent lab", "🧾  Store consolidation", "🔁  Replenishment (DC→Store)"])
+
+    # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
+    with tab_agent:
+        try:
+            _arid = VRID
+            if not _arid:
+                _lg = dbio.list_run_log(1)
+                _arid = str(_lg.iloc[0]["run_id"]) if not _lg.empty else None
+            try:
+                _runs = get_agent_runs()
+            except Exception:   # no job view permission → results-only board (no stage timings)
+                _runs = []
+            _jr = dbio.agent_match_run(_runs, _arid) if (_arid and _runs) else None
+            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))))
+            if _jr is None:
+                st.caption("Stage timings for this run are no longer in the job history — showing results only.")
+        except Exception as e:
+            st.info(f"Agent lab unavailable for this run: {e}")
 
     # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
     with tab_replen:

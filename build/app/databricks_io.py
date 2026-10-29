@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 import pandas as pd
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
@@ -329,6 +330,68 @@ def latest_run() -> dict:
     if not runs:
         return {}
     return run_status(runs[0].run_id) | {"run_id": runs[0].run_id}
+
+
+# ---- Agent view (visual layer over the deterministic pipeline — read-only, changes no recommendation) ----
+def _job_run_dict(r) -> dict:
+    """Flatten an SDK job run into what the Agent view needs: per-task timings/states + the engine RUN_ID."""
+    params = {p.name: p.value for p in (r.job_parameters or [])}
+    tasks = [{"key": t.task_key, "start": t.start_time or 0, "end": t.end_time or 0,
+              "life": t.state.life_cycle_state.value if t.state and t.state.life_cycle_state else None,
+              "result": t.state.result_state.value if t.state and t.state.result_state else None}
+             for t in (r.tasks or [])]
+    return {"job_run_id": r.run_id, "start": r.start_time or 0, "end": r.end_time or 0,
+            "engine_run_id": params.get("RUN_ID") or "", "triggered_by": params.get("TRIGGERED_BY") or "",
+            "country": params.get("COUNTRY") or "ALL", "category": params.get("CATEGORY") or "ALL",
+            "life": r.state.life_cycle_state.value if r.state and r.state.life_cycle_state else None,
+            "result": r.state.result_state.value if r.state and r.state.result_state else None,
+            "url": r.run_page_url, "tasks": tasks}
+
+
+def agent_job_runs(limit=30) -> list:
+    """Recent runs of the persistent job with task timings (app service principal; needs job CAN_VIEW)."""
+    if not JOB_ID:
+        return []
+    import itertools
+    w = get_client()
+    return [_job_run_dict(r) for r in itertools.islice(
+        w.jobs.list_runs(job_id=int(JOB_ID), expand_tasks=True), int(limit))]
+
+
+def agent_job_run(job_run_id: int) -> dict:
+    """One job run (live status for the running card)."""
+    return _job_run_dict(get_client().jobs.get_run(int(job_run_id)))
+
+
+def agent_match_run(runs: list, engine_run_id: str):
+    """Find the job run behind an engine RUN_ID. App runs pass RUN_ID as a job parameter; scheduled/manual runs
+    mint it in 00 as the UTC time the config task started (YYYYmmddTHHMMSSZ-xxxxxx), so match those by time."""
+    if not engine_run_id:
+        return runs[0] if runs else None
+    for r in runs:
+        if r["engine_run_id"] == engine_run_id:
+            return r
+    try:
+        ts = datetime.strptime(engine_run_id[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp() * 1000
+    except Exception:
+        return None
+    def cfg_start(r):
+        return next((t["start"] for t in r["tasks"] if t["key"] == "config" and t["start"]), r["start"])
+    cands = [r for r in runs if not r["engine_run_id"]]
+    best = min(cands, key=lambda r: abs(cfg_start(r) - ts), default=None)
+    return best if best is not None and abs(cfg_start(best) - ts) < 10 * 60 * 1000 else None
+
+
+def agent_run_metrics(run_id=None) -> dict:
+    """Headline numbers each agent reports, from the run's own outputs (per-run history when run_id given)."""
+    out = {"stats": {}, "replen": {}}
+    for key, base in (("stats", "run_stats"), ("replen", "replen_stats")):
+        try:
+            df = run_sql(f"SELECT * FROM {_src(base, run_id)}")
+            out[key] = df.iloc[0].to_dict() if not df.empty else {}
+        except Exception:
+            pass
+    return out
 
 
 def current_user() -> str:

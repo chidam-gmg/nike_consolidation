@@ -1,0 +1,12 @@
+# DEV preview app (nike-consolidation-dev): same code, APP_MODE=dev => read-only (no runs / config writes).
+# Deployed by copying build/app to the dev workspace folder and replacing app.yaml with this file.
+command: ["streamlit", "run", "app.py", "--server.port", "8000", "--server.address", "0.0.0.0"]
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "1c9706d9594f1f2f"
+  - name: NIKE_PIPELINE_DIR
+    value: "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline"
+  - name: NIKE_JOB_ID
+    value: "553755400746008"
+  - name: APP_MODE
+    value: "dev"
