@@ -619,7 +619,7 @@ elif ss.run_state == "results":
 
     # run picker — view any recent run (each user can always return to their own or a full-scope run)
     _log = dbio.list_run_log(25)
-    fh = st.columns([4, 1])
+    fh = st.columns([4, 1], vertical_alignment="bottom")
     if not _log.empty:
         _labels, _map = [], {}
         for _, r in _log.iterrows():
@@ -648,37 +648,6 @@ elif ss.run_state == "results":
         except Exception as e:
             st.warning(f"Could not refresh: {e}")
         st.rerun()
-
-    # ---- definitions (brief) ----
-    with st.expander("Definitions"):
-        st.markdown("""
-- **ROS** — units sold/day at a store over the ROS window (0 = dead).
-- **Cover (days)** — ATP ÷ ROS (blank = dead/∞).
-- **ATP** — sellable stock (SL01). **This is the only stock figure the engine uses** for cover, donor surplus and receiver need.
-- **In-transit** — units on the way to the store (latest snapshot). **Counted for the receiving store** — a receiver's need already nets off stock inbound to it, so the engine won't over-ship.
-- **Generic article name** — parent style name without the size (product master parent row; fallback = article name minus the size).
-- **Article name** — product description (product master TXTMD).
-- **APO** — Y if an APO key is present for that parent at the store (from the ATP table, rolled up from child to parent). The receiver APO reads N by design — APO parents are already excluded from receivers.
-- **Reason** — Dead (no sales) or Slow-moving (cover over threshold).
-- **Proposed transfer qty** — units to move (donor keeps its reserve; receiver filled to target cover).
-- **Cover post-move** — cover after the move: donor (ATP−qty)/ROS, receiver (ATP+qty)/ROS.
-- **Est. uplift\\*** — qty × receiver net sales/unit × **probability to sell at receiver**.
-- **Net benefit\\*** — uplift − movement cost (assumed **AED 5/unit**). *(\\* provisional until real cost & probability-to-sell are confirmed.)*
-- **Season** — the article's Nike season (Jan–Mar Spring, Apr–Jun Summer, Jul–Sep Fall, Oct–Dec Holiday) + year; CORE/YEAR = carried all-year.
-
-**The Action column accounts for every store×article line with ATP** (Moved ⊎ Held ⊎ Not moved):
-- **move** — proposed donor→receiver transfers.
-- **Held** — donor surplus that *would* move but a soft guard blocked it, so business can override. **Held reason:** *Size-curve break* (would break the donor's full-size run), *Season-freshness* (a would-be receiver can't stock this season), *APO* (the would-be receiver already has an inbound APO for this parent). *Receiver stays cut-size* (after ATP + in-transit + all store and DC moves the receiver still can't display a full run). *Move-back <30d* (the article left that receiver in the last 30 days). Each row shows a **would-be receiver** + **indicative qty** (min of donor surplus and receiver need) and a blank **Decision** column to mark Approve/Keep.
-- **Not moved** — everything retained, with a reason: *no receiving store needs this size*, *new to store*, or *retained – selling within cover* (healthy).
-
-**Why moved** *(tag on every line):*
-- *Moved - donor stays full-size* — donor gives from surplus; its size run stays complete after giving.
-- *Moved - donor cut — full remaining run consolidated to one receiver to display* — the donor's run was already broken (cut-size), so its **entire remaining giveable run is consolidated into one receiver** so that store can display the full size ladder.
-- *Moved - run released & consolidated to a faster receiver (>=25%) to display* — moving would break the donor's (dead/slow) run, but a receiver sells **≥25% faster**, so the run is released and consolidated into that faster receiver to display the full ladder.
-- *Moved - no size rule (fallback)* — item has no size definition (e.g. kids/accessories); moved on demand alone, without the size-curve check.
-
-Every store×size sits in exactly one **Action**: **move** (to action), **held** (would move but a soft guard blocked it — size-curve break / season-freshness / APO — with an indicative qty for a business call), or **dont move** (no receiving store needs the size / new-to-store / retained & selling within cover).
-        """)
 
     tab_agent, tab_all, tab_replen = st.tabs(
         ["Agent lab", "Store consolidation", "Replenishment (DC → store)"])
@@ -1011,3 +980,33 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                    "(move + held + dont move).")
         st.dataframe(cdf, hide_index=True, use_container_width=True, height=460)
 
+    # ---- definitions (brief) — reference material, kept at the bottom so the Agent lab sits higher ----
+    with st.expander("Definitions"):
+        st.markdown("""
+- **ROS** — units sold/day at a store over the ROS window (0 = dead).
+- **Cover (days)** — ATP ÷ ROS (blank = dead/∞).
+- **ATP** — sellable stock (SL01). **This is the only stock figure the engine uses** for cover, donor surplus and receiver need.
+- **In-transit** — units on the way to the store (latest snapshot). **Counted for the receiving store** — a receiver's need already nets off stock inbound to it, so the engine won't over-ship.
+- **Generic article name** — parent style name without the size (product master parent row; fallback = article name minus the size).
+- **Article name** — product description (product master TXTMD).
+- **APO** — Y if an APO key is present for that parent at the store (from the ATP table, rolled up from child to parent). The receiver APO reads N by design — APO parents are already excluded from receivers.
+- **Reason** — Dead (no sales) or Slow-moving (cover over threshold).
+- **Proposed transfer qty** — units to move (donor keeps its reserve; receiver filled to target cover).
+- **Cover post-move** — cover after the move: donor (ATP−qty)/ROS, receiver (ATP+qty)/ROS.
+- **Est. uplift\\*** — qty × receiver net sales/unit × **probability to sell at receiver**.
+- **Net benefit\\*** — uplift − movement cost (assumed **AED 5/unit**). *(\\* provisional until real cost & probability-to-sell are confirmed.)*
+- **Season** — the article's Nike season (Jan–Mar Spring, Apr–Jun Summer, Jul–Sep Fall, Oct–Dec Holiday) + year; CORE/YEAR = carried all-year.
+
+**The Action column accounts for every store×article line with ATP** (Moved ⊎ Held ⊎ Not moved):
+- **move** — proposed donor→receiver transfers.
+- **Held** — donor surplus that *would* move but a soft guard blocked it, so business can override. **Held reason:** *Size-curve break* (would break the donor's full-size run), *Season-freshness* (a would-be receiver can't stock this season), *APO* (the would-be receiver already has an inbound APO for this parent). *Receiver stays cut-size* (after ATP + in-transit + all store and DC moves the receiver still can't display a full run). *Move-back <30d* (the article left that receiver in the last 30 days). Each row shows a **would-be receiver** + **indicative qty** (min of donor surplus and receiver need) and a blank **Decision** column to mark Approve/Keep.
+- **Not moved** — everything retained, with a reason: *no receiving store needs this size*, *new to store*, or *retained – selling within cover* (healthy).
+
+**Why moved** *(tag on every line):*
+- *Moved - donor stays full-size* — donor gives from surplus; its size run stays complete after giving.
+- *Moved - donor cut — full remaining run consolidated to one receiver to display* — the donor's run was already broken (cut-size), so its **entire remaining giveable run is consolidated into one receiver** so that store can display the full size ladder.
+- *Moved - run released & consolidated to a faster receiver (>=25%) to display* — moving would break the donor's (dead/slow) run, but a receiver sells **≥25% faster**, so the run is released and consolidated into that faster receiver to display the full ladder.
+- *Moved - no size rule (fallback)* — item has no size definition (e.g. kids/accessories); moved on demand alone, without the size-curve check.
+
+Every store×size sits in exactly one **Action**: **move** (to action), **held** (would move but a soft guard blocked it — size-curve break / season-freshness / APO — with an indicative qty for a business call), or **dont move** (no receiving store needs the size / new-to-store / retained & selling within cover).
+        """)
