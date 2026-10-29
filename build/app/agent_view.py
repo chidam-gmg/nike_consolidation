@@ -186,6 +186,9 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
         {"k": "DC value", "v": _aed(r.get("fill_value_aed")), "at": stages["replen_output"]["end"]},
         {"k": "Held by rules", "v": _n(s.get("held_lines")), "at": stages["score"]["end"]},
     ]
+    if (review or {}).get("total") is not None:   # the one figure that needs a person leads the strip
+        pend = review.get("pending") or 0
+        kpis[-1] = {"k": "Awaiting approval", "v": _n(pend) if pend else "None", "at": audit_end, "accent": bool(pend)}
     jr = job_run or {}
     return {
         "live": live, "theme": theme, "review": rv, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
@@ -238,6 +241,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .kpis { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
 .kpi { padding:8px 16px; border-right:1px solid var(--line); min-width:0; } .kpi:last-child { border-right:0; }
 .kpi .l { font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+.kpi.accent { background:var(--acc-soft); } .kpi.accent .l, .kpi.accent .v { color:var(--accent); }
 .kpi .v { font:500 21px var(--mono); font-variant-numeric:tabular-nums; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .stage { border:1px solid var(--line); border-radius:12px; overflow:hidden; position:relative;
   background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
@@ -452,7 +456,7 @@ if (!D.have_timings) document.getElementById("logbody").classList.add("nots");
 
 /* KPIs */
 const kbox = document.getElementById("kpis");
-const kels = D.kpis.map(k => { const d = document.createElement("div"); d.className = "kpi"; const l = document.createElement("div"); l.className = "l"; l.textContent = k.k;
+const kels = D.kpis.map(k => { const d = document.createElement("div"); d.className = "kpi" + (k.accent ? " accent" : ""); const l = document.createElement("div"); l.className = "l"; l.textContent = k.k;
   const v = document.createElement("div"); v.className = "v"; d.append(l, v); kbox.appendChild(d); return { k, v }; });
 function renderKpis(now) { kels.forEach(({ k, v }) => v.textContent = (D.has && (!k.at || now >= k.at)) ? k.v : "—"); }
 
