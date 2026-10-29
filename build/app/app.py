@@ -658,12 +658,12 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                 st.caption("Stage timings for this run are not available — showing results only.")
         except Exception as e:
             st.info(f"Agent lab unavailable for this run: {e}")
-        # Ask the agents — placeholder; to be answered by a Databricks Genie space over this run's results.
+        # Ask the agents — placeholder for a question-answering assistant over this run's results.
         _qa = st.columns([7, 1])
         _qa[0].text_input("Ask the agents", key="ask_agents", disabled=True, label_visibility="collapsed",
                           placeholder="Ask the agents — e.g. why did store 1122 get size M of NKIF1911-010?")
         _qa[1].button("Ask", key="ask_agents_btn", disabled=True, use_container_width=True)
-        st.caption("Coming soon: answers from Databricks Genie over this run's moves, holds and DC lines.")
+        st.caption("Coming soon: ask questions about this run's moves, holds and DC lines.")
 
     # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
     with tab_replen:
