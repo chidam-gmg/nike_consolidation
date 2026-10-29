@@ -1,40 +1,31 @@
-"""Agent view — a visual "team at work" layer over the deterministic pipeline (business 2026-10-29).
+"""Agent lab — workflow-canvas view over the deterministic pipeline (business 2026-10-29, option A "n8n style").
 
-Each agent is one or more REAL job tasks: its status and timings come from the Databricks job run, its messages
-from the run's own output tables (run_stats / replen_stats). Nothing here decides or changes a recommendation —
-the engine stays rule-based and auditable. Rendered as one self-contained HTML component (CSS/JS replay inside
-the iframe, so replaying never reruns the Streamlit script).
+Each agent is one or more REAL job tasks: status and timings come from the Databricks job run, every number in the
+run log and on the wires comes from the run's own outputs (run_stats / replen_stats). Nothing here decides or
+changes a recommendation — the engine stays rule-based and auditable. Rendered as one self-contained HTML
+component (replay runs inside the iframe, so it never reruns the Streamlit script).
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
+import time
 
 import streamlit.components.v1 as components
 
-GST = timezone(timedelta(hours=4))
-
-# col/row = position on the board (3 rows; the two lanes split after Guard and meet at Size Curator)
+# col/row = canvas grid; the two lanes split after Guard and meet at the Size Curator
 AGENTS = [
-    dict(id="scout", name="Scout", role="Data readiness", code="AG-01", tasks=["config", "effective_stock"], col=0, row=1,
-         doing="Checking the ATP feed, store list and in-transit…"),
-    dict(id="analyst", name="Analyst", role="Demand & cover", code="AG-02", tasks=["classify"], col=1, row=1,
-         doing="Measuring rate-of-sale and cover for every size…"),
-    dict(id="guard", name="Guard", role="Rules & blocks", code="AG-03", tasks=["pools"], col=2, row=1,
-         doing="Applying APO, season, move-back and DC-first rules…"),
-    dict(id="matchmaker", name="Matchmaker", role="Store to store", code="AG-04", tasks=["match"], col=3, row=0,
-         doing="Pairing stores with surplus to stores that need stock…"),
-    dict(id="replenisher", name="Replenisher", role="DC to store", code="AG-05", tasks=["replen_demand", "replen_ration"],
-         col=3, row=2, doing="Working out store needs and rationing DC stock…"),
-    dict(id="curator", name="Size Curator", role="Full / cut size", code="AG-06", tasks=["reshape", "receiver_guard"],
-         col=4, row=1, doing="Making sure every receiving store ends with a full size run…"),
-    dict(id="reviewer", name="Reviewer", role="Final picks", code="AG-07", tasks=["score", "replen_output"], col=5, row=1,
-         doing="Scoring and finalising the recommendations…"),
-    dict(id="auditor", name="Auditor", role="Books closed", code="AG-08", tasks=["archive", "replen_history"], col=6, row=1,
-         doing="Reconciling every stock line and archiving the run…"),
+    dict(id="scout", g="SC", name="Scout", role="Data readiness", stages=["config", "effective_stock"], col=0, row=1),
+    dict(id="analyst", g="AN", name="Analyst", role="Demand & cover", stages=["classify"], col=1, row=1),
+    dict(id="guard", g="GU", name="Guard", role="Rules & blocks", stages=["pools"], col=2, row=1),
+    dict(id="match", g="MA", name="Matchmaker", role="Store to store", stages=["match"], col=3, row=0),
+    dict(id="replen", g="RE", name="Replenisher", role="DC to store", stages=["replen_demand", "replen_ration"], col=3, row=2),
+    dict(id="curator", g="SZ", name="Size Curator", role="Full / cut size", stages=["reshape", "receiver_guard"], col=4, row=1),
+    dict(id="review", g="RV", name="Reviewer", role="Final picks", stages=["score", "replen_output"], col=5, row=1),
+    dict(id="audit", g="AU", name="Auditor", role="Books closed", stages=["archive", "replen_history"], col=6, row=1),
 ]
-EDGES = [("scout", "analyst"), ("analyst", "guard"), ("guard", "matchmaker"), ("guard", "replenisher"),
-         ("matchmaker", "curator"), ("replenisher", "curator"), ("curator", "reviewer"), ("reviewer", "auditor")]
+STAGE_AGENT = {s: a["id"] for a in AGENTS for s in a["stages"]}
+STAGE_ORDER = ["config", "effective_stock", "classify", "pools", "match", "replen_demand", "reshape",
+               "replen_ration", "receiver_guard", "score", "replen_output", "replen_history", "archive"]
 
 
 def _num(v):
@@ -45,291 +36,362 @@ def _num(v):
         return None
 
 
-def _n(v, dflt="—"):
+def _n(v):
     f = _num(v)
-    return dflt if f is None else f"{f:,.0f}"
+    return "—" if f is None else f"{f:,.0f}"
 
 
 def _aed(v):
     f = _num(v)
     if f is None:
-        return "—"
+        return "AED —"
     return f"AED {f / 1e6:,.1f}M" if f >= 1e6 else f"AED {f / 1e3:,.0f}K" if f >= 1e3 else f"AED {f:,.0f}"
 
 
-def _done_messages(m: dict) -> dict:
-    """What each agent reports when it finishes — numbers straight from the run's outputs."""
-    s, r = m.get("stats") or {}, m.get("replen") or {}
-    scope = f"{s.get('country_scope') or 'ALL'} · {s.get('category_scope') or 'ALL'} categories"
+def _script(s: dict, r: dict, has: bool) -> dict:
+    """Per stage: [(fraction of the stage, level, text)]. Levels: run / tool / out / hold. Without results yet
+    (live run, before it archives) outputs are generic completion lines, with no numbers."""
+    cat = s.get("category_scope") or "ALL"
     rec = str(s.get("partition_reconciles", "")).lower() in ("true", "1")
-    msgs = {
-        "scout": [f"Run scope: {scope}",
-                  f"Loaded {_n(s.get('universe_lines'))} store × size stock lines (ATP + in-transit)"],
-        "analyst": [f"{_n(s.get('oos_receiver_candidates'))} sizes are selling but out of stock",
-                    f"{_n(s.get('aplus_curve_candidates'))} display gaps found at A+ stores"],
-        "guard": [f"Blocked receivers — APO {_n(s.get('apo_blocked_candidates'))} · season "
-                  f"{_n(s.get('season_blocked_candidates'))} · moved out <30d {_n(s.get('moveback_blocked_candidates'))}",
-                  f"Sent {_n(s.get('oos_deferred_to_replen'))} out-of-stock sizes to the DC first"],
-        "matchmaker": [f"Paired {_n(s.get('donor_stores'))} donor stores with {_n(s.get('receiver_stores'))} receiving stores"],
-        "replenisher": [f"Rationed DC stock across {_n(r.get('stores'))} stores and {_n(r.get('skus'))} SKUs",
-                        f"{_n(r.get('no_dc_stock_lines'))} store needs had no DC stock"],
-        "curator": [f"Protected {_n(s.get('held_step8'))} donor size runs from breaking",
-                    f"Held {_n(s.get('receiver_cut_blocked_moves'))} store moves + {_n(r.get('held_receiver_cut_lines'))} "
-                    f"DC lines that would leave a store cut-size",
-                    f"Topped up {_n(r.get('fullsize_topup_units'))} sizes from the DC to make stores full-size"],
-        "reviewer": [f"{_n(s.get('recommended_moves'))} store moves · {_n(s.get('total_units'))} units",
-                     f"{_n(r.get('replen_lines'))} DC lines · {_n(r.get('replen_units'))} units · {_aed(r.get('fill_value_aed'))}"],
-        "auditor": [(f"Every stock line accounted for: moved {_n(s.get('moved_donor_lines'))} + held {_n(s.get('held_lines'))}"
-                     f" + kept {_n(s.get('not_moved_lines'))} = {_n(s.get('universe_lines'))} " + ("[OK]" if rec else "[MISMATCH]")),
-                    "Run archived to history"],
+    out = lambda txt: [(1, "out", txt)] if has else [(1, "out", "stage complete")]
+    hold = lambda txt: [(0.7, "hold", txt)] if has else []
+    return {
+        "config": [(0, "run", "start · freezing run config"),
+                   (0.4, "tool", f"read cfg_scalar_params · scope {s.get('country_scope') or 'ALL'} · {cat}")]
+                  + out(f"run_config written · sales through {s.get('as_of_date') or '—'}"),
+        "effective_stock": [(0, "run", "start · building today's stock picture"),
+                            (0.25, "tool", "read sap_gmg_datalake.bronze.atp_detail · latest ATP snapshot · SL01"),
+                            (0.5, "tool", "read prod_mena.silver.combined_inventory · in-transit")]
+                           + ([(0.75, "tool", f"scope articles · category {cat}")] if cat != "ALL" else [])
+                           + out(f"effective_stock: {_n(s.get('universe_lines'))} store × size lines"),
+        "classify": [(0, "run", "start · rate-of-sale and cover per size"),
+                     (0.4, "tool", "read fct_sap_sales_detail_v · sales window")]
+                    + out(f"{_n(s.get('oos_receiver_candidates'))} sizes selling but out of stock · "
+                          f"{_n(s.get('aplus_curve_candidates'))} A+ display gaps"),
+        "pools": [(0, "run", "start · applying receiver rules"),
+                  (0.3, "tool", "read APO flags · read recommendations_history (30 days)")]
+                 + hold(f"blocked receivers · APO {_n(s.get('apo_blocked_candidates'))} · season "
+                        f"{_n(s.get('season_blocked_candidates'))} · moved out <30d {_n(s.get('moveback_blocked_candidates'))}")
+                 + out(f"{_n(s.get('oos_deferred_to_replen'))} out-of-stock sizes routed to the DC first"),
+        "match": [(0, "run", "start · pairing surplus with need")]
+                 + out(f"paired {_n(s.get('donor_stores'))} donor stores ↔ {_n(s.get('receiver_stores'))} receiving stores"),
+        "replen_demand": [(0, "run", "start · store needs vs ATP + in-transit"),
+                          (0.5, "tool", "read POS demand · 14-day cover target")]
+                         + out("needs computed for every selling size"),
+        "replen_ration": [(0, "run", "rationing · primary pool first, then shared hub")]
+                         + hold(f"{_n(r.get('no_dc_stock_lines'))} store needs had no DC stock")
+                         + out(f"DC stock rationed across {_n(r.get('stores'))} stores"),
+        "reshape": [(0, "run", "start · checking donor size runs")]
+                   + out(f"protected {_n(s.get('held_step8'))} donor size runs from breaking"),
+        "receiver_guard": [(0, "run", "start · joint full-size check, store + DC"),
+                           (0.3, "tool", "position = ATP + in-transit + store moves + DC lines − donations")]
+                          + hold(f"held {_n(s.get('receiver_cut_blocked_moves'))} store moves + "
+                                 f"{_n(r.get('held_receiver_cut_lines'))} DC lines · receiver would stay cut-size")
+                          + out(f"DC top-up · {_n(r.get('fullsize_topup_units'))} sizes for "
+                                f"{_n(r.get('fullsize_topup_pairs'))} store × style pairs → full size (for review)"),
+        "score": [(0, "run", "start · scoring store moves")]
+                 + out(f"{_n(s.get('recommended_moves'))} store moves · {_n(s.get('total_units'))} units · "
+                       f"est. uplift {_aed(s.get('total_expected_uplift'))}"),
+        "replen_output": [(0, "run", "start · finalising DC lines")]
+                         + out(f"{_n(r.get('replen_lines'))} DC lines · {_n(r.get('replen_units'))} units · "
+                               f"{_aed(r.get('fill_value_aed'))}"),
+        "replen_history": [(0, "run", "archiving DC lines")] + out("DC run archived"),
+        "archive": [(0, "run", "reconciling every stock line")]
+                   + ([(0.6, "out", f"{_n(s.get('moved_donor_lines'))} moved + {_n(s.get('held_lines'))} held + "
+                                    f"{_n(s.get('not_moved_lines'))} kept = {_n(s.get('universe_lines'))} · "
+                                    + ("OK" if rec else "MISMATCH"))] if has else [])
+                   + out("run archived to history"),
     }
-    return msgs
 
 
-def _payload(job_run: dict | None, metrics: dict, live: bool) -> dict:
-    tasks = {t["key"]: t for t in (job_run or {}).get("tasks", [])}
-    have_metrics = bool((metrics or {}).get("stats"))
-    done_msgs = _done_messages(metrics or {}) if have_metrics else {}
-    agents = []
-    for a in AGENTS:
-        ts = [tasks[k] for k in a["tasks"] if k in tasks]
-        starts = [t["start"] for t in ts if t["start"]]
-        ends = [t["end"] for t in ts if t["end"]]
-        results = [t["result"] for t in ts]
-        if any(x in ("FAILED", "TIMEDOUT", "CANCELED", "UPSTREAM_FAILED") for x in results):
-            status = "failed"
-        elif ts and all(x in ("SUCCESS", "SKIPPED") for x in results):
-            status = "done"
-        elif any(t["life"] in ("RUNNING", "PENDING", "TERMINATING") for t in ts) or (starts and not ends):
-            status = "working"
-        elif job_run is None and have_metrics:
-            status = "done"
-        else:
-            status = "waiting"
-        agents.append({k: a[k] for k in ("id", "name", "role", "code", "col", "row", "doing")} | {
-            "status": status,
-            "start": min(starts) if starts else None,
-            "end": max(ends) if (ends and status == "done") else None,
-            "done_msgs": done_msgs.get(a["id"], []),
-        })
+def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None = None) -> dict:
     s, r = (metrics or {}).get("stats") or {}, (metrics or {}).get("replen") or {}
+    has = bool(s)
+    tasks = {t["key"]: t for t in (job_run or {}).get("tasks", [])}
+    have_timings = bool(tasks)
+    # without job timings (old run, or no job view permission) lay the finished stages out on a synthetic clock
+    if not have_timings and has:
+        tasks = {k: {"key": k, "start": i * 1000 + 1, "end": i * 1000 + 900, "result": "SUCCESS", "life": "TERMINATED"}
+                 for i, k in enumerate(STAGE_ORDER)}
+
+    def stage(k):
+        t = tasks.get(k)
+        if not t:
+            return {"start": None, "end": None, "state": "waiting"}
+        res, life = t.get("result"), t.get("life")
+        state = ("failed" if res in ("FAILED", "TIMEDOUT", "CANCELED", "UPSTREAM_FAILED")
+                 else "done" if res in ("SUCCESS", "SKIPPED")
+                 else "running" if (t.get("start") and not t.get("end")) or life in ("RUNNING", "PENDING", "TERMINATING")
+                 else "waiting")
+        return {"start": t.get("start") or None, "end": (t.get("end") or None) if state in ("done", "failed") else None,
+                "state": state}
+
+    stages = {k: stage(k) for k in STAGE_AGENT}
+    names = {a["id"]: a["name"] for a in AGENTS}
+    events = []
+    for k, lines in _script(s, r, has).items():
+        st = stages[k]
+        if not st["start"]:
+            continue
+        for i, (f, lv, tx) in enumerate(lines):
+            if st["end"]:
+                ts = st["start"] + f * (st["end"] - st["start"]) + (0 if f == 1 else i)
+            elif f == 0 or lv == "tool":
+                ts = st["start"] + i * 400            # running: start + tool calls only, no results yet
+            else:
+                continue
+            if st["state"] == "failed" and f == 1:
+                lv, tx = "hold", "stage failed — open the run in Databricks"
+            events.append({"ts": ts, "a": STAGE_AGENT[k], "lv": lv, "tx": tx})
+
+    def edge(f, t, after, label):
+        return {"f": f, "t": t, "at": stages[after]["end"] if stages[after]["state"] == "done" else None,
+                "label": label if has else "handed over"}
+    edges = [
+        edge("scout", "analyst", "effective_stock", f"{_n(s.get('universe_lines'))} lines"),
+        edge("analyst", "guard", "classify", f"{_n(s.get('oos_receiver_candidates'))} OOS sizes"),
+        edge("guard", "match", "pools", "receiver pool"),
+        edge("guard", "replen", "pools", f"{_n(s.get('oos_deferred_to_replen'))} DC-first"),
+        edge("match", "curator", "match", f"{_n(s.get('donor_stores'))} → {_n(s.get('receiver_stores'))} stores"),
+        edge("replen", "curator", "replen_ration", f"{_n(r.get('replen_lines'))} DC lines"),
+        edge("curator", "review", "receiver_guard", f"{_n(r.get('fullsize_topup_units'))} top-ups"),
+        edge("review", "audit", "replen_output",
+             f"{_n((_num(s.get('recommended_moves')) or 0) + (_num(r.get('replen_lines')) or 0))} lines"),
+    ]
+    for e in edges:
+        if e["at"]:
+            events.append({"ts": e["at"] + 50, "a": e["f"], "lv": "send", "tx": f"→ {names[e['t']]}: {e['label']}"})
+    events.sort(key=lambda e: e["ts"])
+
     kpis = [
-        {"label": "Store moves", "value": _num(s.get("recommended_moves"))},
-        {"label": "Units moved", "value": _num(s.get("total_units"))},
-        {"label": "DC lines", "value": _num(r.get("replen_lines"))},
-        {"label": "DC units", "value": _num(r.get("replen_units"))},
-        {"label": "Held for review", "value": _num(s.get("held_lines"))},
+        {"k": "Store moves", "v": _n(s.get("recommended_moves")), "at": stages["score"]["end"]},
+        {"k": "Units moved", "v": _n(s.get("total_units")), "at": stages["score"]["end"]},
+        {"k": "DC lines", "v": _n(r.get("replen_lines")), "at": stages["replen_output"]["end"]},
+        {"k": "DC value", "v": _aed(r.get("fill_value_aed")), "at": stages["replen_output"]["end"]},
+        {"k": "Held for review", "v": _n(s.get("held_lines")), "at": stages["score"]["end"]},
     ]
     jr = job_run or {}
     return {
-        "live": live, "agents": agents, "edges": EDGES, "kpis": kpis,
-        "t0": jr.get("start") or None, "t1": jr.get("end") or None,
-        "who": s.get("triggered_by") or jr.get("triggered_by") or "",
-        "when": s.get("run_ts") or "",
+        "live": live, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
+        "agents": [dict(a) for a in AGENTS], "stages": stages, "edges": edges, "events": events, "kpis": kpis,
+        "run_id": jr.get("engine_run_id") or run_id or "",
+        # the scheduled 10:30 job runs with the job's default TRIGGERED_BY ('app'); app users are recorded by email
+        "who": {"app": "scheduled", "": "scheduled"}.get(str(s.get("triggered_by") or jr.get("triggered_by") or ""),
+                                                          str(s.get("triggered_by") or jr.get("triggered_by"))),
         "scope": f"{s.get('country_scope') or jr.get('country') or 'ALL'} · {s.get('category_scope') or jr.get('category') or 'ALL'}",
-        "run_id": jr.get("engine_run_id") or "", "job_run_id": jr.get("job_run_id") or "",
-        "have_timings": bool(jr.get("tasks")),
     }
 
 
-def render(job_run: dict | None, metrics: dict, live: bool = False, height: int = 760):
-    """Draw the agent board. live=True: current statuses of a running job (no replay)."""
-    data = json.dumps(_payload(job_run, metrics, live)).replace("</", "<\\/")
+def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str | None = None, height: int = 1010):
+    """Draw the workflow canvas + run log. live=True: current state of a running job (no replay)."""
+    data = json.dumps(_payload(job_run, metrics, live, run_id)).replace("</", "<\\/")
     components.html(_HTML.replace("__DATA__", data), height=height, scrolling=True)
 
 
-_HTML = r"""
-<!doctype html><html><head><meta charset="utf-8">
+_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap">
 <style>
-  :root { --ink:#20274C; --cobalt:#2658F2; --grid:#EEF2F4; --grid2:#E3E9EC; --line:#C9D3DA; --muted:#7A8499;
-          --ok:#1E9E6A; --fail:#B15940; --paper:#FBFCFC; }
-  * { box-sizing:border-box; }
-  body { margin:0; color:var(--ink); background:#fff;
-         font-family:ui-monospace,"SFMono-Regular","JetBrains Mono",Menlo,Consolas,monospace; font-size:12px; }
-  .hdr { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; padding:2px 0 8px; border-bottom:1px solid var(--line); }
-  .hdr .t { font-size:13px; font-weight:700; letter-spacing:.12em; }
-  .hdr .m { color:var(--muted); font-size:11px; letter-spacing:.04em; }
-  .hdr .grow { flex:1; }
-  .live { color:var(--cobalt); font-weight:700; letter-spacing:.1em; }
-  .live::before { content:''; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--cobalt);
-                  margin-right:6px; animation:blink 1s steps(2) infinite; }
-  @keyframes blink { 50% { opacity:.15; } }
-  button { font:inherit; font-size:11px; letter-spacing:.08em; border:1px solid var(--ink); background:#fff; color:var(--ink);
-           padding:5px 10px; cursor:pointer; text-transform:uppercase; }
-  button:hover:not(:disabled) { background:var(--ink); color:#fff; }
-  button:disabled { opacity:.35; cursor:default; }
-  .readouts { display:grid; grid-template-columns:repeat(5,minmax(120px,1fr)); border:1px solid var(--line); margin:10px 0; }
-  .ro { padding:8px 12px; border-right:1px solid var(--line); background:var(--paper); }
-  .ro:last-child { border-right:0; }
-  .ro .l { font-size:10px; letter-spacing:.12em; color:var(--muted); text-transform:uppercase; }
-  .ro .v { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:3px; }
-  .wrap { display:flex; gap:10px; align-items:stretch; }
-  .boardbox { flex:1 1 auto; overflow-x:auto; border:1px solid var(--line);
-              background-color:var(--paper);
-              background-image:linear-gradient(var(--grid2) 1px,transparent 1px),linear-gradient(90deg,var(--grid2) 1px,transparent 1px),
-                               linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
-              background-size:100px 100px,100px 100px,20px 20px,20px 20px; }
-  .board { position:relative; width:1190px; height:420px; }
-  svg { position:absolute; left:0; top:0; width:1190px; height:420px; pointer-events:none; overflow:visible; }
-  .edge { stroke:#AEB9C3; stroke-width:1.2; fill:none; }
-  .edge.on { stroke:var(--cobalt); stroke-width:1.6; stroke-dasharray:4 4; animation:flow .8s linear infinite; }
-  .edge.done { stroke:var(--ink); }
-  @keyframes flow { to { stroke-dashoffset:-8; } }
-  .mod { position:absolute; width:150px; height:118px; background:#fff; border:1px solid var(--line); transition:border-color .3s, box-shadow .3s; }
-  .mod .bar { display:flex; justify-content:space-between; align-items:center; padding:5px 8px; border-bottom:1px solid var(--line);
-              font-size:10px; letter-spacing:.1em; color:var(--muted); }
-  .led { width:8px; height:8px; border-radius:50%; background:#C4CCD3; }
-  .mod .nm { padding:8px 8px 0; font-size:13px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
-  .mod .rl { padding:2px 8px 0; font-size:10px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; }
-  .mod .stt { position:absolute; left:8px; bottom:22px; font-size:10px; letter-spacing:.12em; }
-  .mod .tm { position:absolute; left:8px; bottom:7px; font-size:10px; color:var(--muted); font-variant-numeric:tabular-nums; }
-  .mod.waiting { opacity:.6; }
-  .mod.waiting .stt { color:var(--muted); }
-  .mod.working { border-color:var(--cobalt); box-shadow:0 0 0 3px rgba(38,88,242,.10); }
-  .mod.working .led { background:var(--cobalt); animation:blink .8s steps(2) infinite; }
-  .mod.working .stt { color:var(--cobalt); }
-  .mod.done { border-color:var(--ink); }
-  .mod.done .led { background:var(--ok); }
-  .mod.done .stt { color:var(--ok); }
-  .mod.failed { border-color:var(--fail); }
-  .mod.failed .led { background:var(--fail); }
-  .mod.failed .stt { color:var(--fail); }
-  .console { flex:0 0 400px; border:1px solid var(--ink); background:#14182E; color:#C8D0E6; display:flex; flex-direction:column; height:420px; }
-  .console .h { padding:6px 10px; font-size:10px; letter-spacing:.14em; color:#7F8AB0; border-bottom:1px solid #2A3156; display:flex; justify-content:space-between; }
-  .lines { overflow-y:auto; padding:8px 10px; flex:1; font-size:11.5px; line-height:1.55; }
-  .ln { white-space:pre-wrap; animation:fadein .25s ease; }
-  .ln .ts { color:#6C779E; } .ln .ag { color:#8FB0FF; font-weight:700; } .ln.ok .tx { color:#E7ECF7; } .ln.work .tx { color:#9AA4C2; }
-  .ln.err .tx { color:#F2A07B; }
-  .cursor { display:inline-block; width:7px; height:13px; background:#8FB0FF; vertical-align:-2px; animation:blink 1s steps(2) infinite; }
-  @keyframes fadein { from { opacity:0; } to { opacity:1; } }
-  .ask { margin-top:10px; display:flex; gap:0; border:1px solid var(--line); }
-  .ask span { padding:7px 10px; color:var(--muted); border-right:1px solid var(--line); background:var(--paper); }
-  .ask input { flex:1; border:0; padding:7px 10px; font:inherit; background:#fff; color:var(--muted); }
-  .ask button { border:0; border-left:1px solid var(--line); }
-  .foot { margin-top:8px; font-size:10.5px; color:var(--muted); letter-spacing:.02em; }
-  @media (max-width:1100px) { .wrap { flex-direction:column; } .console { flex-basis:auto; width:100%; height:280px; } }
-</style></head><body>
-<div class="hdr">
-  <div class="t">STOCK MOVEMENT · AGENT LAB</div>
-  <div class="m" id="meta"></div><div class="live" id="live" style="display:none">LIVE</div>
-  <div class="grow"></div>
-  <button id="replay">Replay run</button><button id="final">Show result</button>
+:root { color-scheme: dark;
+  --bg:#0A0D16; --panel:#111626; --panel-2:#161C30; --line:#252E48; --fg:#E5E9F4; --muted:#8790AB; --dim:#5A6380;
+  --accent:#5B86FF; --run:#F2A93B; --ok:#34C08F; --hold:#E07A5F; --dot:#1C2338;
+  --ui:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+* { box-sizing:border-box; }
+html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var(--ui); }
+.wrap { display:grid; gap:12px; padding:14px; }
+.head { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
+.head .t { font-weight:600; font-size:15px; }
+.chip { font:11px var(--mono); color:var(--muted); border:1px solid var(--line); border-radius:6px; padding:3px 8px; background:var(--panel); }
+.chip b { color:var(--fg); font-weight:500; }
+.live { font:600 11px var(--mono); letter-spacing:.1em; color:var(--run); display:inline-flex; align-items:center; gap:6px; }
+.live::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--run); animation:pulse 1s ease-in-out infinite; }
+[hidden] { display:none !important; }
+.grow { flex:1; }
+.clock { font:12px var(--mono); color:var(--muted); } .clock b { color:var(--fg); font-weight:500; }
+.btn { font:500 12px var(--ui); color:var(--fg); background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+.btn:hover { border-color:var(--accent); } .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.btn:focus-visible, .filter:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.kpis { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
+.kpi { padding:9px 14px; border-right:1px solid var(--line); min-width:0; } .kpi:last-child { border-right:0; }
+.kpi .l { font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+.kpi .v { font:500 21px var(--mono); font-variant-numeric:tabular-nums; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.stage { border:1px solid var(--line); border-radius:12px; overflow-x:auto;
+  background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
+.canvas { position:relative; width:1240px; height:430px; margin:0 auto; }
+.canvas svg { position:absolute; left:0; top:0; width:1240px; height:430px; overflow:visible; }
+.edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:#3D4B78; }
+.pkt { fill:var(--run); }
+.cnt rect { fill:var(--panel-2); stroke:var(--line); } .cnt text { fill:var(--muted); font:10px var(--mono); }
+.node { position:absolute; width:96px; display:grid; justify-items:center; gap:6px; }
+.box { position:relative; width:84px; height:84px; border-radius:14px; background:var(--panel-2); border:1.5px solid var(--line);
+  display:grid; place-items:center; transition:border-color .3s, box-shadow .3s; }
+.glyph { font:600 20px var(--mono); color:var(--muted); }
+.port { position:absolute; top:37px; width:10px; height:10px; border-radius:50%; background:var(--panel); border:1.5px solid var(--dim); }
+.port.in { left:-6px; } .port.out { right:-6px; }
+.badge { position:absolute; top:-8px; right:-8px; width:20px; height:20px; border-radius:50%; background:var(--panel); border:1.5px solid var(--line); display:grid; place-items:center; }
+.badge svg { width:11px; height:11px; }
+.nm { font-size:12.5px; font-weight:600; text-align:center; }
+.rl { font:10px var(--mono); color:var(--muted); text-align:center; margin-top:-4px; }
+.node.s-running .box { border-color:var(--run); box-shadow:0 0 0 4px rgba(242,169,59,.12); } .node.s-running .glyph { color:var(--run); }
+.node.s-running .badge { border-color:var(--run); } .node.s-running .badge svg { animation:spin 1s linear infinite; }
+.node.s-done .box { border-color:rgba(52,192,143,.6); } .node.s-done .glyph { color:var(--fg); }
+.node.s-done .badge { border-color:var(--ok); background:rgba(52,192,143,.15); }
+.node.s-failed .box { border-color:var(--hold); } .node.s-failed .glyph { color:var(--hold); } .node.s-failed .badge { border-color:var(--hold); }
+.node.s-idle .box { border-color:rgba(91,134,255,.6); }
+.node.s-waiting .box { opacity:.55; }
+.lane { position:absolute; font:10px var(--mono); color:var(--dim); letter-spacing:.12em; }
+@keyframes spin { to { transform:rotate(360deg); } }
+@keyframes pulse { 50% { opacity:.3; } }
+.log { border:1px solid var(--line); border-radius:12px; background:#080B13; overflow:hidden; }
+.log-head { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+.log-head .t { font:11px var(--mono); letter-spacing:.12em; color:var(--muted); }
+.filters { display:flex; gap:4px; flex-wrap:wrap; }
+.filter { font:500 11px var(--mono); color:var(--muted); background:transparent; border:1px solid var(--line); border-radius:5px; padding:3px 8px; cursor:pointer; }
+.filter[aria-pressed="true"] { color:var(--fg); border-color:var(--accent); background:rgba(91,134,255,.12); }
+.log-body { height:290px; overflow:auto; font:12px var(--mono); }
+.ln { display:grid; grid-template-columns:74px 128px 54px minmax(0,1fr); gap:10px; padding:3px 12px; border-bottom:1px solid rgba(37,46,72,.35); }
+.ln:hover { background:rgba(91,134,255,.05); }
+.ts { color:var(--dim); font-variant-numeric:tabular-nums; } .ag { color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.lv { font-size:10.5px; padding-top:1px; } .lv.run { color:var(--run); } .lv.tool { color:#9C8CFF; } .lv.out { color:var(--ok); }
+.lv.send { color:var(--muted); } .lv.hold { color:var(--hold); }
+.tx { color:var(--fg); overflow-wrap:anywhere; }
+.empty { padding:12px; color:var(--muted); }
+.ln.new { animation:flash .6s ease; } @keyframes flash { from { background:rgba(242,169,59,.12); } to { background:transparent; } }
+.cursor { display:inline-block; width:7px; height:13px; margin:6px 12px; background:var(--run); animation:pulse 1s steps(2) infinite; }
+.foot { font-size:11.5px; color:var(--muted); }
+@media (max-width:720px) { .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } .ln { grid-template-columns:62px minmax(0,1fr); } .ag, .lv { display:none; } }
+@media (prefers-reduced-motion:reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
+</style></head><body><div class="wrap">
+<div class="head">
+  <span class="t">Agent lab</span>
+  <span class="chip">RUN <b id="c-run"></b></span><span class="chip">SCOPE <b id="c-scope"></b></span><span class="chip">BY <b id="c-who"></b></span>
+  <span class="live" id="live" hidden>LIVE</span>
+  <span class="grow"></span>
+  <span class="clock" id="clock"></span>
+  <button class="btn" id="speed" type="button">Speed 1×</button>
+  <button class="btn primary" id="play" type="button">Replay run</button>
 </div>
-<div class="readouts" id="kpis"></div>
-<div class="wrap">
-  <div class="boardbox"><div class="board" id="board"><svg id="svg" width="1190" height="420" viewBox="0 0 1190 420"></svg></div></div>
-  <div class="console"><div class="h"><span>RUN LOG</span><span id="clock">--:--:-- GST</span></div><div class="lines" id="items"></div></div>
+<div class="kpis" id="kpis"></div>
+<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1240 430" aria-hidden="true"></svg></div></div>
+<div class="log"><div class="log-head"><span class="t">RUN LOG</span><div class="filters" id="filters"></div></div><div class="log-body" id="logbody"></div></div>
+<div class="foot">Agents are the engine's stages. Decisions are rule-based and auditable; timings and numbers come from this run.</div>
 </div>
-<div class="ask"><span>QUERY&gt;</span><input disabled placeholder="ask the team, e.g. why did store 1122 get size M?  [coming soon]"><button disabled>Run</button></div>
-<div class="foot">Each agent is a stage of the deterministic engine. Decisions are rule-based and auditable; this view replays the engine's real timings and outputs.</div>
 <script>
 const D = __DATA__;
-const COLW = 170, ROWH = 140, X0 = 14, Y0 = 0, CW = 150, CH = 118;
-const board = document.getElementById('board'), svg = document.getElementById('svg');
-const byId = {}; D.agents.forEach(a => byId[a.id] = a);
-const pos = a => ({ x: X0 + a.col * COLW, y: Y0 + 12 + a.row * ROWH });
-const gst = ms => ms ? new Date(ms + 4 * 3600e3).toISOString().substr(11, 8) : '--:--:--';
-const fmt = v => (v === null || v === undefined) ? '—' : Math.round(v).toLocaleString('en-US');
+const S = D.stages, A = {}; D.agents.forEach(a => A[a.id] = a);
+const SV = Object.values(S).filter(s => s.start);
+const T0 = SV.length ? Math.min(...SV.map(s => s.start)) : 0;
+const T1 = D.live ? D.now : (SV.length ? Math.max(...SV.map(s => s.end || s.start)) : 0);
+const pad = n => String(n).padStart(2, "0");
+const gst = ms => { if (!D.have_timings || !ms) return "--:--:--"; const d = new Date(ms + 4 * 3600e3);
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; };
+const LV = { run: "RUN", tool: "TOOL", out: "OUT", send: "SEND", hold: "HOLD" };
+document.getElementById("c-run").textContent = D.run_id || "latest";
+document.getElementById("c-scope").textContent = D.scope;
+document.getElementById("c-who").textContent = D.who || "scheduled";
+if (D.live) document.getElementById("live").hidden = false;
+if (D.live || !D.have_timings) { document.getElementById("play").hidden = true; document.getElementById("speed").hidden = true; }
 
-document.getElementById('meta').textContent =
-  'SCOPE ' + D.scope + (D.who ? '  ·  BY ' + D.who : '') + (D.run_id ? '  ·  RUN ' + D.run_id : '');
-if (D.live) { document.getElementById('live').style.display = ''; document.getElementById('replay').style.display = 'none';
-              document.getElementById('final').style.display = 'none'; }
-if (!D.have_timings) document.getElementById('replay').disabled = true;
+function stageState(k, now) {
+  const s = S[k]; if (!s.start || now < s.start) return "waiting";
+  if (s.state === "failed" && (!s.end || now >= s.end)) return "failed";
+  if (s.end && now >= s.end) return "done";
+  return "running";
+}
+function agentState(a, now) {
+  const st = a.stages.map(k => stageState(k, now));
+  if (st.includes("failed")) return "failed";
+  if (st.includes("running")) return "running";
+  if (st.every(x => x === "done")) return "done";
+  if (st.includes("done")) return "idle";
+  return "waiting";
+}
 
-const cards = {};
+/* canvas */
+const canvas = document.getElementById("canvas"), svg = document.getElementById("edges"), NS = "http://www.w3.org/2000/svg";
+const NX = c => 44 + c * 180, NY = r => 40 + r * 130;
+const ICON = { done: '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="#34C08F" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  running: '<svg viewBox="0 0 12 12"><path d="M6 1.5a4.5 4.5 0 1 1-4.5 4.5" fill="none" stroke="#F2A93B" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  failed: '<svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" fill="none" stroke="#E07A5F" stroke-width="1.6" stroke-linecap="round"/></svg>' };
+const nodes = {};
 D.agents.forEach(a => {
-  const p = pos(a), el = document.createElement('div');
-  el.className = 'mod waiting'; el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
-  const bar = document.createElement('div'); bar.className = 'bar';
-  const code = document.createElement('span'); code.textContent = a.code; const led = document.createElement('span'); led.className = 'led';
-  bar.append(code, led);
-  const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = a.name;
-  const rl = document.createElement('div'); rl.className = 'rl'; rl.textContent = a.role;
-  const st = document.createElement('div'); st.className = 'stt';
-  const tm = document.createElement('div'); tm.className = 'tm';
-  el.append(bar, nm, rl, st, tm); board.appendChild(el); cards[a.id] = { el, st, tm };
+  const el = document.createElement("div"); el.className = "node s-waiting"; el.style.left = (NX(a.col) - 6) + "px"; el.style.top = NY(a.row) + "px";
+  el.innerHTML = '<div class="box"><span class="port in"></span><span class="glyph"></span><span class="port out"></span><span class="badge"></span></div><div class="nm"></div><div class="rl"></div>';
+  el.querySelector(".glyph").textContent = a.g; el.querySelector(".nm").textContent = a.name; el.querySelector(".rl").textContent = a.role;
+  canvas.appendChild(el); nodes[a.id] = el;
 });
-const edges = D.edges.map(([f, t]) => {
-  const a = pos(byId[f]), b = pos(byId[t]);
-  const x1 = a.x + CW, y1 = a.y + CH / 2, x2 = b.x, y2 = b.y + CH / 2, mx = (x1 + x2) / 2;
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('d', `M${x1},${y1} L${mx},${y1} L${mx},${y2} L${x2},${y2}`);
-  path.setAttribute('class', 'edge'); svg.appendChild(path);
-  return { f, t, path };
+[["STORE ↔ STORE", NY(0) - 22], ["DC → STORE", NY(2) + 132]].forEach(([t, y]) => { const l = document.createElement("div"); l.className = "lane";
+  l.textContent = t; l.style.left = (NX(3) - 6) + "px"; l.style.top = y + "px"; canvas.appendChild(l); });
+const edges = D.edges.map(e => {
+  const a = A[e.f], b = A[e.t];
+  const x1 = NX(a.col) + 88, y1 = NY(a.row) + 42, x2 = NX(b.col) - 4, y2 = NY(b.row) + 42, dx = Math.max(40, (x2 - x1) / 2);
+  const p = document.createElementNS(NS, "path"); p.setAttribute("d", `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`);
+  p.setAttribute("class", "edge"); svg.appendChild(p);
+  const pk = document.createElementNS(NS, "circle"); pk.setAttribute("r", "3.5"); pk.setAttribute("class", "pkt"); pk.style.display = "none"; svg.appendChild(pk);
+  const g = document.createElementNS(NS, "g"); g.setAttribute("class", "cnt"); g.style.display = "none";
+  const len = p.getTotalLength(), mid = p.getPointAtLength(len / 2), mx = mid.x, my = y1 === y2 ? y1 - 14 : mid.y, w = e.label.length * 6.1 + 14;
+  const r = document.createElementNS(NS, "rect"); r.setAttribute("x", mx - w / 2); r.setAttribute("y", my - 9); r.setAttribute("width", w); r.setAttribute("height", 18); r.setAttribute("rx", 9);
+  const tx = document.createElementNS(NS, "text"); tx.setAttribute("x", mx); tx.setAttribute("y", my + 3.5); tx.setAttribute("text-anchor", "middle"); tx.textContent = e.label;
+  g.append(r, tx); svg.appendChild(g);
+  return { e, p, pk, g, len };
 });
-function setState(states) {
-  D.agents.forEach(a => {
-    const s = states[a.id], c = cards[a.id];
-    c.el.className = 'mod ' + s;
-    c.st.textContent = s === 'working' ? 'STATUS: RUNNING' : s === 'done' ? 'STATUS: COMPLETE' : s === 'failed' ? 'STATUS: FAILED' : 'STATUS: STANDBY';
-    c.tm.textContent = s === 'done' && a.start && a.end ? `${gst(a.start)} > ${gst(a.end)}` :
-                       s === 'working' && a.start ? `T+ since ${gst(a.start)}` : '';
-  });
-  edges.forEach(e => {
-    const sf = states[e.f], st = states[e.t];
-    e.path.setAttribute('class', 'edge' + (sf === 'done' && st === 'working' ? ' on' : sf === 'done' && st === 'done' ? ' done' : ''));
+function renderCanvas(now, animate) {
+  D.agents.forEach(a => { const s = agentState(a, now), el = nodes[a.id]; el.className = "node s-" + s; el.querySelector(".badge").innerHTML = ICON[s] || ""; });
+  edges.forEach(x => {
+    const sent = x.e.at && now >= x.e.at, st = agentState(A[x.e.t], now), active = sent && (st === "running" || st === "idle");
+    x.p.setAttribute("class", "edge" + (active ? " active" : sent ? " done" : "")); x.g.style.display = sent ? "" : "none";
+    if (active && animate) { const pt = x.p.getPointAtLength(((performance.now() / 1400) % 1) * x.len);
+      x.pk.setAttribute("cx", pt.x); x.pk.setAttribute("cy", pt.y); x.pk.style.display = ""; } else x.pk.style.display = "none";
   });
 }
-const items = document.getElementById('items'), clock = document.getElementById('clock');
-function log(a, text, ms, kind) {
-  const ln = document.createElement('div'); ln.className = 'ln ' + kind;
-  const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = '[' + gst(ms) + '] ';
-  const ag = document.createElement('span'); ag.className = 'ag'; ag.textContent = a.code + ' ' + a.name.toUpperCase();
-  const tx = document.createElement('span'); tx.className = 'tx'; tx.textContent = ' > ' + text;
-  ln.append(ts, ag, tx); items.appendChild(ln); items.scrollTop = items.scrollHeight;
-  if (ms) clock.textContent = gst(ms) + ' GST';
-}
-function cursor() { const c = document.createElement('span'); c.className = 'cursor'; items.appendChild(c); }
-function kpis(show) {
-  const box = document.getElementById('kpis'); box.innerHTML = '';
-  D.kpis.forEach(k => {
-    const el = document.createElement('div'); el.className = 'ro';
-    const l = document.createElement('div'); l.className = 'l'; l.textContent = k.label;
-    const v = document.createElement('div'); v.className = 'v'; v.textContent = show ? fmt(k.value) : '—';
-    el.append(l, v); box.appendChild(el); k._el = v;
+
+/* KPIs */
+const kbox = document.getElementById("kpis");
+const kels = D.kpis.map(k => { const d = document.createElement("div"); d.className = "kpi"; const l = document.createElement("div"); l.className = "l"; l.textContent = k.k;
+  const v = document.createElement("div"); v.className = "v"; d.append(l, v); kbox.appendChild(d); return { k, v }; });
+function renderKpis(now) { kels.forEach(({ k, v }) => v.textContent = (D.has && (!k.at || now >= k.at)) ? k.v : "—"); }
+
+/* run log */
+const logbody = document.getElementById("logbody"), filters = document.getElementById("filters");
+let filter = "all", shown = -1;
+[["all", "All"], ...D.agents.map(a => [a.id, a.name])].forEach(([id, label]) => {
+  const b = document.createElement("button"); b.type = "button"; b.className = "filter"; b.textContent = label; b.setAttribute("aria-pressed", id === "all");
+  b.onclick = () => { filter = id; filters.querySelectorAll(".filter").forEach(x => x.setAttribute("aria-pressed", x === b)); shown = -1; renderLog(cur, false); };
+  filters.appendChild(b);
+});
+function renderLog(now, anim) {
+  const vis = D.events.filter(e => e.ts <= now && (filter === "all" || e.a === filter));
+  if (vis.length === shown) return;
+  const prev = shown; logbody.innerHTML = "";
+  vis.forEach((e, i) => {
+    const ln = document.createElement("div"); ln.className = "ln" + (anim && prev >= 0 && i >= prev ? " new" : "");
+    const c = (cls, t) => { const s = document.createElement("span"); s.className = cls; s.textContent = t; return s; };
+    ln.append(c("ts", gst(e.ts)), c("ag", A[e.a].g + " " + A[e.a].name), c("lv " + e.lv, LV[e.lv]), c("tx", e.tx)); logbody.appendChild(ln);
   });
+  if (D.live) { const k = document.createElement("span"); k.className = "cursor"; logbody.appendChild(k); }
+  if (!vis.length && !D.live) { const m = document.createElement("div"); m.className = "empty"; m.textContent = "No stage activity recorded for this run."; logbody.appendChild(m); }
+  shown = vis.length; logbody.scrollTop = logbody.scrollHeight;
 }
-function countUp(ms) {
-  D.kpis.forEach(k => {
-    if (k.value === null || k.value === undefined) return;
-    const t0 = performance.now();
-    const step = now => { const f = Math.min(1, (now - t0) / ms); k._el.textContent = fmt(k.value * (1 - Math.pow(1 - f, 3)));
-                          if (f < 1) requestAnimationFrame(step); };
-    requestAnimationFrame(step);
-  });
+
+/* engine */
+let cur = T1 + 1, playing = false, t0p = 0, speed = 1; const SPAN = 42000;
+function render(now, anim) {
+  document.getElementById("clock").innerHTML = D.have_timings ? `engine time <b>${gst(Math.min(now, T1))}</b> GST` : "stage timings unavailable";
+  renderCanvas(now, anim || D.live); renderKpis(now); renderLog(now, anim);
 }
-let timers = [];
-function finalState() {
-  timers.forEach(clearTimeout); timers = [];
-  const states = {}; D.agents.forEach(a => states[a.id] = a.status); setState(states);
-  items.innerHTML = '';
-  const ev = [];   // one time-ordered log: stage starts + stage results
-  D.agents.forEach((a, i) => {
-    if (a.status !== 'waiting') ev.push([a.start || 0, i, 0, a, a.doing, 'work']);
-    if (a.status === 'done') a.done_msgs.forEach((m, j) => ev.push([a.end || 0, i, 1 + j, a, m, 'ok']));
-    if (a.status === 'failed') ev.push([a.end || a.start || 0, i, 9, a, 'stage failed; see the run in Databricks', 'err']);
-  });
-  ev.sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]).forEach(e => log(e[3], e[4], e[0], e[5]));
-  if (D.live) cursor();
-  kpis(!D.live || D.agents.every(a => a.status === 'done'));
+function tick() {
+  if (!playing) return; const f = ((performance.now() - t0p) * speed) / SPAN; cur = T0 - 1 + f * (T1 - T0 + 2);
+  if (f >= 1) { playing = false; cur = T1 + 1; document.getElementById("play").textContent = "Replay run"; }
+  render(cur, true); if (playing) requestAnimationFrame(tick);
 }
-function replay() {
-  timers.forEach(clearTimeout); timers = []; items.innerHTML = ''; kpis(false);
-  const st = {}; D.agents.forEach(a => st[a.id] = 'waiting'); setState(st);
-  const valid = D.agents.filter(a => a.start && a.end);
-  if (!valid.length) { finalState(); return; }
-  const t0 = Math.min(...valid.map(a => a.start)), t1 = Math.max(...valid.map(a => a.end));
-  const SPAN = 32000, sc = ms => 400 + (ms - t0) / Math.max(1, t1 - t0) * SPAN;
-  valid.forEach(a => {
-    timers.push(setTimeout(() => { st[a.id] = 'working'; setState(st); log(a, a.doing, a.start, 'work'); }, sc(a.start)));
-    timers.push(setTimeout(() => { st[a.id] = a.status === 'failed' ? 'failed' : 'done'; setState(st);
-                                   a.done_msgs.forEach(m => log(a, m, a.end, 'ok')); }, sc(a.end)));
-  });
-  timers.push(setTimeout(() => countUp(1500), sc(byId.reviewer.end || t1)));
-}
-document.getElementById('replay').onclick = replay;
-document.getElementById('final').onclick = finalState;
-finalState();
+document.getElementById("play").onclick = () => {
+  const b = document.getElementById("play");
+  if (playing) { playing = false; cur = T1 + 1; b.textContent = "Replay run"; shown = -1; render(cur, false); return; }
+  playing = true; t0p = performance.now(); shown = 0; logbody.innerHTML = ""; b.textContent = "Skip to result"; requestAnimationFrame(tick);
+};
+document.getElementById("speed").onclick = e => { const el = playing ? (performance.now() - t0p) * speed : 0;
+  speed = speed === 1 ? 3 : 1; e.target.textContent = "Speed " + speed + "×"; if (playing) t0p = performance.now() - el / speed; };
+render(cur, false);
+if (D.live) { const loop = () => { renderCanvas(cur, true); requestAnimationFrame(loop); }; requestAnimationFrame(loop); }
 </script></body></html>
 """

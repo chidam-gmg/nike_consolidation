@@ -610,7 +610,7 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
             except Exception:   # no job view permission → results-only board (no stage timings)
                 _runs = []
             _jr = dbio.agent_match_run(_runs, _arid) if (_arid and _runs) else None
-            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))))
+            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))), run_id=_arid)
             if _jr is None:
                 st.caption("Stage timings for this run are no longer in the job history — showing results only.")
         except Exception as e:
