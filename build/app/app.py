@@ -171,6 +171,17 @@ st.markdown(f"""
              padding-bottom:10px; margin-bottom:6px; }}
   .eyebrow {{ font-size:10px; letter-spacing:.14em; font-weight:700; color:#8891A6; }}
   div[data-testid="stMetricValue"] {{ font-variant-numeric:tabular-nums; }}
+  /* chat (Ask the agents) */
+  [data-testid="stChatMessage"] {{ border-radius:12px; padding:14px 16px; gap:14px; }}
+  [data-testid="stChatMessage"]:has(.chat-u) {{ background:#F3F6F7; border:1px solid #E1E7E8; }}
+  [data-testid="stChatMessage"]:has(.chat-a) {{ background:transparent; border:1px solid transparent; }}
+  [data-testid^="stChatMessageAvatar"] {{ border-radius:8px !important; width:32px; height:32px; }}
+  [data-testid="stChatMessage"]:has(.chat-u) [data-testid^="stChatMessageAvatar"] {{ background:{SAPPHIRE} !important; color:#FFFFFF !important; }}
+  [data-testid="stChatMessage"]:has(.chat-a) [data-testid^="stChatMessageAvatar"] {{ background:{COBALT} !important; color:#FFFFFF !important; }}
+  [data-testid^="stChatMessageAvatar"] * {{ color:#FFFFFF !important; fill:#FFFFFF !important; }}
+  [data-testid="stChatInput"] > div {{ border-radius:12px !important; }}
+  .chat-u, .chat-a {{ display:none; }}
+  [data-testid="stElementContainer"]:has(.chat-u), [data-testid="stElementContainer"]:has(.chat-a) {{ display:none; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -232,6 +243,16 @@ if DARK:
   .kpi:not([style*="2658F2"]) { background:#111626 !important; }
   .kpi:not([style*="2658F2"]) .val { color:#E5E9F4 !important; }
   .stApp code { background:#161C30 !important; color:#8FB0FF !important; }
+  .stApp h5, .stApp h6, [data-testid="stHeading"], [data-testid="stHeading"] * { color:#E5E9F4 !important; }
+  [data-testid="stCode"] pre, [data-testid="stCode"] code { background:#0E1220 !important; }
+  [data-testid="stChatMessage"]:has(.chat-u) { background:#161C30 !important; border-color:#252E48 !important; }
+  [data-testid="stChatMessage"]:has(.chat-u) [data-testid^="stChatMessageAvatar"] { background:#2A3458 !important; }
+  [data-testid="stChatMessage"]:has(.chat-a) [data-testid^="stChatMessageAvatar"] { background:#3D6BFF !important; }
+  [data-testid="stChatInput"] > div, [data-testid="stChatInput"] textarea { background:#161C30 !important; color:#E5E9F4 !important;
+    border-color:#2E3858 !important; }
+  [data-testid="stChatInput"] textarea::placeholder { color:#7A84A3 !important; }
+  [data-testid="stChatInputSubmitButton"] svg { fill:#8FB0FF !important; color:#8FB0FF !important; }
+  [data-testid="stBottom"], [data-testid="stBottom"] > div, [data-testid="stBottomBlockContainer"] { background:#0A0D16 !important; }
 </style>""", unsafe_allow_html=True)
 THEME = "dark" if DARK else "light"
 
@@ -792,16 +813,20 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                            "Coming soon: ask questions about this run's moves, holds and DC lines.")
             for _qq, _aa in ss.ask_history:
                 with st.chat_message("user", avatar=":material/person:"):
+                    st.markdown('<span class="chat-u"></span>', unsafe_allow_html=True)
                     st.markdown(_qq)
                 with st.chat_message("assistant", avatar=":material/hub:"):
+                    st.markdown('<span class="chat-a"></span>', unsafe_allow_html=True)
                     _render_answer(_aa)
         _prompt = st.chat_input("Ask the agents a question about this run…", key="ask_input", disabled=not _ask_on)
         if _prompt and _prompt.strip():
             _q = _prompt.strip()
             with _chat:
                 with st.chat_message("user", avatar=":material/person:"):
+                    st.markdown('<span class="chat-u"></span>', unsafe_allow_html=True)
                     st.markdown(_q)
                 with st.chat_message("assistant", avatar=":material/hub:"):
+                    st.markdown('<span class="chat-a"></span>', unsafe_allow_html=True)
                     with st.spinner("The agents are looking into it…"):
                         try:
                             _latest = dbio.list_run_log(1)
