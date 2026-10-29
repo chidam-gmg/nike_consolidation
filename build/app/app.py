@@ -785,7 +785,7 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                              disabled=_pend.empty):
                 _save(_pend.assign(decision="APPROVED"), "Approved")
             if _bc[2].button(f"Reject {len(_pend):,} pending shown", use_container_width=True, key="rv_rej",
-                             disabled=_pend.empty, type="tertiary"):
+                             disabled=_pend.empty):
                 _save(_pend.assign(decision="REJECTED"), "Rejected")
             _bc[3].caption(f"{len(_view):,} of {len(_rv):,} review lines shown · filter, then decide in the "
                            "Decision column and Save, or use the bulk buttons.")
