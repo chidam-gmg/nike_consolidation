@@ -104,7 +104,7 @@ def _script(s: dict, r: dict, has: bool) -> dict:
     }
 
 
-def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None = None) -> dict:
+def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None = None, theme: str = "light") -> dict:
     s, r = (metrics or {}).get("stats") or {}, (metrics or {}).get("replen") or {}
     has = bool(s)
     tasks = {t["key"]: t for t in (job_run or {}).get("tasks", [])}
@@ -172,7 +172,7 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
     ]
     jr = job_run or {}
     return {
-        "live": live, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
+        "live": live, "theme": theme, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
         "agents": [dict(a) for a in AGENTS], "stages": stages, "edges": edges, "events": events, "kpis": kpis,
         "run_id": jr.get("engine_run_id") or run_id or "",
         # the scheduled 10:30 job runs with the job's default TRIGGERED_BY ('app'); app users are recorded by email
@@ -182,23 +182,31 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
     }
 
 
-def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str | None = None, height: int = 1010):
-    """Draw the workflow canvas + run log. live=True: current state of a running job (no replay)."""
-    data = json.dumps(_payload(job_run, metrics, live, run_id)).replace("</", "<\\/")
+def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str | None = None,
+           theme: str = "light", height: int = 960):
+    """Draw the workflow canvas + run log. live=True: current state of a running job (no replay).
+    theme follows the app's Dark mode toggle so the board blends into the page either way."""
+    data = json.dumps(_payload(job_run, metrics, live, run_id, theme)).replace("</", "<\\/")
     components.html(_HTML.replace("__DATA__", data), height=height, scrolling=True)
 
 
 _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap">
 <style>
-:root { color-scheme: dark;
-  --bg:#0A0D16; --panel:#111626; --panel-2:#161C30; --line:#252E48; --fg:#E5E9F4; --muted:#8790AB; --dim:#5A6380;
-  --accent:#5B86FF; --run:#F2A93B; --ok:#34C08F; --hold:#E07A5F; --dot:#1C2338;
+:root { /* light = GMG brand (matches the app page); dark = console. Set by the app's Dark mode toggle. */
+  color-scheme: light;
+  --bg:#FFFFFF; --panel:#F6F8F9; --panel-2:#FFFFFF; --line:#DCE3E6; --fg:#20274C; --muted:#5C6478; --dim:#8F97AC;
+  --accent:#2658F2; --run:#C47A10; --ok:#1E9E6A; --hold:#B15940; --dot:#E2E8EB; --console:#FBFCFC;
+  --wire-done:#9DB0E8; --acc-soft:rgba(38,88,242,.10); --run-soft:rgba(196,122,16,.14); --ok-soft:rgba(30,158,106,.12);
   --ui:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono:"Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+:root[data-theme="dark"] { color-scheme: dark;
+  --bg:#0A0D16; --panel:#111626; --panel-2:#161C30; --line:#252E48; --fg:#E5E9F4; --muted:#8790AB; --dim:#5A6380;
+  --accent:#5B86FF; --run:#F2A93B; --ok:#34C08F; --hold:#E07A5F; --dot:#1C2338; --console:#080B13;
+  --wire-done:#3D4B78; --acc-soft:rgba(91,134,255,.12); --run-soft:rgba(242,169,59,.14); --ok-soft:rgba(52,192,143,.15); }
 * { box-sizing:border-box; }
 html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var(--ui); }
-.wrap { display:grid; gap:12px; padding:14px; }
+.wrap { display:grid; gap:12px; padding:4px 2px 8px; }
 .head { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
 .head .t { font-weight:600; font-size:15px; }
 .chip { font:11px var(--mono); color:var(--muted); border:1px solid var(--line); border-radius:6px; padding:3px 8px; background:var(--panel); }
@@ -219,7 +227,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
   background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
 .canvas { position:relative; width:1240px; height:430px; margin:0 auto; }
 .canvas svg { position:absolute; left:0; top:0; width:1240px; height:430px; overflow:visible; }
-.edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:#3D4B78; }
+.edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:var(--wire-done); }
 .pkt { fill:var(--run); }
 .cnt rect { fill:var(--panel-2); stroke:var(--line); } .cnt text { fill:var(--muted); font:10px var(--mono); }
 .node { position:absolute; width:96px; display:grid; justify-items:center; gap:6px; }
@@ -230,33 +238,34 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .port.in { left:-6px; } .port.out { right:-6px; }
 .badge { position:absolute; top:-8px; right:-8px; width:20px; height:20px; border-radius:50%; background:var(--panel); border:1.5px solid var(--line); display:grid; place-items:center; }
 .badge svg { width:11px; height:11px; }
+.node.s-done .badge { color:var(--ok); } .node.s-running .badge { color:var(--run); } .node.s-failed .badge { color:var(--hold); }
 .nm { font-size:12.5px; font-weight:600; text-align:center; }
 .rl { font:10px var(--mono); color:var(--muted); text-align:center; margin-top:-4px; }
-.node.s-running .box { border-color:var(--run); box-shadow:0 0 0 4px rgba(242,169,59,.12); } .node.s-running .glyph { color:var(--run); }
+.node.s-running .box { border-color:var(--run); box-shadow:0 0 0 4px var(--run-soft); } .node.s-running .glyph { color:var(--run); }
 .node.s-running .badge { border-color:var(--run); } .node.s-running .badge svg { animation:spin 1s linear infinite; }
-.node.s-done .box { border-color:rgba(52,192,143,.6); } .node.s-done .glyph { color:var(--fg); }
-.node.s-done .badge { border-color:var(--ok); background:rgba(52,192,143,.15); }
+.node.s-done .box { border-color:var(--ok); } .node.s-done .glyph { color:var(--fg); }
+.node.s-done .badge { border-color:var(--ok); background:var(--ok-soft); }
 .node.s-failed .box { border-color:var(--hold); } .node.s-failed .glyph { color:var(--hold); } .node.s-failed .badge { border-color:var(--hold); }
-.node.s-idle .box { border-color:rgba(91,134,255,.6); }
+.node.s-idle .box { border-color:var(--accent); }
 .node.s-waiting .box { opacity:.55; }
 .lane { position:absolute; font:10px var(--mono); color:var(--dim); letter-spacing:.12em; }
 @keyframes spin { to { transform:rotate(360deg); } }
 @keyframes pulse { 50% { opacity:.3; } }
-.log { border:1px solid var(--line); border-radius:12px; background:#080B13; overflow:hidden; }
+.log { border:1px solid var(--line); border-radius:12px; background:var(--console); overflow:hidden; }
 .log-head { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
 .log-head .t { font:11px var(--mono); letter-spacing:.12em; color:var(--muted); }
 .filters { display:flex; gap:4px; flex-wrap:wrap; }
 .filter { font:500 11px var(--mono); color:var(--muted); background:transparent; border:1px solid var(--line); border-radius:5px; padding:3px 8px; cursor:pointer; }
-.filter[aria-pressed="true"] { color:var(--fg); border-color:var(--accent); background:rgba(91,134,255,.12); }
+.filter[aria-pressed="true"] { color:var(--fg); border-color:var(--accent); background:var(--acc-soft); }
 .log-body { height:290px; overflow:auto; font:12px var(--mono); }
-.ln { display:grid; grid-template-columns:74px 128px 54px minmax(0,1fr); gap:10px; padding:3px 12px; border-bottom:1px solid rgba(37,46,72,.35); }
-.ln:hover { background:rgba(91,134,255,.05); }
+.ln { display:grid; grid-template-columns:74px 128px 54px minmax(0,1fr); gap:10px; padding:3px 12px; border-bottom:1px solid var(--panel); }
+.ln:hover { background:var(--acc-soft); }
 .ts { color:var(--dim); font-variant-numeric:tabular-nums; } .ag { color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.lv { font-size:10.5px; padding-top:1px; } .lv.run { color:var(--run); } .lv.tool { color:#9C8CFF; } .lv.out { color:var(--ok); }
+.lv { font-size:10.5px; padding-top:1px; } .lv.run { color:var(--run); } .lv.tool { color:var(--accent); } .lv.out { color:var(--ok); }
 .lv.send { color:var(--muted); } .lv.hold { color:var(--hold); }
 .tx { color:var(--fg); overflow-wrap:anywhere; }
 .empty { padding:12px; color:var(--muted); }
-.ln.new { animation:flash .6s ease; } @keyframes flash { from { background:rgba(242,169,59,.12); } to { background:transparent; } }
+.ln.new { animation:flash .6s ease; } @keyframes flash { from { background:var(--run-soft); } to { background:transparent; } }
 .cursor { display:inline-block; width:7px; height:13px; margin:6px 12px; background:var(--run); animation:pulse 1s steps(2) infinite; }
 .foot { font-size:11.5px; color:var(--muted); }
 @media (max-width:720px) { .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } .ln { grid-template-columns:62px minmax(0,1fr); } .ag, .lv { display:none; } }
@@ -274,10 +283,10 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 <div class="kpis" id="kpis"></div>
 <div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1240 430" aria-hidden="true"></svg></div></div>
 <div class="log"><div class="log-head"><span class="t">RUN LOG</span><div class="filters" id="filters"></div></div><div class="log-body" id="logbody"></div></div>
-<div class="foot">Agents are the engine's stages. Decisions are rule-based and auditable; timings and numbers come from this run.</div>
 </div>
 <script>
 const D = __DATA__;
+document.documentElement.dataset.theme = D.theme === "dark" ? "dark" : "light";
 const S = D.stages, A = {}; D.agents.forEach(a => A[a.id] = a);
 const SV = Object.values(S).filter(s => s.start);
 const T0 = SV.length ? Math.min(...SV.map(s => s.start)) : 0;
@@ -310,9 +319,9 @@ function agentState(a, now) {
 /* canvas */
 const canvas = document.getElementById("canvas"), svg = document.getElementById("edges"), NS = "http://www.w3.org/2000/svg";
 const NX = c => 44 + c * 180, NY = r => 40 + r * 130;
-const ICON = { done: '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="#34C08F" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  running: '<svg viewBox="0 0 12 12"><path d="M6 1.5a4.5 4.5 0 1 1-4.5 4.5" fill="none" stroke="#F2A93B" stroke-width="1.6" stroke-linecap="round"/></svg>',
-  failed: '<svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" fill="none" stroke="#E07A5F" stroke-width="1.6" stroke-linecap="round"/></svg>' };
+const ICON = { done: '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  running: '<svg viewBox="0 0 12 12"><path d="M6 1.5a4.5 4.5 0 1 1-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  failed: '<svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>' };
 const nodes = {};
 D.agents.forEach(a => {
   const el = document.createElement("div"); el.className = "node s-waiting"; el.style.left = (NX(a.col) - 6) + "px"; el.style.top = NY(a.row) + "px";

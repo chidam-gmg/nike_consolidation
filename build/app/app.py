@@ -186,6 +186,49 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Dark mode — one switch for the whole page (app chrome + Agent lab), so nothing renders half light / half dark.
+_tg = st.columns([6, 1])
+DARK = _tg[1].toggle("Dark mode", key="dark_mode", help="Switch the whole app between GMG light and dark.")
+if DARK:
+    st.markdown("""
+<style>
+  :root { color-scheme: dark; }
+  .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background:#0A0D16 !important; }
+  .stApp { color:#E5E9F4; }
+  .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp li, .stApp label, .stApp summary,
+  [data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"] * { color:#E5E9F4 !important; }
+  [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color:#8790AB !important; }
+  [data-testid="stCaptionContainer"] strong { color:#C9D0E4 !important; }
+  .topbar { border-bottom-color:#252E48 !important; }
+  .topbar img { background:#FFFFFF; padding:3px 6px; border-radius:6px; }
+  .topbar div[style*="Georgia"] { color:#E5E9F4 !important; }
+  .topbar > div[style*="background:#E1E7E8"] { background:#252E48 !important; }
+  [data-testid="stExpander"] details { background:#111626 !important; border-color:#252E48 !important; }
+  [data-testid="stExpander"] summary { background:#111626 !important; color:#E5E9F4 !important; }
+  [data-testid="stExpander"] summary:hover { background:#161C30 !important; }
+  [data-testid="stVerticalBlockBorderWrapper"] { border-color:#252E48 !important; }
+  .stTabs [data-baseweb="tab-border"] { background:#252E48 !important; }
+  .stTabs [data-baseweb="tab"] p { color:#8790AB !important; }
+  .stTabs [aria-selected="true"] p { color:#E5E9F4 !important; }
+  [data-baseweb="select"] > div, [data-baseweb="base-input"], [data-baseweb="input"] > div, .stApp input, .stApp textarea,
+  [data-testid="stNumberInputContainer"] { background:#161C30 !important; color:#E5E9F4 !important; border-color:#252E48 !important; }
+  [data-baseweb="select"] div { background-color:#161C30 !important; color:#E5E9F4 !important; }
+  [data-baseweb="select"] svg { fill:#8790AB !important; }
+  [data-baseweb="tag"], [data-baseweb="tag"] * { background-color:#252E48 !important; }
+  [data-baseweb="popover"] ul, [data-baseweb="menu"] { background:#161C30 !important; }
+  [data-baseweb="popover"] li { color:#E5E9F4 !important; }
+  .stButton > button:not([kind="primary"]), .stDownloadButton > button, [data-testid="stNumberInputStepDown"],
+  [data-testid="stNumberInputStepUp"] { background:#161C30 !important; color:#E5E9F4 !important; border-color:#252E48 !important; }
+  [data-testid="stFileUploaderDropzone"] { background:#111626 !important; }
+  [data-testid="stAlertContainer"] { background:#161C30 !important; }
+  [data-testid="stAlertContainer"] * { color:#E5E9F4 !important; }
+  [data-testid="stDataFrame"], [data-testid="stTable"] { filter:invert(.92) hue-rotate(180deg); }
+  .kpi:not([style*="2658F2"]) { background:#111626 !important; }
+  .kpi:not([style*="2658F2"]) .val { color:#E5E9F4 !important; }
+  .stApp code { background:#161C30 !important; color:#8FB0FF !important; }
+</style>""", unsafe_allow_html=True)
+THEME = "dark" if DARK else "light"
+
 if DEV:
     st.warning("DEV PREVIEW — read-only copy on live data. Running the engine and config uploads are disabled here.")
 
@@ -475,7 +518,7 @@ if ss.run_state == "running":
             if cols[2].button("↻ Refresh now"):
                 st.rerun()
         try:   # agent lab, live: same board, current task states (no replay while running)
-            agent_view.render(dbio.agent_job_run(ss.run_id), {}, live=True)
+            agent_view.render(dbio.agent_job_run(ss.run_id), {}, live=True, theme=THEME)
         except Exception:
             pass
         time.sleep(4)
@@ -610,11 +653,17 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
             except Exception:   # no job view permission → results-only board (no stage timings)
                 _runs = []
             _jr = dbio.agent_match_run(_runs, _arid) if (_arid and _runs) else None
-            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))), run_id=_arid)
+            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))), run_id=_arid, theme=THEME)
             if _jr is None:
-                st.caption("Stage timings for this run are no longer in the job history — showing results only.")
+                st.caption("Stage timings for this run are not available — showing results only.")
         except Exception as e:
             st.info(f"Agent lab unavailable for this run: {e}")
+        # Ask the agents — placeholder; to be answered by a Databricks Genie space over this run's results.
+        _qa = st.columns([7, 1])
+        _qa[0].text_input("Ask the agents", key="ask_agents", disabled=True, label_visibility="collapsed",
+                          placeholder="Ask the agents — e.g. why did store 1122 get size M of NKIF1911-010?")
+        _qa[1].button("Ask", key="ask_agents_btn", disabled=True, use_container_width=True)
+        st.caption("Coming soon: answers from Databricks Genie over this run's moves, holds and DC lines.")
 
     # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
     with tab_replen:
