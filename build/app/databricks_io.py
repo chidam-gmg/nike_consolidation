@@ -24,7 +24,9 @@ NB_DIR = os.environ.get(
 )
 PROFILE = os.environ.get("DATABRICKS_CONFIG_PROFILE", "gmg-sso")
 
-# Ordered pipeline tasks (task_key, notebook)
+# Merged pipeline tasks (task_key, notebook). Shared prep 00->03 runs once, then consolidation (04->07) and
+# replenishment (10->13) fan out in PARALLEL. This ordered list is used for the progress total + the dev
+# fallback submit (which runs them serially — prod uses run_now on the merged job DAG).
 PIPELINE = [
     ("config", "00_config_validation"),
     ("effective_stock", "01_effective_stock"),
@@ -32,7 +34,13 @@ PIPELINE = [
     ("pools", "03_pools_guards"),
     ("match", "04_match_size"),
     ("reshape", "05_size_curve"),
+    ("replen_demand", "10_replen_demand"),
+    ("replen_ration", "11_replen_ration"),
+    ("receiver_guard", "08_receiver_guard"),   # joint receiver full-size guard: needs BOTH 05 and 11
     ("score", "06_score_output"),
+    ("archive", "07_history_archive"),
+    ("replen_output", "12_replen_output"),
+    ("replen_history", "13_replen_history"),
 ]
 
 
@@ -253,7 +261,8 @@ def submit_pipeline(params: dict) -> dict:
     Fallback (no NIKE_JOB_ID): one-time multi-task submit (dev)."""
     w = get_client()
     if JOB_ID:
-        job_params = {"COUNTRY": str(params.get("COUNTRY", "ALL"))}
+        job_params = {"COUNTRY": str(params.get("COUNTRY", "ALL")),
+                      "CATEGORY": str(params.get("CATEGORY", "ALL"))}
         for k in SCALAR_PARAMS:
             if k in params:
                 job_params[k] = str(int(params[k]))
@@ -344,11 +353,18 @@ def list_run_log(limit=25) -> pd.DataFrame:
     Empty until the first run after per-run attribution shipped (triggered_by column)."""
     try:
         return run_sql(f"""
-            SELECT run_id, run_ts, triggered_by, country_scope,
+            SELECT run_id, run_ts, triggered_by, country_scope, COALESCE(category_scope, 'ALL') AS category_scope,
                    recommended_moves, held_lines, not_moved_lines
             FROM {FQ}.run_stats_history ORDER BY run_ts DESC LIMIT {int(limit)}""")
     except Exception:
         return pd.DataFrame()
+
+
+def load_run_categories() -> list:
+    """Business categories (category converter) offered in the 'Categories to run' picker."""
+    df = run_sql(f"SELECT DISTINCT UPPER(TRIM(business_category)) AS c FROM {FQ}.cfg_category_converter "
+                 f"WHERE business_category IS NOT NULL AND TRIM(business_category) <> '' ORDER BY c")
+    return df["c"].tolist()
 
 
 # ---- reads used by the UI ----
@@ -364,10 +380,10 @@ def _src(base: str, run_id=None) -> str:
 
 def load_recommendations(run_id=None) -> pd.DataFrame:
     df = run_sql(f"""
-        SELECT country, parent_article, r.article, article_name, size, business_category, b.brand AS brand, gender, division,
+        SELECT country, parent_article, r.article, generic_article_name, article_name, size, business_category, b.brand AS brand, gender, division,
                article_season, demand_type, donor_apo, receiver_apo,
-               donor_store, donor_store_name, donor_bu, donor_available_sizes, donor_available_sizes_post_move,
-               receiver_store, receiver_store_name, receiver_bu, receiver_available_sizes, receiver_available_sizes_post_move,
+               donor_store, donor_store_name, donor_bu, donor_available_sizes, donor_available_sizes_post_move, donor_size_status_post_move,
+               receiver_store, receiver_store_name, receiver_bu, receiver_available_sizes, receiver_available_sizes_post_move, receiver_size_status_post_move,
                recommended_qty, reason, donor_stock, donor_intransit, receiver_stock, receiver_intransit,
                receiver_units_in, receiver_stock_post_move,
                donor_cover_days, receiver_cover_days, donor_ros, receiver_ros, donor_parent_ros, receiver_parent_ros,
@@ -388,6 +404,37 @@ def load_recommendations(run_id=None) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+REPLEN_FQ = os.environ.get("REPLEN_SCHEMA", f"{CATALOG}.{SCHEMA}")
+
+
+def load_replenishment() -> pd.DataFrame:
+    """DC->store replenishment recommendations (P1). Recommend-only. Built by the
+    `replenishment_pipeline_P1` job into `<catalog>.<schema>.replen_recommendations`."""
+    df = run_sql(f"""
+        SELECT country, category, division, parent_article, generic_article_name, article, size, receiver_store,
+               source, source_available, store_need, recommended_qty, reason,
+               demand_rate_day, protection_window, presentation_floor, store_atp, store_intransit, store_atp_after,
+               unit_price_aed, recurrence_propensity, decision
+        FROM {REPLEN_FQ}.replen_recommendations
+        WHERE recommended_qty >= 1
+        ORDER BY country, recurrence_propensity DESC, recommended_qty DESC, parent_article, receiver_store
+    """)
+    for c in ["source_available", "store_need", "recommended_qty", "demand_rate_day",
+              "protection_window", "presentation_floor", "store_atp", "store_intransit", "store_atp_after", "unit_price_aed"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def load_atp_info() -> dict:
+    """ATP freshness stamp (snapshot date used + when that snapshot was loaded upstream) for the UI."""
+    try:
+        df = run_sql(f"SELECT atp_snapshot_date, atp_updated_at, as_of_date FROM {FQ}.atp_snapshot_info")
+        return df.iloc[0].to_dict() if not df.empty else {}
+    except Exception:
+        return {}
 
 
 def load_run_stats(run_id=None) -> dict:
@@ -432,7 +479,7 @@ def load_not_moved(country=None, reason=None, category=None, article=None, brand
     j = f"{_src('not_moved', run_id)} n LEFT JOIN {_BRAND_SUB} b ON n.article = b.art"
     total = int(run_sql(f"SELECT COUNT(*) n FROM {j} {w}").iloc[0]["n"])
     df = run_sql(f"""
-        SELECT country, business_category, gender, division, parent_article, n.article, article_name, size, article_season,
+        SELECT country, business_category, gender, division, parent_article, n.article, generic_article_name, article_name, size, article_season,
                store_id, store_name, b.brand AS brand, bu, class, apo_key, available_sizes, effective_stock, intransit_qty, inventory_cost_aed,
                ros, parent_ros, cover_days, not_moved_reason
         FROM {j} {w}
@@ -453,7 +500,7 @@ def load_not_moved_full(country=None, reason=None, article=None, brand=None, run
         w = (w + " AND " + cond) if w else ("WHERE " + cond)
         return run_sql_full(f"SELECT n.* FROM {_src('not_moved', run_id)} n LEFT JOIN {_BRAND_SUB} b ON n.article = b.art {w} "
                             "ORDER BY n.country, n.not_moved_reason, n.store_id, n.parent_article, n.article")
-    return run_sql_full(f"SELECT country, business_category, gender, division, parent_article, article, article_name, size, "
+    return run_sql_full(f"SELECT country, business_category, gender, division, parent_article, article, generic_article_name, article_name, size, "
                         f"article_season, store_id, store_name, bu, class, apo_key, available_sizes, effective_stock, "
                         f"intransit_qty, inventory_cost_aed, ros, parent_ros, cover_days, not_moved_reason "
                         f"FROM {_src('not_moved', run_id)} {w} ORDER BY country, not_moved_reason, store_id, parent_article, article")
@@ -486,7 +533,7 @@ def load_held(country=None, reason=None, category=None, article=None, limit=5000
     w = _held_where(country, reason, article)
     total = int(run_sql(f"SELECT COUNT(*) n FROM {_src('held', run_id)} {w}").iloc[0]["n"])
     df = run_sql(f"""
-        SELECT country, business_category, gender, division, parent_article, h.article, article_name, size, article_season,
+        SELECT country, business_category, gender, division, parent_article, h.article, generic_article_name, article_name, size, article_season,
                donor_store, donor_store_name, b.brand AS brand, bu, class, apo_key, held_reason,
                would_be_receiver, would_be_receiver_name, would_be_receiver_ros, indicative_qty, indicative_value_aed,
                available_sizes, effective_stock, intransit_qty, inventory_cost_aed, ros, parent_ros, cover_days, decision
@@ -504,7 +551,7 @@ def load_held(country=None, reason=None, category=None, article=None, limit=5000
 def load_held_full(country=None, reason=None, article=None, brand=None, run_id=None) -> pd.DataFrame:
     """Full (unbounded) held for CSV export — all columns, chunk-paged."""
     w = _held_where(country, reason, article)
-    cols = ("h.country, h.business_category, h.gender, h.division, h.parent_article, h.article, h.article_name, "
+    cols = ("h.country, h.business_category, h.gender, h.division, h.parent_article, h.article, h.generic_article_name, h.article_name, "
             "h.size, h.article_season, h.donor_store, h.donor_store_name, h.bu, h.class, h.apo_key, h.held_reason, "
             "h.would_be_receiver, h.would_be_receiver_name, h.would_be_receiver_ros, h.indicative_qty, "
             "h.indicative_value_aed, h.available_sizes, h.effective_stock, h.intransit_qty, h.inventory_cost_aed, "
@@ -523,12 +570,12 @@ _BRAND_SUB = ("(SELECT MATERIAL AS art, MAX(`RF_BNDID`) AS brand "
               "FROM prod_mena.gold.mena_sports_product_master_view GROUP BY MATERIAL)")
 _COMBINED_SQL = """
 SELECT r.country, r.business_category AS category, r.gender, b.brand, r.division, r.demand_type,
-  r.parent_article AS parent, r.article, r.article_name, r.size, r.article_season AS season,
-  r.donor_store, r.donor_store_name, r.donor_available_sizes, r.donor_available_sizes_post_move,
+  r.parent_article AS parent, r.article, r.generic_article_name, r.article_name, r.size, r.article_season AS season,
+  r.donor_store, r.donor_store_name, r.donor_available_sizes, r.donor_available_sizes_post_move, r.donor_size_status_post_move,
   CAST(r.donor_ros AS DOUBLE) donor_ros, CAST(r.donor_parent_ros AS DOUBLE) donor_parent_ros,
   CAST(r.donor_cover_days AS DOUBLE) donor_cover_days, CAST(r.donor_stock AS INT) donor_stock,
   CAST(r.donor_intransit AS INT) donor_intransit, r.donor_apo,
-  r.reason, r.receiver_store, r.receiver_store_name, r.receiver_available_sizes, r.receiver_available_sizes_post_move,
+  r.reason, r.receiver_store, r.receiver_store_name, r.receiver_available_sizes, r.receiver_available_sizes_post_move, r.receiver_size_status_post_move,
   CAST(r.receiver_ros AS DOUBLE) receiver_ros, CAST(r.receiver_parent_ros AS DOUBLE) receiver_parent_ros,
   CAST(r.receiver_cover_days AS DOUBLE) receiver_cover_days, CAST(r.receiver_stock AS INT) receiver_stock,
   CAST(r.receiver_intransit AS INT) receiver_intransit, r.receiver_apo,
@@ -539,11 +586,11 @@ SELECT r.country, r.business_category AS category, r.gender, b.brand, r.division
 FROM {REC} r LEFT JOIN {BR} b ON r.article=b.art
 UNION ALL
 SELECT h.country, h.business_category, h.gender, b.brand, h.division, CAST(NULL AS STRING),
-  h.parent_article, h.article, h.article_name, h.size, h.article_season,
-  h.donor_store, h.donor_store_name, h.available_sizes, CAST(NULL AS STRING),
+  h.parent_article, h.article, h.generic_article_name, h.article_name, h.size, h.article_season,
+  h.donor_store, h.donor_store_name, h.available_sizes, CAST(NULL AS STRING), CAST(NULL AS STRING),
   CAST(h.ros AS DOUBLE), CAST(h.parent_ros AS DOUBLE), CAST(h.cover_days AS DOUBLE), CAST(h.effective_stock AS INT),
   CAST(h.intransit_qty AS INT), h.apo_key,
-  h.held_reason, h.would_be_receiver, h.would_be_receiver_name, CAST(NULL AS STRING), CAST(NULL AS STRING),
+  h.held_reason, h.would_be_receiver, h.would_be_receiver_name, CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING),
   CAST(h.would_be_receiver_ros AS DOUBLE), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE), CAST(NULL AS INT),
   CAST(NULL AS INT), CAST(NULL AS STRING),
   CAST(h.indicative_qty AS INT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
@@ -551,11 +598,11 @@ SELECT h.country, h.business_category, h.gender, b.brand, h.division, CAST(NULL 
 FROM {HELD} h LEFT JOIN {BR} b ON h.article=b.art
 UNION ALL
 SELECT n.country, n.business_category, n.gender, b.brand, n.division, CAST(NULL AS STRING),
-  n.parent_article, n.article, n.article_name, n.size, n.article_season,
-  n.store_id, n.store_name, n.available_sizes, CAST(NULL AS STRING),
+  n.parent_article, n.article, n.generic_article_name, n.article_name, n.size, n.article_season,
+  n.store_id, n.store_name, n.available_sizes, CAST(NULL AS STRING), CAST(NULL AS STRING),
   CAST(n.ros AS DOUBLE), CAST(n.parent_ros AS DOUBLE), CAST(n.cover_days AS DOUBLE), CAST(n.effective_stock AS INT),
   CAST(n.intransit_qty AS INT), n.apo_key,
-  n.not_moved_reason, CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING),
+  n.not_moved_reason, CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING),
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE), CAST(NULL AS INT),
   CAST(NULL AS INT), CAST(NULL AS STRING),
   CAST(NULL AS INT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
@@ -582,11 +629,11 @@ def _combined_export_sql(country=None, action=None, category=None, brand=None, s
     body = _COMBINED_SQL.format(REC=_src('recommendations', run_id), HELD=_src('held', run_id),
                                 NM=_src('not_moved', run_id), BR=_BRAND_SUB).strip()
     outer = f"SELECT * FROM ({body}) x"
-    conds = []
-    if country and country != "ALL":  conds.append(f"country = '{esc(country)}'")
-    if action and action != "all":    conds.append(f"action = '{esc(action)}'")
-    if category and category != "ALL": conds.append(f"category = '{esc(category)}'")
-    if brand and brand != "ALL":       conds.append(f"brand = '{esc(brand)}'")
+    def flt(col, val, all_tok):   # scalar (legacy) or list (multi-select; empty list = all)
+        vals = [v for v in (val if isinstance(val, (list, tuple, set)) else [val]) if v and v != all_tok]
+        return f"{col} IN ({', '.join(chr(39) + esc(v) + chr(39) for v in vals)})" if vals else None
+    conds = [c for c in (flt("country", country, "ALL"), flt("action", action, "all"),
+                         flt("category", category, "ALL"), flt("brand", brand, "ALL")) if c]
     if search:
         s = esc(search).lower()
         conds.append("(lower(article) LIKE '%{0}%' OR lower(article_name) LIKE '%{0}%' "
@@ -643,6 +690,165 @@ def replace_config_table(table: str, df: pd.DataFrame, bool_cols=None) -> int:
     for i in range(0, len(values), B):
         run_sql(f"INSERT INTO {FQ}.{table} ({col_list}) VALUES " + ", ".join(values[i:i + B]))
     return len(values)
+
+
+# ---- full / cut-size definition (cfg_size_curve) — download + validated upload ----
+SIZE_CURVE_COLS = ["division", "ah2_description", "gender", "size", "threshold"]
+_SC_DIVISIONS = {"FOOTWEAR", "APPAREL"}
+_SC_GENDERS = {"MENS", "WOMENS", "UNISEX", "KIDS"}
+KIDS_BAND_COLS = ["size", "id1"]
+# Excel turns sizes like 6-12 / 8-20 / 4/7 into dates ("06-Dec", "Aug-20", "04-Jul") — block those.
+_MONTH = r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+_DATE_LIKE = rf"(?i)(\d{{1,2}}-{_MONTH}|{_MONTH}-\d{{1,4}})"
+
+
+def _norm_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """lower-case, trim, drop BOM, spaces -> '_' (so 'AH2 Description' == 'ah2_description')."""
+    df = df.copy()
+    df.columns = [str(c).replace("﻿", "").strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+
+def load_size_curve() -> pd.DataFrame:
+    """Current full/cut-size definition (ALL genders incl. KIDS) in the exact upload format."""
+    return run_sql(f"SELECT {', '.join(SIZE_CURVE_COLS)} FROM {FQ}.cfg_size_curve "
+                   f"ORDER BY CASE WHEN UPPER(gender) = 'KIDS' THEN 1 ELSE 0 END, division, ah2_description, gender, size")
+
+
+def load_kids_size_bands() -> pd.DataFrame:
+    """Kids size -> age band (id1) mapping in the exact upload format."""
+    return run_sql(f"SELECT size, id1 FROM {FQ}.cfg_kids_size_band ORDER BY id1, size")
+
+
+def validate_kids_size_bands(df: pd.DataFrame):
+    """Check an uploaded kids size -> age band (id1) CSV (read with dtype=str). Returns (clean_df, errors,
+    warnings). A size may belong to several bands (e.g. 1C = CRIB and T); the engine picks per style."""
+    errors, warnings = [], []
+    df = _norm_headers(df)
+    missing = [c for c in KIDS_BAND_COLS if c not in df.columns]
+    if missing:
+        return None, [f"Missing column(s): {', '.join(missing)}. Required headers: size, id1."], []
+    extra = [c if c and not c.startswith("unnamed") else "(unnamed)" for c in df.columns if c not in KIDS_BAND_COLS]
+    if extra:
+        warnings.append(f"Ignored extra column(s): {', '.join(dict.fromkeys(extra))}.")
+    df = df[KIDS_BAND_COLS].fillna("").astype(str).apply(lambda s: s.str.strip().str.upper())
+    df = df[(df != "").any(axis=1)]                          # drop fully blank rows
+    if df.empty:
+        return None, ["The file has no data rows."], warnings
+    for c in KIDS_BAND_COLS:
+        m = df[c] == ""
+        if m.any():
+            errors.append(f"'{c}' is blank (row {', '.join(str(i + 2) for i in df.index[m.values][:5])})")
+    dl = df["size"].str.fullmatch(_DATE_LIKE)
+    if dl.any():
+        errors.append("size looks like an Excel date — format the Size column as Text and retype it "
+                      f"({', '.join(sorted(set(df.loc[dl, 'size']))[:6])}; e.g. 06-Dec = 6-12, Aug-20 = 8-20, 04-Jul = 4/7)")
+    if errors:
+        return None, errors, warnings
+    dup = int(df.duplicated().sum())
+    if dup:
+        df = df.drop_duplicates()
+        warnings.append(f"Removed {dup} duplicate row(s).")
+    multi = df.groupby("size")["id1"].nunique()
+    multi = multi[multi > 1]
+    if len(multi):
+        warnings.append(f"{len(multi)} size(s) sit in more than one age band ({', '.join(multi.index[:6])}) — "
+                        "fine: each style is placed in the band that best fits its size range.")
+    return df.reset_index(drop=True), [], warnings
+
+
+def validate_size_curve(df: pd.DataFrame, live: pd.DataFrame | None = None, bands: pd.DataFrame | None = None):
+    """Check an uploaded size-curve CSV (read with dtype=str) BEFORE it may replace the live table.
+    One file for ALL genders: adult rows = one ladder per (division, ah2, gender); KIDS rows = ah2 is the
+    sub-category (e.g. HOODIES, SANDALS) and the ladder is (division, ah2, age band) via `bands` (size -> id1).
+    Returns (clean_df, errors, warnings); any error => do not upload. clean_df is normalised: trimmed,
+    division/ah2/gender upper-cased, whole-number thresholds, exact duplicates dropped. Sizes are kept
+    verbatim (they must match the product-master RT_SIZE token exactly)."""
+    errors, warnings = [], []
+    df = _norm_headers(df)
+    missing = [c for c in SIZE_CURVE_COLS if c not in df.columns]
+    if missing:
+        return None, [f"Missing column(s): {', '.join(missing)}. Required headers: "
+                      f"{', '.join(SIZE_CURVE_COLS)}."], []
+    extra = [c if c and not c.startswith("unnamed") else "(unnamed)" for c in df.columns if c not in SIZE_CURVE_COLS]
+    if extra:
+        warnings.append(f"Ignored extra column(s): {', '.join(dict.fromkeys(extra))}.")
+    df = df[SIZE_CURVE_COLS].fillna("").astype(str).apply(lambda s: s.str.strip())
+    df = df[(df != "").any(axis=1)]                          # drop fully blank rows
+    if df.empty:
+        return None, ["The file has no data rows."], warnings
+    for c in ["division", "ah2_description", "gender"]:
+        df[c] = df[c].str.upper()
+
+    def bad(mask, msg, cap=5):
+        if mask.any():
+            rows = [str(i + 2) for i in df.index[mask.values]]   # +2 = header row + 1-based row numbers
+            errors.append(f"{msg} (row {', '.join(rows[:cap])}{'…' if len(rows) > cap else ''})")
+
+    for c in SIZE_CURVE_COLS:
+        bad(df[c] == "", f"'{c}' is blank")
+    set_ = lambda c: df[c] != ""
+    bad(set_("division") & ~df["division"].isin(_SC_DIVISIONS), "division must be FOOTWEAR or APPAREL")
+    kids = df["gender"] == "KIDS"
+    bad(set_("gender") & ~df["gender"].isin(_SC_GENDERS), "gender must be MENS, WOMENS, UNISEX or KIDS")
+    bad(~kids & (df["division"] == "APPAREL") & set_("ah2_description") & (df["ah2_description"] != "APPAREL"),
+        "for adult APPAREL rows, ah2_description must be APPAREL (kids apparel uses the sub-category)")
+    bad(df["size"].str.fullmatch(_DATE_LIKE),
+        "size looks like an Excel date — format the Size column as Text (e.g. 06-Dec = 6-12, Aug-20 = 8-20)")
+    thr = pd.to_numeric(df["threshold"], errors="coerce")
+    bad(set_("threshold") & (thr.isna() | (thr % 1 != 0) | (thr < 0)),
+        "threshold must be a whole number, e.g. 5 (text like 'GREATER THAN 5' is not allowed)")
+    if errors:
+        return None, errors, warnings
+    df["threshold"] = thr.astype(int).astype(str)
+    adult = df[~kids]
+    per_group = adult.groupby(["division", "ah2_description", "gender"])["threshold"].nunique()
+    for k in list(per_group[per_group > 1].index)[:5]:
+        errors.append(f"threshold differs within group {' / '.join(k)} — use one value per group")
+    kd = df[kids]
+    if len(kd):
+        if bands is None or bands.empty:
+            errors.append("KIDS rows need the kids size → age band (id1) mapping — upload or keep the mapping.")
+        else:
+            b = bands.assign(size=bands["size"].astype(str).str.strip().str.upper(),
+                             id1=bands["id1"].astype(str).str.strip().str.upper()).drop_duplicates()
+            kk = kd.assign(_s=kd["size"].str.upper()).merge(b, left_on="_s", right_on="size",
+                                                            how="left", suffixes=("", "_b"))
+            unmapped = sorted(set(kk.loc[kk["id1"].isna(), "size"]))
+            if unmapped:
+                warnings.append(f"{len(unmapped)} kids size(s) are not in the age-band mapping and will be ignored: "
+                                + ", ".join(unmapped[:8]) + ("…" if len(unmapped) > 8 else ""))
+            kk = kk[kk["id1"].notna()]
+            lad = kk.groupby(["division", "ah2_description", "id1"]).agg(
+                n_thr=("threshold", "nunique"), thr=("threshold", "max"), n_sizes=("size", "nunique"))
+            for k in list(lad[lad["n_thr"] > 1].index)[:5]:
+                errors.append(f"KIDS threshold differs within ladder {' / '.join(k)} (sub-category / age band) — "
+                              "use one value per ladder")
+            never = lad[(lad["n_thr"] == 1) & (lad["thr"].astype(int) >= lad["n_sizes"])]
+            if len(never):
+                warnings.append(f"{len(never)} KIDS ladder(s) can never be full at A+/A stores (threshold ≥ number of "
+                                "key sizes; other grades use threshold − 1), so moves into them will be held: " + "; ".join(
+                                    f"{d} / {a} / {g} (>{r.thr} of {r.n_sizes})" for (d, a, g), r in never.head(8).iterrows())
+                                + ("…" if len(never) > 8 else ""))
+    if errors:
+        return None, errors, warnings
+    dup = int(df.duplicated().sum())
+    if dup:
+        df = df.drop_duplicates()
+        warnings.append(f"Removed {dup} duplicate row(s).")
+    odd = sorted(set(df.loc[df["size"].str.fullmatch(r"\d+\.0"), "size"]))
+    if odd:
+        warnings.append(f"Size value(s) {', '.join(odd[:6])} look like spreadsheet artefacts — the product "
+                        f"master writes whole sizes without '.0' (e.g. 10), so these will not match.")
+    if live is not None and not live.empty:
+        grp = lambda d: set(map(tuple, d[["division", "ah2_description", "gender"]]
+                                .astype(str).apply(lambda s: s.str.strip().str.upper()).values))
+        dropped = sorted(grp(live) - grp(df))
+        if dropped:
+            warnings.append(f"{len(dropped)} group(s) in the current definition are NOT in this file and will be "
+                            f"removed: " + "; ".join(" / ".join(k) for k in dropped[:6])
+                            + ("…" if len(dropped) > 6 else "") + ". Upload the full definition to keep them.")
+    return df.reset_index(drop=True), [], warnings
 
 
 # ---- active store list (cfg_store_grade) — the authoritative store universe + grade source ----

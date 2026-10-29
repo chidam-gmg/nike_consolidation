@@ -4,6 +4,70 @@ Running backlog of known shortcuts / deferred work. Newest first.
 
 ---
 
+## TD-8 · Article-level open-STO feed for receiver checks (2026-10-07)
+
+**Status:** Requested from data team — engine uses in-transit only until it lands.
+
+**Issue:** receiver checks now count `ATP + in-transit` (business point 5). "In-process" moves that are
+**released but not yet shipped** (open STOs / APO / delivery not goods-issued) are invisible: `combined_inventory`
+blank-stor_loc rows only carry shipped stock, `atp_detail.apo_*` is a flag with no qty/date, and `omni_sto_report`
+is not article-level. So a store with an open STO can still be recommended the same size.
+
+**Request (data team):** daily table, grain = receiving site × article (variant) × STO, with: STO number + line,
+supplying site, receiving site, article, open qty (ordered − goods-issued − received), created date, planned
+delivery date, status (open / partially shipped). Refreshed before 09:30 GST (pipeline runs 10:30).
+
+**Wiring when available:** add open-STO qty to `store_intransit` (nb 01) so every check — receiver pool, nb05
+display gate, nb10 replen need, nb08 joint guard — picks it up with no further change.
+
+---
+
+## TD-7 · Store-level allowed season list (2026-10-07)
+
+**Status:** PARKED by business (2026-10-07) — do not build.
+
+**Ask:** a per-store list of seasons a store may receive (instead of / on top of `cfg_store_season.allow_seasons_back`,
+which is a single "N seasons back" rule). Today the season gate is store × seasons-back only (nb 03 receiver pool).
+When picked up: new config `cfg_store_allowed_season (store_id, season_label)` + UI upload, applied in nb 03
+receiver pool, nb 10/11 replen eligibility and the nb 08 full-size top-up season check.
+
+---
+
+## TD-6 · Replenishment lead times — cross-border lanes & the whole lead-time model (2026-09-18)
+
+**Status:** Deferred by business (parked as tech debt). The DC→store replenishment model now sources
+cross-border (UAE hub 1D00/1D01 serves UAE/KWT/OMN/QTR as primary and KSA/BAH as fallback top-up), but the
+**lead time used for the cover window was NOT upgraded to match** — flagged and parked here.
+
+**Current state (the shortcut):** the order-up-to target in `10_replen_demand` is
+`S = demand_rate_day × protection_window`, where `protection_window = REVIEW_PERIOD_DAYS (flat 3) + LT`, and
+`LT` = the **destination country's** single percentile from `cfg_replen_leadtime` — **P75 for all, hardcoded
+override to P90 for BH** (`LTCOL`/`LT_Q`, with the BH special-case inline in the `REVIEW_LT` join). One number
+per destination country, regardless of which DC actually ships.
+
+**The gaps:**
+1. **Cross-border lanes not modelled (the specific ask).** A KSA/KWT/OMN/QTR/BAH store fed from the **UAE hub**
+   crosses a border (customs + longer transit) but is costed with its **own destination-country lead time**, so
+   hub-fed lines' cover windows are **understated** → under-buys the protection for exactly the fallback lines.
+   Need a lead time per **(source pool → destination country)** lane — at least: hub→KSA, hub→KWT, hub→OMN,
+   hub→QTR, hub→BAH (distinct from the local-DC lanes 2D22→KSA, 3D31→BAH, and the domestic 1D00→UAE).
+2. **The lead-time model overall is coarse.** One percentile per country; the **P75-vs-P90 choice is a single
+   global switch** with a hardcoded BH exception baked into SQL (should be config, per lane); the **3-day review
+   period is flat** (not per country/format); provenance of the `cfg_replen_leadtime` P50/P75/P90 figures is
+   unclear (which historical STO lanes they were derived from). No SKU/mode variation.
+
+**Suggested direction (when picked up):** replace `cfg_replen_leadtime` (country → percentile) with a
+**lane table** keyed `(source_pool, dest_country)` carrying the review period + chosen percentile per lane;
+join it in `10_replen_demand` on the pool that actually sources each line (needs the sourcing decision, which
+today is resolved later in `11_replen_ration` — so either pre-resolve the dominant source, or compute the
+protection window per candidate lane). Removes the inline BH/P90 hack. Cross-border lane lead times to be
+supplied by business/logistics.
+
+**Related:** the AED value of hub-fed cross-border recommendations is large (~AED 28.6M at the 2026-09-17
+refresh); realistic lead times will reshape those quantities.
+
+---
+
 ## TD-4 · Cross-BU (multi-brand) consolidation flows (planned, ~few months out) (2026-08-06)
 
 **Status:** Deferred by business. Scope stays brand-to-brand within a brand's OWN stores for now
@@ -91,6 +155,14 @@ Small, deterministic; pairs naturally with TD-3.
 
 ## TD-1 · Config-file upload persistence, audit & download (2026-07-23)
 
+**Partial progress (2026-10-02) — size curve only:** the full/cut-size uploader now (a) reads the CSV as text
+(stops `10` → `10.0` when sizes are all numeric), (b) **validates before replacing** the live table (required
+headers, whole-number threshold, no blanks, allowed division/gender, APPAREL→ah2=APPAREL, one threshold per group,
+KIDS rejected) and disables Run on error, (c) warns on partial files that would drop groups, `.0` size artefacts and
+duplicates, and (d) has a **Download current definition** button. Still open for all configs: raw-file archive,
+upload log/audit (who/when), version history/rollback, `.xlsx` support, and BU-eligibility validation. Kids
+(`cfg_size_curve_kids`) still has no UI upload.
+
 **Ask (business):** every CSV/Excel file uploaded under the run parameters must be **saved to a
 Databricks table with its upload date**, and the user must be able to **download the latest uploaded
 file from the UI**. Required for:
@@ -141,3 +213,24 @@ the same upload → persist → audit → download flow:
 
 **Not currently churning:** `cfg_brand_mapping` (13 Nike IDs) is **unused** after the BU-scope change —
 skip unless article-brand scope returns.
+
+---
+
+## TD-5 · Enrich consolidation receiver-demand with PDA de-censored signal (2026-08-24)
+
+**Status:** Deferred (parked). Build core DC→store replenishment (P1) first, as planned.
+
+**Why:** As-of-T backtest (T=2026-06-30, fwd Jul) on where stock for *actual recurring losses* sits:
+same-country **sister store (consolidation) 63%** · network-dry (buy/allocate) 27% · **in-country DC (replen) 6%** ·
+UAE hub 4%. So the biggest in-season lever is **consolidation**, and its engine currently builds receiver-demand
+from sales-based OOS only — **blind to censored (RoS=0) demand** that the PDA runner log captures directly.
+
+**The enhancement:** feed `runner_app_catalog` PDA loss (recurring, de-censored) into the consolidation
+`receiver_pool` (module 03) demand universe, so consolidation recommends transfers for sizes that show zero sales
+but real repeated demand. Expands/sharpens the 63% lever, especially RoS=0 censored sizes.
+
+**Caveat on the 6% / 63% split:** the backtest ran on **July = launch season** (3/6-mo cycle) — unrepresentative
+(new products, thin DC, allocation-dominated). Re-run on an in-season month before quoting; the in-country-DC
+share is biased low. Structural finding (thin country DCs, UAE=85% of DC stock) is robust regardless.
+
+**Dev artifacts:** `sports_analytics_test.replen_p1_dev.{pda_demand_signal, bt_worklist_T, bt_forward}`.

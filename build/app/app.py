@@ -1,6 +1,6 @@
-"""Nike Store-to-Store Consolidation — review & export UI (Streamlit approximation of the
-Claude Design mock). Thin front-end: set parameters → trigger the Databricks pipeline →
-review recommended moves → export. No business logic here; the engine (00-06) does it all.
+"""Nike Stock Movement Engine — review & export UI (store→store consolidation + DC→store
+replenishment). Streamlit front-end: set parameters → trigger the Databricks pipeline →
+review recommended moves → export. No business logic here; the engine notebooks do it all.
 
 GMG Brand Book V6, INFORM end: Sapphire #20274C, Cobalt #2658F2, Light Silver #E9EFEF,
 Burnt Copper #B15940. Economics columns are PROVISIONAL (movement cost / probability-to-sell pending).
@@ -126,7 +126,7 @@ def full_csv_ui(col, key, loader, fname, sig, gz_loader=None):
 # ---------- palette ----------
 SAPPHIRE, COBALT, SILVER, COPPER = "#20274C", "#2658F2", "#E9EFEF", "#B15940"
 
-st.set_page_config(page_title="Nike Consolidation Engine", layout="wide", page_icon="⇄")
+st.set_page_config(page_title="Nike Stock Movement Engine", layout="wide", page_icon="⇄")
 
 st.markdown(f"""
 <style>
@@ -163,11 +163,21 @@ st.markdown(
     f"<div style='width:1px;height:26px;background:#E1E7E8;'></div>"
     f"<img src='{NIKE_LOGO}' style='height:26px;border-radius:4px;'/>"
     f"<div style='width:1px;height:26px;background:#E1E7E8;'></div>"
-    f"<div><div class='eyebrow'>NIKE · STORE-TO-STORE</div>"
-    f"<div style='font-family:Georgia,serif;font-size:22px;color:{SAPPHIRE};'>Consolidation engine</div></div>"
+    f"<div><div class='eyebrow'>NIKE · CONSOLIDATION + REPLENISHMENT</div>"
+    f"<div style='font-family:Georgia,serif;font-size:22px;color:{SAPPHIRE};'>Stock movement engine</div></div>"
     f"<div style='flex:1'></div><div style='font-size:11px;color:#8891A6;'>● Databricks</div></div>",
     unsafe_allow_html=True,
 )
+
+# ATP freshness stamp — snapshot the run used + when that snapshot was loaded upstream (etl_timetsamp)
+try:
+    _atp = dbio.load_atp_info()
+    if _atp.get("atp_snapshot_date"):
+        _upd = human_ts(_atp["atp_updated_at"]) if _atp.get("atp_updated_at") else "—"
+        _dmd = f" · demand window through **{_atp['as_of_date']}**" if _atp.get("as_of_date") else ""
+        st.caption(f"📦 Inventory (ATP) as of **{_atp['atp_snapshot_date']}**{_dmd} · upstream loaded **{_upd}**")
+except Exception:
+    pass
 
 # ---------- session ----------
 ss = st.session_state
@@ -229,9 +239,84 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                "(`sports_analytics_test.nike_consolidation.cfg_brand_mapping` / `cfg_category_converter`) — "
                "no upload needed. The active store list, size-curve and BU-eligibility can be replaced below.")
     uc = st.columns(3)
-    up_size = uc[0].file_uploader("Full / cut-size definition", type="csv", key="up_size")
+    up_size = uc[0].file_uploader(
+        "Full / cut-size definition", type="csv", key="up_size",
+        help="CSV, one row per key size, headers: division, ah2_description, gender, size, threshold — ALL genders "
+             "incl. KIDS in one file. Adult: one ladder per division / ah2 / gender (adult apparel ah2 = APPAREL). "
+             "KIDS: ah2 = sub-category (e.g. HOODIES, SANDALS); the ladder is sub-category + age band (from the "
+             "kids size → age band mapping below). A store×style is FULL size when its in-stock key sizes > threshold. "
+             "The upload REPLACES the whole definition, so download the current one, edit it, and re-upload the full file.")
     up_bu = uc[1].file_uploader("BU-eligibility matrix", type="csv", key="up_bu")
     up_stores = uc[2].file_uploader("Active store list (grades)", type=["csv", "xlsx"], key="up_stores")
+
+    # full/cut-size definition: download the current one; validate any upload BEFORE it can replace the live table
+    _sc_live, size_df, size_err = None, None, False
+    try:
+        _sc_live = dbio.load_size_curve()
+        uc[0].download_button(f"⬇ Download current definition ({len(_sc_live)})",
+                              data=dbio.to_csv_bytes(_sc_live), file_name="size_curve_definition.csv",
+                              mime="text/csv", key="dl_size", use_container_width=True)
+    except Exception:
+        uc[0].caption("Current definition unavailable (sign-in/consent may be needed).")
+    # kids size -> age band (id1) mapping: resolves which kids ladder a size belongs to (download / upload)
+    up_bands = uc[0].file_uploader(
+        "Kids size → age band (id1)", type="csv", key="up_bands",
+        help="CSV, headers: size, id1 — one row per kids size and age band (e.g. 2T,l · 1C,CRIB · 1C,T). A size may "
+             "sit in several bands; each style is placed in the band that best fits its size range. "
+             "The upload REPLACES the whole mapping.")
+    _kb_live, bands_df, bands_err = None, None, False
+    try:
+        _kb_live = dbio.load_kids_size_bands()
+        uc[0].download_button(f"⬇ Download kids age-band mapping ({len(_kb_live)})",
+                              data=dbio.to_csv_bytes(_kb_live), file_name="kids_size_band.csv",
+                              mime="text/csv", key="dl_bands", use_container_width=True)
+    except Exception:
+        uc[0].caption("Kids age-band mapping unavailable (sign-in/consent may be needed).")
+    if up_bands is not None:
+        try:
+            up_bands.seek(0)
+            bands_df, _kb_errs, _kb_warns = dbio.validate_kids_size_bands(
+                pd.read_csv(up_bands, dtype=str, keep_default_na=False))
+        except Exception as e:
+            bands_df, _kb_errs, _kb_warns = None, [f"Could not read the file: {e}"], []
+        if _kb_errs:
+            bands_err = True
+            uc[0].error("Kids age-band mapping NOT accepted — fix and re-upload. The live mapping is unchanged.\n\n- "
+                        + "\n- ".join(_kb_errs))
+        else:
+            uc[0].success(f"✅ Valid: {len(bands_df)} size → band rows, {bands_df['id1'].nunique()} bands — "
+                          "applied when you click Run.")
+        for _w in _kb_warns:
+            uc[0].warning(_w)
+    if up_size is not None:
+        try:
+            up_size.seek(0)
+            # dtype=str: keep sizes verbatim (otherwise an all-numeric column turns 10 into 10.0 and stops matching)
+            size_df, _sc_errs, _sc_warns = dbio.validate_size_curve(
+                pd.read_csv(up_size, dtype=str, keep_default_na=False), _sc_live,
+                bands_df if bands_df is not None else _kb_live)   # kids ladders resolved via the mapping in force
+        except Exception as e:
+            size_df, _sc_errs, _sc_warns = None, [f"Could not read the file: {e}"], []
+        if _sc_errs:
+            size_err = True
+            uc[0].error("Size definition NOT accepted — fix and re-upload. The live definition is unchanged.\n\n- "
+                        + "\n- ".join(_sc_errs))
+        else:
+            _nk = int((size_df["gender"] == "KIDS").sum())
+            _ng = size_df[size_df["gender"] != "KIDS"].groupby(["division", "ah2_description", "gender"]).ngroups
+            uc[0].success(f"✅ Valid: {len(size_df)} rows ({_ng} adult groups, {_nk} kids rows) — "
+                          "applied when you click Run.")
+        for _w in _sc_warns:
+            uc[0].warning(_w)
+    elif bands_df is not None and _sc_live is not None:
+        # mapping changed on its own: re-check the LIVE definition's kids ladders against the new mapping
+        _, _x_errs, _x_warns = dbio.validate_size_curve(_sc_live, None, bands_df)
+        if _x_errs:
+            bands_err = True
+            uc[0].error("This age-band mapping does not fit the live size definition:\n\n- " + "\n- ".join(_x_errs))
+        for _w in _x_warns:
+            uc[0].warning(_w)
+    size_err = size_err or bands_err
     # active store list — the authoritative universe + grade source; download current, upload to replace
     _sl = None
     try:
@@ -249,16 +334,26 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                  "OMN": "OM", "OMAN": "OM", "QTR": "QA", "QATAR": "QA", "EGY": "EG", "EGYPT": "EG"}
     _sl_countries = []
     run_countries = []
+    run_categories = []
     if _sl is not None:
         _sl_countries = sorted(_sl["COUNTRY"].dropna().astype(str).str.strip().unique().tolist())
         _prov = dbio.store_list_provenance()
         st.caption(f"📋 Active store list: **{len(_sl)} stores** across {', '.join(_sl_countries)}  ·  "
                    f"last changed by **{_prov['user']}** on {human_ts(_prov['ts'])}")
-        rc = st.columns([3, 1])
+        rc = st.columns([2, 2, 1])
         run_countries = rc[0].multiselect(
             "Countries to run", _sl_countries, default=_sl_countries, key="run_countries",
-            help="Scope THIS run to selected countries. Ephemeral — it does not edit the shared store list.")
-        if rc[1].button("↺ Reset store list to baseline", key="reset_stores", use_container_width=True):
+            help="Scope THIS run to selected countries. The list comes from the active store list — a country "
+                 "only appears if the store list has stores in it. Ephemeral — it does not edit the store list.")
+        try:
+            _run_cat_opts = dbio.load_run_categories()
+        except Exception:
+            _run_cat_opts = []
+        run_categories = rc[1].multiselect(
+            "Categories to run", _run_cat_opts, key="run_categories", placeholder="All categories",
+            help="Scope THIS run to selected business categories (e.g. FOOTBALL). Empty = all categories. "
+                 "Moves, replenishment, held and not-moved are all limited to these categories.")
+        if rc[2].button("↺ Reset store list to baseline", key="reset_stores", use_container_width=True):
             try:
                 n = dbio.reset_store_grades_to_baseline()
                 st.success(f"Store list reset to governed baseline ({n} stores)."); st.rerun()
@@ -266,7 +361,9 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                 st.error(f"Reset failed: {e}")
 
     running = ss.run_state == "running"
-    if st.button("▶ Run consolidation", type="primary", disabled=cover_err or running,
+    if size_err:
+        st.error("Run is disabled until the size-definition / kids age-band file is fixed (or removed from the uploader).")
+    if st.button("▶ Run stock movement", type="primary", disabled=cover_err or running or size_err,
                  use_container_width=True):
         with st.spinner("Submitting job…"):
             try:
@@ -274,8 +371,10 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                 if up_bu is not None:
                     dbio.replace_config_table("cfg_bu_eligibility", pd.read_csv(up_bu),
                                               bool_cols=["allowed"])
-                if up_size is not None:
-                    dbio.replace_config_table("cfg_size_curve", pd.read_csv(up_size))
+                if bands_df is not None:  # mapping first: the size definition's kids ladders resolve through it
+                    dbio.replace_config_table("cfg_kids_size_band", bands_df)
+                if size_df is not None:   # already validated + normalised above
+                    dbio.replace_config_table("cfg_size_curve", size_df)
                 if up_stores is not None:
                     _sdf = pd.read_excel(up_stores) if up_stores.name.lower().endswith("xlsx") else pd.read_csv(up_stores)
                     dbio.replace_store_grades(_sdf)
@@ -288,6 +387,8 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                     params["COUNTRY"] = iso or "ALL"
                 else:
                     params["COUNTRY"] = "ALL"
+                # category scope is a RUN parameter too ('|'-separated; empty => ALL)
+                params["CATEGORY"] = "|".join(run_categories) if run_categories else "ALL"
                 # per-run identity: the app owns RUN_ID so it can read back exactly ITS run (isolation),
                 # and stamps who triggered it. TRIGGERED_BY + RUN_ID flow to 00 → run_config → 07 history.
                 eng_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
@@ -311,8 +412,11 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
 if ss.run_state == "running":
     TASK_LABELS = {"config": "Validating config", "effective_stock": "Building effective stock",
                    "classify": "ROS / cover / classification", "pools": "Donor & receiver pools + guards",
-                   "match": "Matching & sizing", "reshape": "Size-curve", "score": "Scoring & output",
-                   "archive": "Archiving run to history"}
+                   "match": "Matching & sizing", "reshape": "Size-curve",
+                   "receiver_guard": "Receiver full-size guard (store + DC)", "score": "Scoring & output",
+                   "archive": "Archiving run to history",
+                   "replen_demand": "Replenishment demand", "replen_ration": "Replenishment rationing",
+                   "replen_output": "Replenishment output", "replen_history": "Archiving replenishment"}
     try:
         s = dbio.run_status(ss.run_id)
     except Exception as e:
@@ -368,7 +472,7 @@ if ss.run_state == "empty":
             "countries — you review, filter, and export.")
 
 elif ss.run_state == "error":
-    st.error("The consolidation job did not complete.")
+    st.error("The stock movement job did not complete.")
     st.code(ss.error_msg or "Unknown error", language="text")
 
 elif ss.run_state == "no-results":
@@ -396,7 +500,10 @@ elif ss.run_state == "results":
     if VRID:
         st.caption(f"👁 Viewing **your run** · by **{stats.get('triggered_by', '—')}** · "
                    f"{human_ts(stats.get('run_ts', stats.get('computed_at', '—')))} · "
-                   f"scope **{stats.get('country_scope', 'ALL')}**  ·  run `{VRID}`")
+                   f"scope **{stats.get('country_scope', 'ALL')}**"
+                   + (f" · category **{stats.get('category_scope')}**"
+                      if str(stats.get('category_scope') or 'ALL') not in ('ALL', 'None', 'nan') else "")
+                   + f"  ·  run `{VRID}`")
     else:
         st.caption("👁 Viewing the **latest completed run** (shared across users). "
                    "Run the engine to get your own isolated view.")
@@ -408,7 +515,9 @@ elif ss.run_state == "results":
         _labels, _map = [], {}
         for _, r in _log.iterrows():
             lbl = (f"{human_ts(r['run_ts'])} · {r.get('triggered_by', '—')} · "
-                   f"{r['country_scope']} · {int(float(r['recommended_moves'] or 0))} moves")
+                   f"{r['country_scope']}"
+                   + (f" · {r['category_scope']}" if str(r.get('category_scope') or 'ALL') != 'ALL' else "")
+                   + f" · {int(float(r['recommended_moves'] or 0))} moves")
             _labels.append(lbl); _map[lbl] = r["run_id"]
         _idx = next((i for i, l in enumerate(_labels) if _map[l] == VRID), 0)
         pick = fh[0].selectbox("View a run", _labels, index=_idx, key="run_picker")
@@ -438,6 +547,7 @@ elif ss.run_state == "results":
 - **Cover (days)** — ATP ÷ ROS (blank = dead/∞).
 - **ATP** — sellable stock (SL01). **This is the only stock figure the engine uses** for cover, donor surplus and receiver need.
 - **In-transit** — units on the way to the store (latest snapshot). **Counted for the receiving store** — a receiver's need already nets off stock inbound to it, so the engine won't over-ship.
+- **Generic article name** — parent style name without the size (product master parent row; fallback = article name minus the size).
 - **Article name** — product description (product master TXTMD).
 - **APO** — Y if an APO key is present for that parent at the store (from the ATP table, rolled up from child to parent). The receiver APO reads N by design — APO parents are already excluded from receivers.
 - **Reason** — Dead (no sales) or Slow-moving (cover over threshold).
@@ -447,9 +557,9 @@ elif ss.run_state == "results":
 - **Net benefit\\*** — uplift − movement cost (assumed **AED 5/unit**). *(\\* provisional until real cost & probability-to-sell are confirmed.)*
 - **Season** — the article's Nike season (Jan–Mar Spring, Apr–Jun Summer, Jul–Sep Fall, Oct–Dec Holiday) + year; CORE/YEAR = carried all-year.
 
-**The three tabs together account for every store×article line with ATP** (Moved ⊎ Held ⊎ Not moved):
-- **Recommended moves** — proposed donor→receiver transfers.
-- **Held** — donor surplus that *would* move but a soft guard blocked it, so business can override. **Held reason:** *Size-curve break* (would break the donor's full-size run), *Season-freshness* (a would-be receiver can't stock this season), *APO* (the would-be receiver already has an inbound APO for this parent). Each row shows a **would-be receiver** + **indicative qty** (min of donor surplus and receiver need) and a blank **Decision** column to mark Approve/Keep.
+**The Action column accounts for every store×article line with ATP** (Moved ⊎ Held ⊎ Not moved):
+- **move** — proposed donor→receiver transfers.
+- **Held** — donor surplus that *would* move but a soft guard blocked it, so business can override. **Held reason:** *Size-curve break* (would break the donor's full-size run), *Season-freshness* (a would-be receiver can't stock this season), *APO* (the would-be receiver already has an inbound APO for this parent). *Receiver stays cut-size* (after ATP + in-transit + all store and DC moves the receiver still can't display a full run). *Move-back <30d* (the article left that receiver in the last 30 days). Each row shows a **would-be receiver** + **indicative qty** (min of donor surplus and receiver need) and a blank **Decision** column to mark Approve/Keep.
 - **Not moved** — everything retained, with a reason: *no receiving store needs this size*, *new to store*, or *retained – selling within cover* (healthy).
 
 **Why moved** *(tag on every line):*
@@ -458,11 +568,87 @@ elif ss.run_state == "results":
 - *Moved - run released & consolidated to a faster receiver (>=25%) to display* — moving would break the donor's (dead/slow) run, but a receiver sells **≥25% faster**, so the run is released and consolidated into that faster receiver to display the full ladder.
 - *Moved - no size rule (fallback)* — item has no size definition (e.g. kids/accessories); moved on demand alone, without the size-curve check.
 
-Every store×size sits in exactly one of three tabs: **Recommended moves** (to action), **Held** (would move but a soft guard blocked it — size-curve break / season-freshness / APO — with an indicative qty for a business call), and **Not moved** (no receiving store needs the size / new-to-store / retained & selling within cover).
+Every store×size sits in exactly one **Action**: **move** (to action), **held** (would move but a soft guard blocked it — size-curve break / season-freshness / APO — with an indicative qty for a business call), or **dont move** (no receiving store needs the size / new-to-store / retained & selling within cover).
         """)
 
-    tab_all, tab_moves, tab_held, tab_nm = st.tabs(
-        ["🧾  All (one table)", "📦  Recommended moves", "🔒  Held", "🚫  Not moved"])
+    tab_all, tab_replen = st.tabs(
+        ["🧾  Store consolidation", "🔁  Replenishment (DC→Store)"])
+
+    # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
+    with tab_replen:
+        st.caption("**DC → store replenishment** — recommend-only. Demand = **POS rate-of-sale** (retail). "
+                   "Target per size = **max(14-day demand cover, 1 facing)**, rounded up; when the in-country "
+                   "DC is short, stock is **rationed** across stores (flagship→A→B→C, breadth before depth). "
+                   "Built by the `replenishment_pipeline_P1` job.")
+        try:
+            rdf = dbio.load_replenishment()
+        except Exception as e:
+            st.warning(f"Could not load replenishment recommendations: {e}")
+            rdf = pd.DataFrame()
+        if len(rdf):
+            rfc = st.columns([1.2, 1.6, 1.2, 3])
+            # multi-select filters (empty = all)
+            r_ctry = rfc[0].multiselect("Country", sorted(str(c) for c in rdf["country"].dropna().unique()),
+                                        key="rp_ctry_m", placeholder="All countries", label_visibility="collapsed")
+            r_reason = rfc[1].multiselect("Reason", sorted(str(c) for c in rdf["reason"].dropna().unique()),
+                                          key="rp_reason_m", placeholder="All reasons", label_visibility="collapsed")
+            r_prop = rfc[2].multiselect("Propensity", ["HIGH", "MED", "LOW", "THIN"],
+                                        key="rp_prop_m", placeholder="All propensities", label_visibility="collapsed")
+            rv = rdf.copy()
+            if r_ctry:
+                rv = rv[rv["country"].isin(r_ctry)]
+            if r_reason:
+                rv = rv[rv["reason"].isin(r_reason)]
+            if r_prop:
+                rv = rv[rv["recurrence_propensity"].isin(r_prop)]
+            rk = st.columns(4)
+            kpi(rk[0], "Lines", f"{len(rv):,}")
+            kpi(rk[1], "Units to ship", f"{int(rv['recommended_qty'].sum()):,}")
+            kpi(rk[2], "Stores", f"{rv['receiver_store'].nunique():,}")
+            kpi(rk[3], "SKUs", f"{rv['article'].nunique():,}")
+            rshow = rv.rename(columns={
+                "country": "Country", "category": "Category", "division": "Division",
+                "parent_article": "Parent", "generic_article_name": "Generic article name", "article": "Article", "size": "Size",
+                "receiver_store": "Store", "source": "Source", "source_available": "DC ATP",
+                "store_need": "Need", "recommended_qty": "Replen qty", "reason": "Reason",
+                "demand_rate_day": "Demand/day", "protection_window": "Cover window (d)",
+                "presentation_floor": "Display floor",
+                "store_atp": "Store ATP (before)", "store_intransit": "Store in-transit", "store_atp_after": "Store ATP (after)",
+                "unit_price_aed": "Unit price (AED)", "recurrence_propensity": "Recurrence", "decision": "Decision",
+            })
+            rcols = ["Country", "Category", "Division", "Parent", "Generic article name", "Article", "Size", "Store", "Reason", "Recurrence",
+                     "Demand/day", "Cover window (d)", "Display floor", "Store ATP (before)", "Store in-transit", "Need",
+                     "Source", "DC ATP", "Replen qty", "Store ATP (after)", "Unit price (AED)", "Decision"]
+            rshow = commafy(rshow, ["DC ATP", "Store ATP (before)", "Store in-transit", "Store ATP (after)", "Need", "Replen qty"])
+            rshow["Demand/day"] = rshow["Demand/day"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "")
+            rccfg = {
+                "Reason": st.column_config.TextColumn(help="REPLEN_DEPLETION = sold then ran below cover · REPLEN_DISPLAY = display-floor driven · REPLEN_FULL_SIZE = 1 unit of a missing key size so the store becomes full-size (current season / CORE). Lines that would leave the store cut-size are held, not shown."),
+                "Recurrence": st.column_config.TextColumn(help="Recurrence propensity from chain breadth (HIGH = SKU demanded at 50+ stores → likely repeat demand)."),
+                "Demand/day": st.column_config.TextColumn(help="Daily demand = POS units sold / window."),
+                "Cover window (d)": st.column_config.NumberColumn(help="Target days of cover — flat 14 days for all stores."),
+                "Display floor": st.column_config.NumberColumn(help="Min display quantity for this size (from size_definition); 0 if not a display size."),
+                "Category": st.column_config.TextColumn(help="Business category (category converter)."),
+                "Division": st.column_config.TextColumn(help="Product division (product master /BIC/ZRWGH2_T) — FOOTWEAR / APPAREL."),
+                "Store ATP (before)": st.column_config.TextColumn(help="Store sellable stock now (SL01), before this allocation."),
+                "Store ATP (after)": st.column_config.TextColumn(help="Store stock after the replen ships = Store ATP (before) + Replen qty."),
+                "Need": st.column_config.TextColumn(help="max(demand cover, display floor) − (store stock + in-transit)."),
+                "Store in-transit": st.column_config.TextColumn(help="Units already on the way to the store (counted before replenishing)."),
+                "DC ATP": st.column_config.TextColumn(help="In-country DC sellable stock for this SKU (the shared pool)."),
+                "Replen qty": st.column_config.TextColumn(help="Rationed units to ship from DC → store (whole units)."),
+                "Decision": st.column_config.TextColumn(help="'Review - moving to make full size' = the DC tops up missing key sizes so this store displays a full run; review the bundle together. Otherwise reviewer marks Approve / Adjust / Keep."),
+            }
+            rtop = st.columns([3, 1])
+            rtop[0].caption(f"{len(rv):,} of {len(rdf):,} replenishment lines")
+            rtop[1].download_button("Export (Excel)", data=to_xlsx(rshow[rcols]),
+                                    file_name="replenishment_recommendations.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True)
+            st.dataframe(rshow[rcols], hide_index=True, use_container_width=True, height=460, column_config=rccfg)
+            st.caption("Recommend-only · P1 scope: footwear + apparel, in-country DC, short-lead. "
+                       "Cross-border depth & the sparse one-off tail are out of scope (allocation / consolidation).")
+        else:
+            st.info("No replenishment recommendations available — run the `replenishment_pipeline_P1` job "
+                    "(reads `sports_analytics_test.nike_consolidation.replen_recommendations`).")
 
     # ============ TAB 0: ALL — one combined table, all move columns + Action ============
     with tab_all:
@@ -472,19 +658,19 @@ Every store×size sits in exactly one of three tabs: **Recommended moves** (to a
         st.markdown("<div style='font-size:11px;font-weight:700;letter-spacing:.06em;color:#8891A6;'>FILTER</div>",
                     unsafe_allow_html=True)
         ac = st.columns([1.1, 1.2, 1.4, 1.2, 1.6, 1.1])
-        act_sel = ac[0].selectbox("Action", ["All actions", "move", "held", "dont move"],
-                                  key="all_action", label_visibility="collapsed")
-        ctry_sel = ac[1].selectbox("Country", ["All countries"] + sorted(str(c) for c in df["country"].dropna().unique()),
-                                   key="all_ctry", label_visibility="collapsed")
-        cat_sel = ac[2].selectbox("Category", ["All categories"] + sorted(str(c) for c in df["business_category"].dropna().unique()),
-                                  key="all_cat", label_visibility="collapsed")
-        brand_sel = ac[3].selectbox("Brand", ["All brands"] + BRANDS, key="all_brand", label_visibility="collapsed")
+        # multi-select filters (empty = all)
+        act_sel = tuple(ac[0].multiselect("Action", ["move", "held", "dont move"], key="all_action_m",
+                                          placeholder="All actions", label_visibility="collapsed"))
+        ctry_sel = tuple(ac[1].multiselect("Country", sorted(str(c) for c in df["country"].dropna().unique()),
+                                           key="all_ctry_m", placeholder="All countries", label_visibility="collapsed"))
+        cat_sel = tuple(ac[2].multiselect("Category", sorted(str(c) for c in df["business_category"].dropna().unique()),
+                                          key="all_cat_m", placeholder="All categories", label_visibility="collapsed"))
+        brand_sel = tuple(ac[3].multiselect("Brand", BRANDS, key="all_brand_m",
+                                            placeholder="All brands", label_visibility="collapsed"))
         srch = ac[4].text_input("Search", placeholder="Article / name / size…", key="all_search",
                                 label_visibility="collapsed")
-        a_arg = None if act_sel == "All actions" else act_sel
-        c_arg = None if ctry_sel == "All countries" else ctry_sel
-        cat_arg = None if cat_sel == "All categories" else cat_sel
-        br_arg = None if brand_sel == "All brands" else brand_sel
+        a_arg, c_arg, cat_arg, br_arg = (list(act_sel) or None, list(ctry_sel) or None,
+                                         list(cat_sel) or None, list(brand_sel) or None)
         full_csv_ui(ac[5], "combined_all",
                     lambda: dbio.load_combined_export(country=c_arg, category=cat_arg, brand=br_arg, search=srch or None, run_id=VRID),
                     "consolidation_all.csv", ("all", ctry_sel, cat_sel, brand_sel, srch, VRID),
@@ -497,13 +683,14 @@ Every store×size sits in exactly one of three tabs: **Recommended moves** (to a
             st.warning(f"Could not load the combined table: {e}"); cdf = pd.DataFrame()
         A_REN = {"country": "Country", "category": "Category", "gender": "Gender", "brand": "Brand",
                  "division": "Division", "demand_type": "Demand", "parent": "Parent", "article": "Article",
-                 "article_name": "Article name", "size": "Size", "season": "Season",
+                 "generic_article_name": "Generic article name", "article_name": "Article name", "size": "Size", "season": "Season",
                  "donor_store": "Donor", "donor_store_name": "Donor name", "donor_available_sizes": "Donor sizes",
-                 "donor_available_sizes_post_move": "Donor sizes post-move",
+                 "donor_available_sizes_post_move": "Donor sizes post-move", "donor_size_status_post_move": "Donor full/cut",
                  "donor_ros": "Donor ROS", "donor_parent_ros": "Donor parent ROS", "donor_cover_days": "Donor cover (d)",
                  "donor_stock": "Donor ATP", "donor_intransit": "Donor in-transit", "donor_apo": "Donor APO",
                  "reason": "Reason", "receiver_store": "Receiver", "receiver_store_name": "Receiver name",
                  "receiver_available_sizes": "Recv sizes", "receiver_available_sizes_post_move": "Recv sizes post-move",
+                 "receiver_size_status_post_move": "Recv full/cut",
                  "receiver_ros": "Recv ROS",
                  "receiver_parent_ros": "Recv parent ROS", "receiver_cover_days": "Recv cover (d)",
                  "receiver_stock": "Recv ATP", "receiver_intransit": "Recv in-transit", "receiver_apo": "Recv APO",
@@ -511,10 +698,10 @@ Every store×size sits in exactly one of three tabs: **Recommended moves** (to a
                  "receiver_cover_post": "Recv cover post-move (d)", "inventory_cost_aed": "Inv. cost (AED)",
                  "uplift": "Est. uplift*", "net_benefit": "Net benefit*", "movement_note": "Why moved",
                  "action": "Action"}
-        A_ORDER = ["Country", "Category", "Gender", "Brand", "Division", "Demand", "Parent", "Article", "Article name",
-                   "Size", "Season", "Donor", "Donor name", "Donor sizes", "Donor sizes post-move", "Donor ROS", "Donor parent ROS",
+        A_ORDER = ["Country", "Category", "Gender", "Brand", "Division", "Demand", "Parent", "Article", "Generic article name", "Article name",
+                   "Size", "Season", "Donor", "Donor name", "Donor sizes", "Donor sizes post-move", "Donor full/cut", "Donor ROS", "Donor parent ROS",
                    "Donor cover (d)", "Donor ATP", "Donor in-transit", "Donor APO", "Reason", "Receiver",
-                   "Receiver name", "Recv sizes", "Recv sizes post-move", "Recv ROS", "Recv parent ROS", "Recv cover (d)", "Recv ATP",
+                   "Receiver name", "Recv sizes", "Recv sizes post-move", "Recv full/cut", "Recv ROS", "Recv parent ROS", "Recv cover (d)", "Recv ATP",
                    "Recv in-transit", "Recv APO", "Proposed transfer qty", "Donor cover post-move (d)",
                    "Recv cover post-move (d)", "Inv. cost (AED)", "Est. uplift*", "Net benefit*", "Why moved", "Action"]
         if len(cdf):
@@ -534,355 +721,7 @@ Every store×size sits in exactly one of three tabs: **Recommended moves** (to a
             cdf = cdf.rename(columns=A_REN)
             cdf = cdf[[c for c in A_ORDER if c in cdf.columns]]
             cdf = cdf.where(cdf.notna(), "NA").replace({"": "NA", "None": "NA", "nan": "NA"})   # NA for inapplicable
-        st.caption(f"Showing up to 5,000 rows of **{act_sel.lower()}** · download = full combined file "
+        st.caption(f"Showing up to 5,000 rows of **{', '.join(act_sel) if act_sel else 'all actions'}** · download = full combined file "
                    "(move + held + dont move).")
         st.dataframe(cdf, hide_index=True, use_container_width=True, height=460)
 
-    # ============ TAB 1: recommended moves ============
-    with tab_moves:
-        mtiles = st.container()   # tiles at the top of this tab, filled after the filter below
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-        # ---- moves breakdown by 'Why moved' (all moves, mirrors the not-moved summary) ----
-        wm = (df.groupby("movement_note", as_index=False)
-                .agg(Items=("article", "count"), Units=("recommended_qty", "sum"), inv=("inventory_cost_aed", "sum"))
-                .sort_values("Items", ascending=False)
-                .rename(columns={"movement_note": "Why moved", "inv": "Inventory cost (AED)"}))
-        st.caption("Moves breakdown — **why moved** (all recommended moves):")
-        st.dataframe(commafy(wm, ["Items", "Units", "Inventory cost (AED)"]),
-                     hide_index=True, use_container_width=True)
-        st.caption(
-            f"🔒 **{sv('held_lines'):,} donor lines held by constraint** (AED {sv('held_inventory_aed'):,} of stock) — "
-            "would move but a soft guard blocked them (APO / season-freshness / size-curve). "
-            "See the **Held** tab to review and export them.")
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-        st.markdown("<div style='font-size:11px;font-weight:700;letter-spacing:.06em;color:#8891A6;'>FILTER</div>",
-                    unsafe_allow_html=True)
-        f = st.columns([1.0, 1.3, 1.1, 1.1, 1.1, 1.1, 1.3, 1.4, 1.1])
-        countries = ["All countries"] + sorted(df["country"].dropna().unique().tolist())
-        fc = f[0].selectbox("Country", countries, label_visibility="collapsed")
-        fbrand = f[8].selectbox("Brand", ["All brands"] + BRANDS, label_visibility="collapsed", key="mv_brand")
-        cats = ["All categories"] + sorted(df["business_category"].dropna().unique().tolist())
-        fcat = f[1].selectbox("Category", cats, label_visibility="collapsed")
-        reasons = f[2].multiselect("Reason", ["DEAD", "SLOW_MOVING"], default=[],
-                                   format_func=lambda x: "Dead" if x == "DEAD" else "Slow-moving",
-                                   label_visibility="collapsed", placeholder="Reason")
-        donors = ["All donor stores"] + sorted(df["donor_store"].dropna().unique().tolist())
-        fd = f[3].selectbox("Donor", donors, label_visibility="collapsed")
-        recvs = ["All receiver stores"] + sorted(df["receiver_store"].dropna().unique().tolist())
-        fr = f[4].selectbox("Receiver", recvs, label_visibility="collapsed")
-        DMD_LABEL = {"OOS_SELLING": "Out-of-stock demand", "IN_STOCK": "In-stock top-up", "APLUS_CURVE": "A+ curve completion"}
-        dmd_opts = sorted(df["demand_type"].dropna().unique().tolist()) if "demand_type" in df else []
-        dmd_sel = f[5].multiselect("Demand", dmd_opts, default=[], format_func=lambda x: DMD_LABEL.get(x, x),
-                                   label_visibility="collapsed", placeholder="Demand type")
-        why_opts = sorted(df["movement_note"].dropna().unique().tolist())
-        why_sel = f[6].multiselect("Why moved", why_opts, default=[],
-                                   label_visibility="collapsed", placeholder="Why moved")
-        search = f[7].text_input("Search", placeholder="Search article, size…", label_visibility="collapsed")
-
-        view = df.copy()
-        if fc != "All countries": view = view[view["country"] == fc]
-        if fcat != "All categories": view = view[view["business_category"] == fcat]
-        if fbrand != "All brands" and "brand" in view: view = view[view["brand"] == fbrand]
-        if reasons: view = view[view["reason"].isin(reasons)]
-        if fd != "All donor stores": view = view[view["donor_store"] == fd]
-        if fr != "All receiver stores": view = view[view["receiver_store"] == fr]
-        if dmd_sel and "demand_type" in view: view = view[view["demand_type"].isin(dmd_sel)]
-        if why_sel: view = view[view["movement_note"].isin(why_sel)]
-        if search:
-            q = search.lower()
-            hay = (view["parent_article"].astype(str) + " " + view["article"].astype(str) + " "
-                   + view["size"].astype(str)).str.lower()
-            view = view[hay.str.contains(q, na=False)]
-
-        # KPI tiles (top of this tab) — reactive to the filter
-        with mtiles:
-            k = st.columns(7)
-            kpi(k[0], "Recommended moves", f"{len(view):,}", accent=True, help="Transfer lines in the current filter.")
-            kpi(k[1], "Units to move", f"{int(view['recommended_qty'].sum()):,}", help="Total units in the current filter.")
-            kpi(k[2], "Inventory value to move", f"AED {int(view['inventory_cost_aed'].sum()):,}",
-                help="Recommended (not yet actioned): cost value of the stock proposed to move = qty × unit cost (AED).")
-            kpi(k[3], "Donor stores", f"{view['donor_store'].nunique():,}", help="Distinct donors in view.")
-            kpi(k[4], "Receiver stores", f"{view['receiver_store'].nunique():,}", help="Distinct receivers in view.")
-            kpi(k[5], "Est. revenue uplift", f"AED {int(view['expected_sales_uplift'].sum()):,}", prov=True,
-                help="PROVISIONAL. Expected revenue for the moves in view.")
-            kpi(k[6], "Est. net benefit", f"AED {int(view['net_benefit'].sum()):,}", prov=True,
-                help="PROVISIONAL. Sum of net benefit (est. uplift − movement cost) for the moves in view.")
-
-        # Donor cover display: ∞ when dead (ROS=0 with stock), 0 when emptied post-move, else the number.
-        def _dc_today(r):
-            return "∞" if (r["donor_ros"] == 0 or pd.isna(r["donor_cover_days"])) else f"{r['donor_cover_days']:.0f}"
-        def _dc_post(r):
-            if pd.notna(r["donor_cover_post_move"]):
-                return f"{r['donor_cover_post_move']:.0f}"
-            rem = (r["donor_stock"] or 0) - (r["recommended_qty"] or 0)   # ROS=0 case
-            return "0" if rem <= 0 else "∞"
-        view = view.assign(_dc_today=view.apply(_dc_today, axis=1), _dc_post=view.apply(_dc_post, axis=1))
-
-        view = view.assign(_demand=view["demand_type"].map(DMD_LABEL).fillna(view["demand_type"])
-                           if "demand_type" in view else "")
-        show = view.rename(columns={
-            "country": "Country", "business_category": "Category", "gender": "Gender", "division": "Division",
-            "parent_article": "Parent", "_demand": "Demand",
-            "article": "Article", "article_name": "Article name", "size": "Size", "article_season": "Season",
-            "donor_store": "Donor", "donor_store_name": "Donor name", "donor_available_sizes": "Donor sizes",
-            "donor_available_sizes_post_move": "Donor sizes post-move",
-            "donor_ros": "Donor ROS", "donor_parent_ros": "Donor parent ROS", "_dc_today": "Donor cover (d)", "donor_stock": "Donor ATP",
-            "donor_intransit": "Donor in-transit", "donor_apo": "Donor APO",
-            "reason": "Reason",
-            "receiver_store": "Receiver", "receiver_store_name": "Receiver name", "receiver_available_sizes": "Recv sizes",
-            "receiver_available_sizes_post_move": "Recv sizes post-move",
-            "receiver_ros": "Recv ROS", "receiver_parent_ros": "Recv parent ROS", "receiver_cover_days": "Recv cover (d)", "receiver_stock": "Recv ATP",
-            "receiver_intransit": "Recv in-transit", "receiver_apo": "Recv APO",
-            "recommended_qty": "Proposed transfer qty",
-            "_dc_post": "Donor cover post-move (d)",
-            "receiver_cover_post_move": "Recv cover post-move (d)",
-            "inventory_cost_aed": "Inv. cost (AED)",
-            "expected_sales_uplift": "Est. uplift*", "net_benefit": "Net benefit*", "movement_note": "Why moved",
-        })
-        show["Reason"] = show["Reason"].map({"DEAD": "Dead", "SLOW_MOVING": "Slow-moving"}).fillna(show["Reason"])
-        show = commafy(show, ["Donor ATP", "Donor in-transit", "Recv ATP", "Recv in-transit", "Recv cover (d)",
-                              "Recv cover post-move (d)", "Proposed transfer qty", "Inv. cost (AED)",
-                              "Est. uplift*", "Net benefit*"])
-        cols = ["Country", "Category", "Gender", "Division", "Demand", "Parent", "Article", "Article name", "Size", "Season",
-                "Donor", "Donor name", "Donor sizes", "Donor sizes post-move", "Donor ROS", "Donor parent ROS", "Donor cover (d)", "Donor ATP", "Donor in-transit", "Donor APO",
-                "Reason", "Receiver", "Receiver name", "Recv sizes", "Recv sizes post-move", "Recv ROS", "Recv parent ROS", "Recv cover (d)", "Recv ATP", "Recv in-transit", "Recv APO",
-                "Proposed transfer qty", "Donor cover post-move (d)", "Recv cover post-move (d)",
-                "Inv. cost (AED)", "Est. uplift*", "Net benefit*", "Why moved"]
-        ccfg = {
-            "Category": st.column_config.TextColumn(help="Business category from the category converter (e.g. NSW MENS)."),
-            "Gender": st.column_config.TextColumn(help="MENS / WOMENS / KIDS / UNISEX."),
-            "Division": st.column_config.TextColumn(help="Product division (product master /BIC/ZRWGH2_T) — e.g. FOOTWEAR / APPAREL."),
-            "Demand": st.column_config.TextColumn(help="Why the receiver needs it: Out-of-stock demand (sells it, ATP=0, not in the DC), In-stock top-up (has stock, below target), or A+ curve completion."),
-            "Parent": st.column_config.TextColumn(help="Parent (generic) article — the style/colour."),
-            "Donor parent ROS": st.column_config.NumberColumn(format="%.3f", help="Donor parent-level ROS = sum of the parent's article ROS at the donor (same for every size of the parent)."),
-            "Recv parent ROS": st.column_config.NumberColumn(format="%.3f", help="Receiver parent-level ROS = sum of the parent's article ROS at the receiver."),
-            "Article": st.column_config.TextColumn(help="Child article — the specific size SKU that moves."),
-            "Article name": st.column_config.TextColumn(width="medium", help="Article description (product master TXTMD)."),
-            "Season": st.column_config.TextColumn(help="Article's Nike season (RF_SEASON + year). CORE/YEAR = season-agnostic. Receivers with a freshness rule only accept current-or-newer seasons."),
-            "Donor sizes": st.column_config.TextColumn(help="All sizes of this parent currently in stock at the donor store."),
-            "Donor sizes post-move": st.column_config.TextColumn(help="Sizes of this parent the donor still displays after giving the recommended units (a size drops off once its last unit moves)."),
-            "Recv sizes post-move": st.column_config.TextColumn(help="Sizes of this parent the receiver displays after the moves — includes newly received sizes it did not stock before."),
-            "Donor ROS": st.column_config.NumberColumn(format="%.3f", help="Donor units sold/day over the ROS window. 0 = dead."),
-            "Donor cover (d)": st.column_config.TextColumn(help="Donor cover today = ATP ÷ ROS. ∞ = dead (no sales)."),
-            "Donor ATP": st.column_config.TextColumn(help="Donor sellable stock = ATP (SL01) only. This is what the engine uses."),
-            "Donor in-transit": st.column_config.TextColumn(help="Units in transit toward the donor (latest snapshot). Display only — a donor gives ATP only, so its in-transit is NOT used."),
-            "Donor APO": st.column_config.TextColumn(help="Y = an APO key is present for this parent at the donor store (atp_detail, parent level)."),
-            "Reason": st.column_config.TextColumn(help="Dead = no sales; Slow-moving = cover above threshold."),
-            "Recv sizes": st.column_config.TextColumn(help="All sizes of this parent currently in stock at the receiver store."),
-            "Recv ROS": st.column_config.NumberColumn(format="%.3f", help="Receiver units sold/day over the ROS window."),
-            "Recv cover (d)": st.column_config.TextColumn(help="Receiver cover today = ATP ÷ ROS."),
-            "Recv ATP": st.column_config.TextColumn(help="Receiver sellable stock = ATP (SL01) only. This is what the engine uses."),
-            "Recv in-transit": st.column_config.TextColumn(help="Units in transit toward the receiver (latest snapshot). Counted for the receiver — its need nets off inbound stock so the engine won't over-ship."),
-            "Recv APO": st.column_config.TextColumn(help="Y = APO key present for this parent at the receiver. Always N here — the APO guard already excludes APO parents from receivers."),
-            "Proposed transfer qty": st.column_config.TextColumn(help="Whole units to move donor → receiver."),
-            "Donor cover post-move (d)": st.column_config.TextColumn(help="Donor cover after giving qty. 0 = emptied; ∞ = still dead."),
-            "Recv cover post-move (d)": st.column_config.TextColumn(help="Receiver cover after receiving qty."),
-            "Inv. cost (AED)": st.column_config.TextColumn(help="Cost value of the moved units = qty × unit cost (AED)."),
-            "Est. uplift*": st.column_config.TextColumn(label="Est. uplift (AED)*", help="PROVISIONAL. qty × receiver net sales/unit × probability to sell at receiver."),
-            "Net benefit*": st.column_config.TextColumn(label="Net benefit (AED)*", help="PROVISIONAL. Est. uplift − movement cost (assumed AED 5/unit)."),
-            "Why moved": st.column_config.TextColumn(width="medium", help="Plain-English reason for the move."),
-        }
-        top = st.columns([3, 1, 1])
-        top[0].caption(f"{len(view):,} of {len(df):,} lines")
-        top[1].download_button("Export (Excel)", data=to_xlsx(show[cols]), file_name="consolidation_moves.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-        top[2].button("Push to SAP", disabled=True, help="Coming soon — approve-and-execute path not yet enabled",
-                      use_container_width=True)
-        st.caption("ℹ️ Click any row to open its full explanation — donor & receiver detail, why it moved, and economics.")
-
-        event = st.dataframe(show[cols], use_container_width=True, hide_index=True, height=460,
-                             on_select="rerun", selection_mode="single-row", column_config=ccfg)
-        st.caption("Hover a column header for its definition. * = provisional economics (movement cost assumed AED 5/unit; probability-to-sell pending).")
-
-        sel = event.selection.rows if event and event.selection else []
-        if sel:
-            row = view.iloc[sel[0]]
-
-            @st.dialog(f"{row['parent_article']} · {row['article']}")
-            def detail():
-                st.caption(f"{row.get('article_name','')} · {row.get('business_category','')} · {row.get('gender','')} · Size {row['size']} · {row['country']}")
-                st.markdown(f"**{row['donor_store']}** ({row['donor_store_name']}) "
-                            f"→ **{row['recommended_qty']:.0f} units** → "
-                            f"**{row['receiver_store']}** ({row['receiver_store_name']})")
-                st.info(f"**Why moved:** {row.get('movement_note', '')}")
-                d, r = st.columns(2)
-                _rem = (row["donor_stock"] or 0) - (row["recommended_qty"] or 0)
-                _dpost = (f"{row['donor_cover_post_move']:.0f}" if pd.notna(row["donor_cover_post_move"])
-                          else ("0 (emptied)" if _rem <= 0 else "∞ (dead)"))
-                with d:
-                    st.markdown("**Donor**")
-                    st.write({"BU": row["donor_bu"], "Class": row["reason"],
-                              "Sizes in stock": row.get("donor_available_sizes", ""),
-                              "Sizes post-move": row.get("donor_available_sizes_post_move", ""),
-                              "ATP (sellable)": f"{row['donor_stock']:.0f}",
-                              "In-transit (not used)": f"{row.get('donor_intransit', 0):.0f}",
-                              "APO key": row.get("donor_apo", ""),
-                              "Key-size run (before→after)": f"{row.get('donor_run_before','?')}→{row.get('donor_run_after','?')}",
-                              "ROS (u/day)": f"{row['donor_ros']:.3f}",
-                              "Cover today (d)": "∞ (dead)" if (row["donor_ros"] == 0 or pd.isna(row["donor_cover_days"])) else f"{row['donor_cover_days']:.0f}",
-                              "Cover post-move (d)": _dpost})
-                with r:
-                    st.markdown("**Receiver**")
-                    _rin = row.get("receiver_units_in", row["recommended_qty"])
-                    _rpost = row.get("receiver_stock_post_move", (row["receiver_stock"] or 0) + (_rin or 0))
-                    st.write({"BU": row["receiver_bu"],
-                              "Sizes in stock": row.get("receiver_available_sizes", ""),
-                              "Sizes post-move": row.get("receiver_available_sizes_post_move", ""),
-                              "ATP (sellable)": f"{row['receiver_stock']:.0f}",
-                              "Units in (all donors)": f"{_rin:.0f}",
-                              "ATP after all moves": f"{_rpost:.0f}",
-                              "In-transit (not used)": f"{row.get('receiver_intransit', 0):.0f}",
-                              "APO key": row.get("receiver_apo", ""),
-                              "Key-size run (before→after)": f"{row.get('receiver_run_before','?')}→{row.get('receiver_run_after','?')}",
-                              "ROS (u/day)": f"{row['receiver_ros']:.3f}",
-                              "Cover today (d)": "—" if pd.isna(row["receiver_cover_days"]) else f"{row['receiver_cover_days']:.0f}",
-                              "Cover post-move (d)": "—" if pd.isna(row["receiver_cover_post_move"]) else f"{row['receiver_cover_post_move']:.0f}"})
-                st.markdown("**Revenue uplift** :orange-badge[PROVISIONAL]")
-                st.write({"Expected uplift": f"AED {row['expected_sales_uplift']:,.0f}",
-                          "Movement cost (AED 5/unit)": f"AED {row['movement_cost']:,.0f}",
-                          "Net benefit": f"AED {row['net_benefit']:,.0f}"})
-                st.caption("Uplift = qty × receiver net sales/unit × probability to sell at receiver. "
-                           "Net benefit = uplift − movement cost.")
-            detail()
-
-    # ============ TAB 2: held (would move, blocked by a constraint) ============
-    with tab_held:
-        computed_at = str(stats.get("computed_at", ""))
-        hsumm = get_held_summary(computed_at, VRID)
-        h_items = int(hsumm["lines"].sum()) if not hsumm.empty else 0
-        h_units = int(hsumm["units"].sum()) if not hsumm.empty else 0
-        h_invc = int(hsumm["inventory_cost"].sum()) if not hsumm.empty else 0
-        hk = st.columns(7)
-        kpi(hk[0], "Held items", f"{h_items:,}", accent=True, help="Store×article lines that could move to a blocked receiver (each has at least 1 movable unit).")
-        kpi(hk[1], "Indicative units to move", f"{h_units:,}", help="Whole units that would actually move if the guard were overridden — a real, de-duplicated allocation (not the donor's full stock).")
-        kpi(hk[2], "Indicative value", f"AED {h_invc:,}", help="Cost value of the indicative movable units (movable qty × unit cost) — the actionable override opportunity.")
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        st.caption("Held by reason — would move to a blocked receiver, override to release (indicative = actually movable):")
-        h_by_reason = (hsumm.groupby("held_reason", as_index=False)[["lines", "units", "inventory_cost"]].sum()
-                       .sort_values("lines", ascending=False)
-                       .rename(columns={"held_reason": "Held reason", "lines": "Items",
-                                        "units": "Indicative units", "inventory_cost": "Indicative value (AED)"}))
-        st.dataframe(commafy(h_by_reason, ["Items", "Indicative units", "Indicative value (AED)"]),
-                     hide_index=True, use_container_width=True)
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        st.markdown("<div style='font-size:11px;font-weight:700;letter-spacing:.06em;color:#8891A6;'>"
-                    "DETAIL — filter to review (bounded to 5,000, biggest indicative value first)</div>", unsafe_allow_html=True)
-        hf = st.columns([1.0, 1.5, 1.2, 1.1, 1.0, 1.0])
-        h_countries = ["All countries"] + sorted(hsumm["country"].dropna().unique().tolist())
-        h_c = hf[0].selectbox("Country", h_countries, key="h_c", label_visibility="collapsed")
-        h_reasons = ["All reasons"] + sorted(hsumm["held_reason"].dropna().unique().tolist())
-        h_r = hf[1].selectbox("Reason", h_reasons, key="h_r", label_visibility="collapsed")
-        h_a = hf[2].text_input("Article", key="h_a", placeholder="Article / name…", label_visibility="collapsed")
-        h_brand = hf[3].selectbox("Brand", ["All brands"] + BRANDS, key="h_brand", label_visibility="collapsed")
-        h_df, h_total = get_held_slice(computed_at, h_c, h_r, h_a or None, run_id=VRID)
-        if h_brand != "All brands" and "brand" in h_df:
-            h_df = h_df[h_df["brand"] == h_brand]; h_total = len(h_df)
-        h_show = h_df.rename(columns={
-            "country": "Country", "business_category": "Category", "gender": "Gender", "division": "Division",
-            "parent_article": "Parent", "article": "Article", "article_name": "Article name", "size": "Size",
-            "article_season": "Season",
-            "donor_store": "Donor", "donor_store_name": "Donor name", "bu": "BU", "class": "Class", "apo_key": "APO",
-            "held_reason": "Held reason", "would_be_receiver": "Would-be receiver",
-            "would_be_receiver_name": "Would-be receiver name", "would_be_receiver_ros": "Recv ROS",
-            "indicative_qty": "Indicative qty", "indicative_value_aed": "Indicative value (AED)",
-            "available_sizes": "Available sizes",
-            "effective_stock": "ATP", "intransit_qty": "In-transit",
-            "inventory_cost_aed": "Donor inv. (AED)", "ros": "ROS", "parent_ros": "Parent ROS",
-            "cover_days": "Cover (d)", "decision": "Decision"})
-        h_cols = ["Country", "Category", "Gender", "Division", "Parent", "Article", "Article name", "Size", "Season",
-                  "Donor", "Donor name", "BU", "Class", "Held reason", "APO",
-                  "Would-be receiver", "Would-be receiver name", "Recv ROS", "Indicative qty", "Indicative value (AED)",
-                  "Available sizes", "ATP", "In-transit", "Donor inv. (AED)", "ROS", "Parent ROS", "Cover (d)", "Decision"]
-        hf[4].download_button("Export (Excel)", data=to_xlsx(h_show[h_cols]), file_name="held.xlsx",
-                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                              use_container_width=True)
-        _hb = None if h_brand == "All brands" else h_brand
-        full_csv_ui(hf[5], "held_csv", lambda: dbio.load_held_full(h_c, h_r, h_a or None, brand=_hb, run_id=VRID),
-                    "held_all.csv", (computed_at, h_c, h_r, h_a or "", h_brand, VRID))
-        hcap = f"Showing {len(h_df):,} of {h_total:,} held items"
-        if h_total > len(h_df):
-            hcap += " — first 5,000 by indicative value; refine the filter to narrow (export reflects what's shown)."
-        st.caption(hcap)
-        h_show = commafy(h_show, ["Indicative qty", "Indicative value (AED)", "ATP", "In-transit", "Donor inv. (AED)", "Cover (d)"])
-        st.dataframe(h_show[h_cols], hide_index=True, use_container_width=True, height=430, column_config={
-            "Article name": st.column_config.TextColumn(width="medium", help="Article description (product master TXTMD)."),
-            "Division": st.column_config.TextColumn(help="Product division (product master /BIC/ZRWGH2_T) — e.g. FOOTWEAR / APPAREL."),
-            "Season": st.column_config.TextColumn(help="Article's Nike season (RF_SEASON + year). CORE/YEAR = season-agnostic."),
-            "Parent ROS": st.column_config.NumberColumn(format="%.3f", help="Parent-level ROS at the donor = sum of the parent's article ROS (repeats across the parent's sizes)."),
-            "Held reason": st.column_config.TextColumn(help="Why it was blocked: Size-curve break / Season-freshness / APO."),
-            "APO": st.column_config.TextColumn(help="Y = APO key present for this parent at the donor store."),
-            "Would-be receiver": st.column_config.TextColumn(help="The store this donor line would actually supply if the guard were overridden (the biggest single move; a de-duplicated allocation, not just any blocked store)."),
-            "Recv ROS": st.column_config.NumberColumn(format="%.3f", help="Would-be receiver units sold/day."),
-            "Indicative qty": st.column_config.TextColumn(help="Whole units that would actually move from this donor line (summed across the receivers it supplies) — de-duplicated, always ≥ 1."),
-            "Indicative value (AED)": st.column_config.TextColumn(help="Indicative movable qty × unit cost — the actionable override value for this line."),
-            "ATP": st.column_config.TextColumn(help="Donor sellable stock (SL01) — the full holding; only the indicative qty is actually movable."),
-            "In-transit": st.column_config.TextColumn(help="Units in transit to the donor (display only, not used in calc)."),
-            "Donor inv. (AED)": st.column_config.TextColumn(help="Cost value of the donor's FULL holding of this line (context) — not all of it moves; see Indicative value."),
-            "ROS": st.column_config.NumberColumn(format="%.3f"),
-            "Decision": st.column_config.TextColumn(help="Business override: enter Approve to move / Keep to hold. (Not yet fed back into the engine.)")})
-
-    # ============ TAB 3: not moved ============
-    with tab_nm:
-        computed_at = str(stats.get("computed_at", ""))
-        summ = get_nm_summary(computed_at, VRID)
-        total_items = int(summ["lines"].sum()) if not summ.empty else 0
-        total_units = int(summ["units"].sum()) if not summ.empty else 0
-        total_invc = int(summ["inventory_cost"].sum()) if not summ.empty else 0
-        nk = st.columns(7)
-        kpi(nk[0], "Items not moved", f"{total_items:,}", accent=True, help="Store×article lines not moved.")
-        kpi(nk[1], "Units not moved", f"{total_units:,}", help="Total units sitting un-moved.")
-        kpi(nk[2], "Inventory value", f"AED {total_invc:,}", help="Cost value of un-moved stock (stock × unit cost).")
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        st.caption("Full picture by reason:")
-        by_reason = (summ.groupby("not_moved_reason", as_index=False)[["lines", "units", "inventory_cost"]].sum()
-                     .sort_values("lines", ascending=False)
-                     .rename(columns={"not_moved_reason": "Reason not moved", "lines": "Items",
-                                      "units": "Units", "inventory_cost": "Inventory cost (AED)"}))
-        st.dataframe(commafy(by_reason, ["Items", "Units", "Inventory cost (AED)"]),
-                     hide_index=True, use_container_width=True)
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        st.markdown("<div style='font-size:11px;font-weight:700;letter-spacing:.06em;color:#8891A6;'>"
-                    "DETAIL — filter to view lines (bounded to 5,000)</div>", unsafe_allow_html=True)
-        nf = st.columns([1.0, 1.5, 1.2, 1.1, 1.0, 1.0])
-        nm_countries = ["All countries"] + sorted(summ["country"].dropna().unique().tolist())
-        nm_c = nf[0].selectbox("Country", nm_countries, key="nm_c", label_visibility="collapsed")
-        nm_reasons = ["All reasons"] + sorted(summ["not_moved_reason"].dropna().unique().tolist())
-        nm_r = nf[1].selectbox("Reason", nm_reasons, key="nm_r", label_visibility="collapsed")
-        nm_a = nf[2].text_input("Article", key="nm_a", placeholder="Article / name…", label_visibility="collapsed")
-        nm_brand = nf[3].selectbox("Brand", ["All brands"] + BRANDS, key="nm_brand", label_visibility="collapsed")
-        nm_df, nm_total = get_nm_slice(computed_at, nm_c, nm_r, nm_a or None,
-                                       brand=(None if nm_brand == "All brands" else nm_brand), run_id=VRID)
-        nm_show = nm_df.rename(columns={
-            "country": "Country", "business_category": "Category", "gender": "Gender", "division": "Division",
-            "parent_article": "Parent", "article": "Article", "article_name": "Article name", "size": "Size",
-            "article_season": "Season",
-            "store_id": "Store", "store_name": "Store name", "bu": "BU", "class": "Class", "apo_key": "APO",
-            "available_sizes": "Available sizes", "effective_stock": "ATP", "intransit_qty": "In-transit",
-            "inventory_cost_aed": "Inv. cost (AED)", "ros": "ROS", "parent_ros": "Parent ROS", "cover_days": "Cover (d)",
-            "not_moved_reason": "Reason not moved"})
-        nm_cols = ["Country", "Category", "Gender", "Division", "Parent", "Article", "Article name", "Size", "Season", "Store", "Store name",
-                   "BU", "Class", "APO", "Available sizes", "ATP", "In-transit", "Inv. cost (AED)", "ROS", "Parent ROS", "Cover (d)", "Reason not moved"]
-        nf[4].download_button("Export (Excel)", data=to_xlsx(nm_show[nm_cols]), file_name="not_moved.xlsx",
-                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                              use_container_width=True)
-        _nmb = None if nm_brand == "All brands" else nm_brand
-        full_csv_ui(nf[5], "nm_csv", lambda: dbio.load_not_moved_full(nm_c, nm_r, nm_a or None, brand=_nmb, run_id=VRID),
-                    "not_moved_all.csv", (computed_at, nm_c, nm_r, nm_a or "", nm_brand, VRID))
-        cap = f"Showing {len(nm_df):,} of {nm_total:,} matching items"
-        if nm_total > len(nm_df):
-            cap += " — first 5,000; refine the filter to narrow (export reflects what's shown)."
-        st.caption(cap)
-        nm_show = commafy(nm_show, ["ATP", "In-transit", "Inv. cost (AED)", "Cover (d)"])
-        st.dataframe(nm_show[nm_cols], hide_index=True, use_container_width=True, height=430, column_config={
-            "Article name": st.column_config.TextColumn(width="medium", help="Article description (product master TXTMD)."),
-            "Division": st.column_config.TextColumn(help="Product division (product master /BIC/ZRWGH2_T) — e.g. FOOTWEAR / APPAREL."),
-            "Season": st.column_config.TextColumn(help="Article's Nike season (RF_SEASON + year). CORE/YEAR = season-agnostic."),
-            "Parent ROS": st.column_config.NumberColumn(format="%.3f", help="Parent-level ROS at the store = sum of the parent's article ROS (repeats across the parent's sizes)."),
-            "APO": st.column_config.TextColumn(help="Y = APO key present for this parent at the store."),
-            "ATP": st.column_config.TextColumn(help="Sellable stock (SL01) — the only stock the engine uses."),
-            "In-transit": st.column_config.TextColumn(help="Units in transit to the store (display only, not used in calc)."),
-            "Available sizes": st.column_config.TextColumn(help="All sizes of this parent in stock at the store."),
-            "ROS": st.column_config.NumberColumn(format="%.3f")})

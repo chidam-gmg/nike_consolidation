@@ -1,0 +1,275 @@
+{
+  "job_id": 553755400746008,
+  "settings": {
+    "email_notifications": {},
+    "format": "MULTI_TASK",
+    "max_concurrent_runs": 1,
+    "name": "nike_stock_movement_pipeline",
+    "parameters": [
+      {
+        "default": "ALL",
+        "name": "COUNTRY"
+      },
+      {
+        "default": "",
+        "name": "AS_OF_DATE"
+      },
+      {
+        "default": "",
+        "name": "ATP_AS_OF"
+      },
+      {
+        "default": "14",
+        "name": "ROS_WINDOW_DAYS"
+      },
+      {
+        "default": "14",
+        "name": "IN_TRANSIT_LOOKBACK_DAYS"
+      },
+      {
+        "default": "30",
+        "name": "SLOW_MOVING_THRESHOLD_DAYS"
+      },
+      {
+        "default": "14",
+        "name": "NEW_TO_STORE_DAYS"
+      },
+      {
+        "default": "7",
+        "name": "PROTECT_COVER_DAYS"
+      },
+      {
+        "default": "14",
+        "name": "TARGET_COVER_DAYS"
+      },
+      {
+        "default": "",
+        "name": "RUN_ID"
+      },
+      {
+        "default": "app",
+        "name": "TRIGGERED_BY"
+      },
+      {
+        "default": "ALL",
+        "name": "CATEGORY"
+      }
+    ],
+    "queue": {
+      "enabled": true
+    },
+    "schedule": {
+      "pause_status": "UNPAUSED",
+      "quartz_cron_expression": "0 30 10 * * ?",
+      "timezone_id": "Asia/Dubai"
+    },
+    "tasks": [
+      {
+        "email_notifications": {},
+        "notebook_task": {
+          "base_parameters": {
+            "AS_OF_DATE": "{{job.parameters.AS_OF_DATE}}",
+            "ATP_AS_OF": "{{job.parameters.ATP_AS_OF}}",
+            "COUNTRY": "{{job.parameters.COUNTRY}}"
+          },
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/00_config_validation",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "config",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "config"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/01_effective_stock",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "effective_stock",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "effective_stock"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/02_ros_cover_classify",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "classify",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "classify"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/03_pools_guards",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "pools",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "pools"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/04_match_size",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "match",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "match"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/05_size_curve",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "reshape",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "reshape"
+          },
+          {
+            "task_key": "receiver_guard"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/06_score_output",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "score",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "score"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/07_history_archive",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "archive",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "pools"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/10_replen_demand",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "replen_demand",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "replen_demand"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/11_replen_ration",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "replen_ration",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "replen_ration"
+          },
+          {
+            "task_key": "receiver_guard"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/12_replen_output",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "replen_output",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "replen_output"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/13_replen_history",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "replen_history",
+        "timeout_seconds": 0
+      },
+      {
+        "depends_on": [
+          {
+            "task_key": "reshape"
+          },
+          {
+            "task_key": "replen_ration"
+          }
+        ],
+        "email_notifications": {},
+        "notebook_task": {
+          "notebook_path": "/Users/chidambaram.s@gmg.com/nike-consolidation-pipeline/08_receiver_guard",
+          "source": "WORKSPACE"
+        },
+        "run_if": "ALL_SUCCESS",
+        "task_key": "receiver_guard",
+        "timeout_seconds": 0
+      }
+    ],
+    "timeout_seconds": 0,
+    "webhook_notifications": {}
+  }
+}
