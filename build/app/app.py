@@ -750,12 +750,48 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                 _save(_pend.assign(decision="REJECTED"), "Rejected")
             _bc[3].caption(f"{len(_view):,} of {len(_rv):,} review lines shown · filter, then decide in the "
                            "Decision column and Save, or use the bulk buttons.")
-        # Ask the agents — placeholder for a question-answering assistant over this run's results.
-        _qa = st.columns([7, 1])
-        _qa[0].text_input("Ask the agents", key="ask_agents", disabled=True, label_visibility="collapsed",
-                          placeholder="Ask the agents — e.g. why did store 1122 get size M of NKIF1911-010?")
-        _qa[1].button("Ask", key="ask_agents_btn", disabled=True, use_container_width=True)
-        st.caption("Coming soon: ask questions about this run's moves, holds and DC lines.")
+        # ---------- Ask the agents: questions about this run's results, answered as the signed-in user ----------
+        st.markdown("##### Ask the agents")
+        _ask_on = bool(dbio.ASK_SPACE_ID)
+        ss.setdefault("ask_history", [])        # [(question, answer dict)] for this session
+        ss.setdefault("ask_conv", None)
+        with st.form("ask_form", clear_on_submit=True, border=False):
+            _qa = st.columns([7, 1, 1])
+            _q = _qa[0].text_input("Ask the agents", key="ask_agents", disabled=not _ask_on, label_visibility="collapsed",
+                                   placeholder="e.g. Why did store 1122 get size M of NKIF1911-010?  ·  Top 10 DC lines by value")
+            _go = _qa[1].form_submit_button("Ask", disabled=not _ask_on, use_container_width=True, type="primary")
+            _new = _qa[2].form_submit_button("New chat", disabled=not _ask_on, use_container_width=True)
+        if not _ask_on:
+            st.caption("Coming soon: ask questions about this run's moves, holds and DC lines.")
+        if _new:
+            ss.ask_history, ss.ask_conv = [], None
+        if _go and _q.strip():
+            with st.spinner("The agents are looking into it…"):
+                try:
+                    _latest = dbio.list_run_log(1)
+                    _ctx = _arid if (_arid and not _latest.empty and str(_latest.iloc[0]["run_id"]) != _arid) else None
+                    _ans = dbio.ask_agents(_q.strip(), ss.ask_conv, run_id=_ctx)
+                    ss.ask_conv = _ans["conversation_id"]
+                    ss.ask_history.insert(0, (_q.strip(), _ans))
+                except Exception as e:
+                    ss.ask_history.insert(0, (_q.strip(), {"error": str(e)}))
+        for _qq, _aa in ss.ask_history[:5]:
+            with st.container(border=True):
+                st.markdown(f"**{_qq}**")
+                if _aa.get("error"):
+                    st.warning(f"Couldn't answer: {_aa['error']}")
+                    continue
+                if _aa.get("text"):
+                    st.markdown(_aa["text"])
+                if _aa.get("rows"):
+                    st.dataframe(pd.DataFrame(_aa["rows"], columns=_aa["columns"]), hide_index=True,
+                                 use_container_width=True, height=min(38 + 35 * len(_aa["rows"]), 320))
+                if _aa.get("sql"):
+                    with st.expander("How this was answered"):
+                        st.code(_aa["sql"], language="sql")
+        if ss.ask_history:
+            st.caption("Answers come from this engine's results only. Follow-up questions continue the same chat; "
+                       "use New chat to start over.")
 
     # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
     with tab_replen:

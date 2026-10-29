@@ -10,3 +10,5 @@ env:
     value: "553755400746008"
   - name: APP_MODE
     value: "dev"
+  - name: ASK_SPACE_ID
+    value: "01f1d371857d11438cd5701cb35f9a2c"

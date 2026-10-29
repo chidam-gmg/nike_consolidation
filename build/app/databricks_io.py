@@ -464,6 +464,67 @@ def save_review_decisions(run_id: str, rows: pd.DataFrame, user: str) -> int:
     return n
 
 
+# ---- Ask the agents (question answering over this engine's results; runs as the signed-in viewer) ----
+ASK_SPACE_ID = os.environ.get("ASK_SPACE_ID", "")
+
+
+def _ask_call(method: str, path: str, body: dict | None = None) -> dict:
+    """Call the question-answering API as the viewer (forwarded token in the app, CLI profile locally)."""
+    import requests
+    if _IN_APP:
+        import streamlit as st
+        from databricks.sdk.core import Config
+        token = st.context.headers.get("x-forwarded-access-token")
+        if not token:
+            raise RuntimeError("No user token forwarded — sign out and reopen the app to grant access.")
+        host, hdr = Config().host.rstrip("/"), {"Authorization": f"Bearer {token}"}
+    else:
+        cfg = get_client().config
+        host, hdr = cfg.host.rstrip("/"), cfg.authenticate()
+    r = requests.request(method, f"{host}{path}", headers=hdr, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
+    return r.json() if r.text else {}
+
+
+def ask_agents(question: str, conversation_id: str | None = None, run_id: str | None = None,
+               timeout_s: int = 180) -> dict:
+    """Ask a question about the engine's results. Follow-ups reuse conversation_id. When the viewer is looking at a
+    specific (non-latest) run, the run id is added as context. Returns {conversation_id, text, sql, columns, rows}."""
+    if not ASK_SPACE_ID:
+        raise RuntimeError("Ask the agents is not configured for this app (ASK_SPACE_ID).")
+    content = question if not run_id else f"{question}\n(Use run_id = '{run_id}'.)"
+    base = f"/api/2.0/genie/spaces/{ASK_SPACE_ID}"
+    if conversation_id:
+        msg = _ask_call("POST", f"{base}/conversations/{conversation_id}/messages", {"content": content})
+        cid, mid = conversation_id, msg.get("message_id") or msg.get("id")
+    else:
+        msg = _ask_call("POST", f"{base}/start-conversation", {"content": content})
+        cid, mid = msg["conversation_id"], msg["message_id"]
+    t0 = time.time()
+    while True:
+        m = _ask_call("GET", f"{base}/conversations/{cid}/messages/{mid}")
+        st_ = m.get("status")
+        if st_ in ("COMPLETED", "FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"):
+            break
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError("The answer took too long — try a narrower question.")
+        time.sleep(2)
+    if st_ != "COMPLETED":
+        raise RuntimeError((m.get("error") or {}).get("error") or f"Question failed ({st_}).")
+    out = {"conversation_id": cid, "text": "", "sql": "", "columns": [], "rows": []}
+    for a in m.get("attachments") or []:
+        if a.get("text"):
+            out["text"] += (a["text"].get("content") or "")
+        if a.get("query"):
+            out["sql"] = a["query"].get("query") or ""
+            res = _ask_call("GET", f"{base}/conversations/{cid}/messages/{mid}/attachments/{a['attachment_id']}/query-result")
+            sr = res.get("statement_response") or {}
+            out["columns"] = [c["name"] for c in ((sr.get("manifest") or {}).get("schema") or {}).get("columns", [])]
+            out["rows"] = ((sr.get("result") or {}).get("data_array")) or []
+    return out
+
+
 def current_user() -> str:
     """Best-effort identity of the logged-in user (for run attribution). In-app: the platform-forwarded
     email header; locally: the CLI profile user."""
