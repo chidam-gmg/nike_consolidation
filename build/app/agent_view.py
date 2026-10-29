@@ -183,7 +183,7 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
 
 
 def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str | None = None,
-           theme: str = "light", height: int = 960):
+           theme: str = "light", height: int = 1040):
     """Draw the workflow canvas + run log. live=True: current state of a running job (no replay).
     theme follows the app's Dark mode toggle so the board blends into the page either way."""
     data = json.dumps(_payload(job_run, metrics, live, run_id, theme)).replace("</", "<\\/")
@@ -225,12 +225,12 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .kpi .v { font:500 21px var(--mono); font-variant-numeric:tabular-nums; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .stage { border:1px solid var(--line); border-radius:12px; overflow-x:auto;
   background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
-.canvas { position:relative; width:1240px; height:430px; margin:0 auto; }
-.canvas svg { position:absolute; left:0; top:0; width:1240px; height:430px; overflow:visible; }
+.canvas { position:relative; width:1240px; height:462px; margin:0 auto; }
+.canvas svg { position:absolute; left:0; top:0; width:1240px; height:462px; overflow:visible; }
 .edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:var(--wire-done); }
 .pkt { fill:var(--run); }
 .cnt rect { fill:var(--panel-2); stroke:var(--line); } .cnt text { fill:var(--muted); font:10px var(--mono); }
-.node { position:absolute; width:96px; display:grid; justify-items:center; gap:6px; }
+.node { position:absolute; width:150px; display:grid; justify-items:center; gap:6px; }
 .box { position:relative; width:84px; height:84px; border-radius:14px; background:var(--panel-2); border:1.5px solid var(--line);
   display:grid; place-items:center; transition:border-color .3s, box-shadow .3s; }
 .glyph { font:600 20px var(--mono); color:var(--muted); }
@@ -249,6 +249,21 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .node.s-idle .box { border-color:var(--accent); }
 .node.s-waiting .box { opacity:.55; }
 .lane { position:absolute; font:10px var(--mono); color:var(--dim); letter-spacing:.12em; }
+.stt { font:600 9.5px var(--mono); letter-spacing:.06em; text-transform:uppercase; text-align:center; line-height:1.3;
+  padding:2px 7px; border-radius:5px; border:1px solid var(--line); color:var(--dim); background:var(--panel); max-width:150px; }
+.node.s-running .stt { color:var(--run); border-color:var(--run); background:var(--run-soft); }
+.node.s-done .stt { color:var(--ok); border-color:transparent; background:transparent; }
+.node.s-failed .stt { color:var(--hold); border-color:var(--hold); }
+.node.s-idle .stt, .node.s-ready .stt { color:var(--accent); border-color:var(--accent); background:var(--acc-soft); }
+.node.s-ready .box { border-color:var(--accent); opacity:1; }
+.edge.pending { stroke:var(--run); stroke-dasharray:3 6; opacity:.55; animation:dash 1.2s linear infinite; }
+@keyframes dash { to { stroke-dashoffset:-18; } }
+.now { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; padding:9px 14px; border:1px solid var(--line); border-radius:10px;
+  background:var(--panel); font:12px var(--mono); }
+.now .k { color:var(--muted); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; margin-right:6px; }
+.now .v { color:var(--fg); } .now .v.run { color:var(--run); } .now .v.ok { color:var(--ok); } .now .v.fail { color:var(--hold); }
+.now .bar { flex:1 1 160px; height:4px; background:var(--line); border-radius:2px; overflow:hidden; min-width:120px; }
+.now .bar i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s; }
 @keyframes spin { to { transform:rotate(360deg); } }
 @keyframes pulse { 50% { opacity:.3; } }
 .log { border:1px solid var(--line); border-radius:12px; background:var(--console); overflow:hidden; }
@@ -281,7 +296,8 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
   <button class="btn primary" id="play" type="button">Replay run</button>
 </div>
 <div class="kpis" id="kpis"></div>
-<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1240 430" aria-hidden="true"></svg></div></div>
+<div class="now" id="now"></div>
+<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1240 462" aria-hidden="true"></svg></div></div>
 <div class="log"><div class="log-head"><span class="t">RUN LOG</span><div class="filters" id="filters"></div></div><div class="log-body" id="logbody"></div></div>
 </div>
 <script>
@@ -295,7 +311,7 @@ const pad = n => String(n).padStart(2, "0");
 const gst = ms => { if (!D.have_timings || !ms) return "--:--:--"; const d = new Date(ms + 4 * 3600e3);
   return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; };
 const LV = { run: "RUN", tool: "TOOL", out: "OUT", send: "SEND", hold: "HOLD" };
-document.getElementById("c-run").textContent = D.run_id || "latest";
+document.getElementById("c-run").textContent = D.run_id || (D.live ? "in progress" : "latest");
 document.getElementById("c-scope").textContent = D.scope;
 document.getElementById("c-who").textContent = D.who || "scheduled";
 if (D.live) document.getElementById("live").hidden = false;
@@ -324,12 +340,12 @@ const ICON = { done: '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" 
   failed: '<svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>' };
 const nodes = {};
 D.agents.forEach(a => {
-  const el = document.createElement("div"); el.className = "node s-waiting"; el.style.left = (NX(a.col) - 6) + "px"; el.style.top = NY(a.row) + "px";
-  el.innerHTML = '<div class="box"><span class="port in"></span><span class="glyph"></span><span class="port out"></span><span class="badge"></span></div><div class="nm"></div><div class="rl"></div>';
+  const el = document.createElement("div"); el.className = "node s-waiting"; el.style.left = (NX(a.col) - 33) + "px"; el.style.top = NY(a.row) + "px";
+  el.innerHTML = '<div class="box"><span class="port in"></span><span class="glyph"></span><span class="port out"></span><span class="badge"></span></div><div class="nm"></div><div class="rl"></div><div class="stt"></div>';
   el.querySelector(".glyph").textContent = a.g; el.querySelector(".nm").textContent = a.name; el.querySelector(".rl").textContent = a.role;
   canvas.appendChild(el); nodes[a.id] = el;
 });
-[["STORE ↔ STORE", NY(0) - 22], ["DC → STORE", NY(2) + 132]].forEach(([t, y]) => { const l = document.createElement("div"); l.className = "lane";
+[["STORE ↔ STORE", NY(0) - 22], ["DC → STORE", NY(2) + 152]].forEach(([t, y]) => { const l = document.createElement("div"); l.className = "lane";
   l.textContent = t; l.style.left = (NX(3) - 6) + "px"; l.style.top = y + "px"; canvas.appendChild(l); });
 const edges = D.edges.map(e => {
   const a = A[e.f], b = A[e.t];
@@ -344,14 +360,50 @@ const edges = D.edges.map(e => {
   g.append(r, tx); svg.appendChild(g);
   return { e, p, pk, g, len };
 });
+const UP = {}; D.edges.forEach(e => (UP[e.t] = UP[e.t] || []).push(e.f));
+const clk = ms => { const t = Math.max(0, Math.round(ms / 1000)); return t >= 60 ? `${Math.floor(t / 60)}m ${pad(t % 60)}s` : `${t}s`; };
+function runningStage(a, now) { return a.stages.find(k => stageState(k, now) === "running"); }
+function nodeStatus(a, now) {   // state class + plain-language status line for one agent at time `now`
+  const s = agentState(a, now), ups = UP[a.id] || [];
+  const pendingUp = ups.filter(u => agentState(A[u], now) !== "done").map(u => A[u].name);
+  if (s === "running") { const k = runningStage(a, now); return ["running", `running · ${k} · ${clk(now - S[k].start)}`]; }
+  if (s === "done") { const st = a.stages.map(k => S[k]).filter(x => x.start); const dur = st.reduce((n, x) => n + ((x.end || now) - x.start), 0);
+    return ["done", D.have_timings ? `done · ${clk(dur)}` : "done"]; }
+  if (s === "failed") return ["failed", `failed · ${a.stages.find(k => stageState(k, now) === "failed")}`];
+  if (pendingUp.length) return [s, `waiting for ${pendingUp.join(" + ")}`];
+  return [s === "idle" ? "idle" : "ready", ups.length ? "handover received · starting" : "queued"];
+}
 function renderCanvas(now, animate) {
-  D.agents.forEach(a => { const s = agentState(a, now), el = nodes[a.id]; el.className = "node s-" + s; el.querySelector(".badge").innerHTML = ICON[s] || ""; });
+  D.agents.forEach(a => { const [cls, txt] = nodeStatus(a, now), el = nodes[a.id];
+    el.className = "node s-" + cls; el.querySelector(".badge").innerHTML = ICON[cls] || ""; el.querySelector(".stt").textContent = txt; });
   edges.forEach(x => {
     const sent = x.e.at && now >= x.e.at, st = agentState(A[x.e.t], now), active = sent && (st === "running" || st === "idle");
-    x.p.setAttribute("class", "edge" + (active ? " active" : sent ? " done" : "")); x.g.style.display = sent ? "" : "none";
+    const pending = !sent && agentState(A[x.e.f], now) === "running";   // sender working → handover coming
+    x.p.setAttribute("class", "edge" + (active ? " active" : sent ? " done" : pending ? " pending" : "")); x.g.style.display = sent ? "" : "none";
     if (active && animate) { const pt = x.p.getPointAtLength(((performance.now() / 1400) % 1) * x.len);
       x.pk.setAttribute("cx", pt.x); x.pk.setAttribute("cy", pt.y); x.pk.style.display = ""; } else x.pk.style.display = "none";
   });
+}
+
+/* now bar: who is running, who is waiting for a handover, overall progress */
+const nowEl = document.getElementById("now");
+function renderNow(now) {
+  const keys = Object.keys(S), total = keys.length, done = keys.filter(k => stageState(k, now) === "done").length;
+  const running = D.agents.filter(a => agentState(a, now) === "running");
+  const failed = D.agents.filter(a => agentState(a, now) === "failed");
+  const waiting = D.agents.filter(a => ["waiting", "idle"].includes(agentState(a, now)));
+  const started = SV.length && now >= T0;
+  const span = (k, v, cls) => `<span><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></span>`;
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  let html;
+  if (failed.length) html = span("Status", "stopped · " + esc(failed.map(a => a.name).join(", ")) + " failed", "fail");
+  else if (!started) html = span("Status", D.has || SV.length ? "ready to replay" : "waiting for the run to start");
+  else if (done === total && !running.length) html = span("Status", "run complete", "ok") + span("Stages", `${done} / ${total}`)
+    + (D.have_timings ? span("Elapsed", clk(T1 - T0)) : "");
+  else html = span("Now running", running.length ? esc(running.map(a => `${a.name} (${runningStage(a, now)})`).join(" · ")) : "handing over…", "run")
+    + span("Waiting", waiting.length ? esc(waiting.map(a => a.name).join(", ")) : "—")
+    + span("Stages", `${done} / ${total}`) + (D.have_timings ? span("Elapsed", clk(now - T0)) : "");
+  nowEl.innerHTML = html + `<span class="bar"><i style="width:${Math.round(done / Math.max(1, total) * 100)}%"></i></span>`;
 }
 
 /* KPIs */
@@ -386,7 +438,7 @@ function renderLog(now, anim) {
 let cur = T1 + 1, playing = false, t0p = 0, speed = 1; const SPAN = 42000;
 function render(now, anim) {
   document.getElementById("clock").innerHTML = D.have_timings ? `engine time <b>${gst(Math.min(now, T1))}</b> GST` : "stage timings unavailable";
-  renderCanvas(now, anim || D.live); renderKpis(now); renderLog(now, anim);
+  renderCanvas(now, anim || D.live); renderNow(now); renderKpis(now); renderLog(now, anim);
 }
 function tick() {
   if (!playing) return; const f = ((performance.now() - t0p) * speed) / SPAN; cur = T0 - 1 + f * (T1 - T0 + 2);
@@ -401,6 +453,10 @@ document.getElementById("play").onclick = () => {
 document.getElementById("speed").onclick = e => { const el = playing ? (performance.now() - t0p) * speed : 0;
   speed = speed === 1 ? 3 : 1; e.target.textContent = "Speed " + speed + "×"; if (playing) t0p = performance.now() - el / speed; };
 render(cur, false);
-if (D.live) { const loop = () => { renderCanvas(cur, true); requestAnimationFrame(loop); }; requestAnimationFrame(loop); }
+if (D.live) {   // live: advance the engine clock between app refreshes so timers tick
+  const p0 = performance.now();
+  const loop = () => { const now = D.now + (performance.now() - p0); renderCanvas(now, true); renderNow(now); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
 </script></body></html>
 """
