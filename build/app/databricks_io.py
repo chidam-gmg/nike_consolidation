@@ -482,6 +482,12 @@ def _ask_call(method: str, path: str, body: dict | None = None) -> dict:
         cfg = get_client().config
         host, hdr = cfg.host.rstrip("/"), cfg.authenticate()
     r = requests.request(method, f"{host}{path}", headers=hdr, json=body, timeout=60)
+    if r.status_code == 403 and "required scopes" in r.text:
+        # the viewer's token predates the app's question-answering permission → needs a fresh sign-in + consent
+        raise RuntimeError("your sign-in doesn't include permission to ask questions yet. Close this tab, reopen the app "
+                           "(a private window is quickest) and accept the permission screen, then ask again.")
+    if r.status_code == 403:
+        raise RuntimeError("you don't have access to the question data yet — ask the app owner to grant it.")
     if r.status_code >= 400:
         raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
     return r.json() if r.text else {}
