@@ -36,6 +36,8 @@ Matching: stores can be named by code (e.g. 1122) or name; match names with ILIK
 
 "Why did store X get size Y of style Z": find the row(s) for that store, style and size in both views for the latest full run and report status, units, reason, store_stock_before / store_stock, store_in_transit, daily_demand, cover and review_status.
 
+Conversation: follow-up questions build on the previous answer. Keep the same view (DC replenishment vs store stock), the same run and the same filters unless the user changes them. "These", "those", "them" mean the items in your previous answer (e.g. the articles or stores you just listed) — filter to exactly those. Answer directly; only ask a clarifying question if the request cannot be answered at all.
+
 Format: show units with thousands separators, AED values as K / M (e.g. AED 176K, AED 1.1M), and say which run (run_id, run_date) the answer comes from."""
 
 SAMPLES = [
