@@ -394,6 +394,76 @@ def agent_run_metrics(run_id=None) -> dict:
     return out
 
 
+# ---- Human review (approver node): exceptions a person must approve before lines go out ----
+# Review rules (deterministic): every DC full-size top-up line (engine already tags it for review), plus any
+# store move or DC line worth >= REVIEW_MIN_AED or moving >= REVIEW_MIN_QTY units. Everything else is routine
+# and auto-approved. Decisions live in review_decisions (one row per run x line, latest wins).
+REVIEW_MIN_QTY = 6
+REVIEW_MIN_AED = 1000.0
+REVIEW_FQ = f"{FQ}.review_decisions"
+REVIEW_STATUS = {"PENDING": "Pending", "APPROVED": "Approve", "REJECTED": "Reject"}
+
+
+def load_review_items(run_id: str) -> pd.DataFrame:
+    """Lines needing a human decision for one run, with the current decision (Pending if none)."""
+    rid = str(run_id).replace("'", "''")
+    q, v = int(REVIEW_MIN_QTY), float(REVIEW_MIN_AED)
+    df = run_sql(f"""
+        WITH m AS (
+          SELECT 'Store move' AS line_type, CONCAT(donor_store, '|', receiver_store, '|', article) AS line_key,
+                 parent_article, generic_article_name, article, size, donor_store AS from_site, receiver_store AS to_site,
+                 CAST(recommended_qty AS INT) AS qty, ROUND(inventory_cost_aed, 0) AS value_aed,
+                 CONCAT_WS(' · ', CASE WHEN inventory_cost_aed >= {v} THEN 'High value' END,
+                                  CASE WHEN recommended_qty >= {q} THEN 'Large qty' END) AS review_reason
+          FROM {_src('recommendations', run_id)}
+          WHERE inventory_cost_aed >= {v} OR recommended_qty >= {q}),
+        d AS (
+          SELECT 'DC line', CONCAT(source, '|', receiver_store, '|', article), parent_article, generic_article_name,
+                 article, size, source, receiver_store, CAST(recommended_qty AS INT),
+                 ROUND(recommended_qty * unit_price_aed, 0),
+                 CONCAT_WS(' · ', CASE WHEN decision IS NOT NULL THEN 'Full-size top-up' END,
+                                  CASE WHEN recommended_qty * unit_price_aed >= {v} THEN 'High value' END,
+                                  CASE WHEN recommended_qty >= {q} THEN 'Large qty' END)
+          FROM {_src('replen_recommendations', run_id)}
+          WHERE decision IS NOT NULL OR recommended_qty >= {q} OR recommended_qty * unit_price_aed >= {v})
+        SELECT u.*, COALESCE(x.decision, 'PENDING') AS decision, x.comment, x.decided_by, x.decided_at
+        FROM (SELECT * FROM m UNION ALL SELECT * FROM d) u
+        LEFT JOIN {REVIEW_FQ} x ON x.run_id = '{rid}' AND x.line_type = u.line_type AND x.line_key = u.line_key
+        ORDER BY CASE COALESCE(x.decision, 'PENDING') WHEN 'PENDING' THEN 0 ELSE 1 END, value_aed DESC""")
+    for c in ["qty", "value_aed"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def save_review_decisions(run_id: str, rows: pd.DataFrame, user: str) -> int:
+    """Upsert decisions (APPROVED / REJECTED / PENDING) for the given review rows; written as the viewer."""
+    if rows is None or rows.empty:
+        return 0
+    lit = lambda x: "NULL" if x is None or (isinstance(x, float) and x != x) or str(x) == "nan" else "'" + str(x).replace("'", "''") + "'"
+    num = lambda x: "NULL" if x is None or pd.isna(x) else str(float(x))
+    cols = "run_id, line_type, line_key, parent_article, article, size, from_site, to_site, qty, value_aed, review_reason, decision, comment, decided_by"
+    n = 0
+    for i in range(0, len(rows), 300):
+        vals = ", ".join(
+            f"({lit(run_id)}, {lit(r.line_type)}, {lit(r.line_key)}, {lit(r.parent_article)}, {lit(r.article)}, {lit(r['size'])}, "
+            f"{lit(r.from_site)}, {lit(r.to_site)}, {num(r.qty)}, {num(r.value_aed)}, {lit(r.review_reason)}, "
+            f"{lit(r.decision)}, {lit(r.get('comment'))}, {lit(user)})"
+            for _, r in rows.iloc[i:i + 300].iterrows())
+        run_sql(f"""
+            MERGE INTO {REVIEW_FQ} t
+            USING (SELECT * FROM VALUES {vals} AS v({cols})) s
+            ON t.run_id = s.run_id AND t.line_type = s.line_type AND t.line_key = s.line_key
+            WHEN MATCHED THEN UPDATE SET decision = s.decision, comment = s.comment, decided_by = s.decided_by,
+                                         decided_at = current_timestamp()
+            WHEN NOT MATCHED THEN INSERT ({cols}, decided_at)
+              VALUES (s.run_id, s.line_type, s.line_key, s.parent_article, s.article, s.size, s.from_site, s.to_site,
+                      CAST(s.qty AS INT), CAST(s.value_aed AS DOUBLE), s.review_reason, s.decision, s.comment,
+                      s.decided_by, current_timestamp())""")
+        n += min(300, len(rows) - i)
+    return n
+
+
 def current_user() -> str:
     """Best-effort identity of the logged-in user (for run attribution). In-app: the platform-forwarded
     email header; locally: the CLI profile user."""

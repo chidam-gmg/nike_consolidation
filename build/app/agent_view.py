@@ -22,6 +22,8 @@ AGENTS = [
     dict(id="curator", g="SZ", name="Size Curator", role="Full / cut size", stages=["reshape", "receiver_guard"], col=4, row=1),
     dict(id="review", g="RV", name="Reviewer", role="Final picks", stages=["score", "replen_output"], col=5, row=1),
     dict(id="audit", g="AU", name="Auditor", role="Books closed", stages=["archive", "replen_history"], col=6, row=1),
+    # the human in the loop: approves the exceptions before anything leaves the engine (no job stage)
+    dict(id="human", g="HU", name="Approver", role="Human review", stages=[], col=7, row=1, human=True),
 ]
 STAGE_AGENT = {s: a["id"] for a in AGENTS for s in a["stages"]}
 STAGE_ORDER = ["config", "effective_stock", "classify", "pools", "match", "replen_demand", "reshape",
@@ -104,7 +106,8 @@ def _script(s: dict, r: dict, has: bool) -> dict:
     }
 
 
-def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None = None, theme: str = "light") -> dict:
+def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None = None, theme: str = "light",
+             review: dict | None = None) -> dict:
     s, r = (metrics or {}).get("stats") or {}, (metrics or {}).get("replen") or {}
     has = bool(s)
     tasks = {t["key"]: t for t in (job_run or {}).get("tasks", [])}
@@ -158,9 +161,22 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
         edge("review", "audit", "replen_output",
              f"{_n((_num(s.get('recommended_moves')) or 0) + (_num(r.get('replen_lines')) or 0))} lines"),
     ]
+    rv = review or {}
+    audit_end = max([x for x in (stages["archive"]["end"], stages["replen_history"]["end"]) if x] or [0]) or None
+    if has and rv.get("total") is not None:
+        edges.append({"f": "audit", "t": "human", "at": audit_end, "label": f"{_n(rv.get('total'))} to review"})
     for e in edges:
         if e["at"]:
             events.append({"ts": e["at"] + 50, "a": e["f"], "lv": "send", "tx": f"→ {names[e['t']]}: {e['label']}"})
+    if has and audit_end and rv.get("total") is not None:
+        routine = (_num(s.get("recommended_moves")) or 0) + (_num(r.get("replen_lines")) or 0) - (rv.get("total") or 0)
+        events.append({"ts": audit_end + 120, "a": "human", "lv": "wait",
+                       "tx": f"{_n(rv.get('total'))} lines need a decision ({_n(rv.get('topup'))} full-size top-ups, "
+                             f"{_n(rv.get('other'))} high value / large qty) · {_n(routine)} routine lines auto-approved"})
+        if (rv.get("approved") or 0) + (rv.get("rejected") or 0):
+            events.append({"ts": audit_end + 240, "a": "human", "lv": "out",
+                           "tx": f"approved {_n(rv.get('approved'))} · rejected {_n(rv.get('rejected'))} · "
+                                 f"pending {_n(rv.get('pending'))}"})
     events.sort(key=lambda e: e["ts"])
 
     kpis = [
@@ -172,7 +188,7 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
     ]
     jr = job_run or {}
     return {
-        "live": live, "theme": theme, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
+        "live": live, "theme": theme, "review": rv, "now": int(time.time() * 1000), "have_timings": have_timings, "has": has,
         "agents": [dict(a) for a in AGENTS], "stages": stages, "edges": edges, "events": events, "kpis": kpis,
         "run_id": jr.get("engine_run_id") or run_id or "",
         # the scheduled 10:30 job runs with the job's default TRIGGERED_BY ('app'); app users are recorded by email
@@ -183,10 +199,10 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
 
 
 def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str | None = None,
-           theme: str = "light", height: int = 1040):
+           theme: str = "light", review: dict | None = None, height: int = 1040):
     """Draw the workflow canvas + run log. live=True: current state of a running job (no replay).
     theme follows the app's Dark mode toggle so the board blends into the page either way."""
-    data = json.dumps(_payload(job_run, metrics, live, run_id, theme)).replace("</", "<\\/")
+    data = json.dumps(_payload(job_run, metrics, live, run_id, theme, review)).replace("</", "<\\/")
     components.html(_HTML.replace("__DATA__", data), height=height, scrolling=True)
 
 
@@ -225,8 +241,8 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .kpi .v { font:500 21px var(--mono); font-variant-numeric:tabular-nums; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .stage { border:1px solid var(--line); border-radius:12px; overflow-x:auto;
   background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
-.canvas { position:relative; width:1240px; height:462px; margin:0 auto; }
-.canvas svg { position:absolute; left:0; top:0; width:1240px; height:462px; overflow:visible; }
+.canvas { position:relative; width:1440px; height:462px; margin:0 auto; }
+.canvas svg { position:absolute; left:0; top:0; width:1440px; height:462px; overflow:visible; }
 .edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:var(--wire-done); }
 .pkt { fill:var(--run); }
 .cnt rect { fill:var(--panel-2); stroke:var(--line); } .cnt text { fill:var(--muted); font:10px var(--mono); }
@@ -256,6 +272,12 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .node.s-failed .stt { color:var(--hold); border-color:var(--hold); }
 .node.s-idle .stt, .node.s-ready .stt { color:var(--accent); border-color:var(--accent); background:var(--acc-soft); }
 .node.s-ready .box { border-color:var(--accent); opacity:1; }
+.node.human .box { border-style:dashed; border-radius:42px; }
+.node.s-await .box { border-color:var(--accent); border-style:solid; box-shadow:0 0 0 4px var(--acc-soft); animation:await 1.6s ease-in-out infinite; }
+.node.s-await .glyph { color:var(--accent); }
+.node.s-await .stt { color:var(--accent); border-color:var(--accent); background:var(--acc-soft); }
+@keyframes await { 50% { box-shadow:0 0 0 9px transparent; } }
+.lv.wait { color:var(--accent); }
 .edge.pending { stroke:var(--run); stroke-dasharray:3 6; opacity:.55; animation:dash 1.2s linear infinite; }
 @keyframes dash { to { stroke-dashoffset:-18; } }
 .now { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; padding:9px 14px; border:1px solid var(--line); border-radius:10px;
@@ -297,7 +319,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 </div>
 <div class="kpis" id="kpis"></div>
 <div class="now" id="now"></div>
-<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1240 462" aria-hidden="true"></svg></div></div>
+<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1440 462" aria-hidden="true"></svg></div></div>
 <div class="log"><div class="log-head"><span class="t">RUN LOG</span><div class="filters" id="filters"></div></div><div class="log-body" id="logbody"></div></div>
 </div>
 <script>
@@ -310,7 +332,7 @@ const T1 = D.live ? D.now : (SV.length ? Math.max(...SV.map(s => s.end || s.star
 const pad = n => String(n).padStart(2, "0");
 const gst = ms => { if (!D.have_timings || !ms) return "--:--:--"; const d = new Date(ms + 4 * 3600e3);
   return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; };
-const LV = { run: "RUN", tool: "TOOL", out: "OUT", send: "SEND", hold: "HOLD" };
+const LV = { run: "RUN", tool: "TOOL", out: "OUT", send: "SEND", hold: "HOLD", wait: "WAIT" };
 document.getElementById("c-run").textContent = D.run_id || (D.live ? "in progress" : "latest");
 document.getElementById("c-scope").textContent = D.scope;
 document.getElementById("c-who").textContent = D.who || "scheduled";
@@ -363,7 +385,17 @@ const edges = D.edges.map(e => {
 const UP = {}; D.edges.forEach(e => (UP[e.t] = UP[e.t] || []).push(e.f));
 const clk = ms => { const t = Math.max(0, Math.round(ms / 1000)); return t >= 60 ? `${Math.floor(t / 60)}m ${pad(t % 60)}s` : `${t}s`; };
 function runningStage(a, now) { return a.stages.find(k => stageState(k, now) === "running"); }
+const RV = D.review || {};
+function humanStatus(now) {     // approver: waits for the Auditor, then for people to decide the review items
+  const auditDone = agentState(A.audit, now) === "done";
+  if (!auditDone) return ["waiting", "waiting for Auditor"];
+  if (RV.total === undefined || RV.total === null) return ["waiting", "review not loaded"];
+  if (!RV.total) return ["done", "nothing to review"];
+  if (RV.pending > 0) return ["await", `awaiting approval · ${RV.pending.toLocaleString("en-US")} of ${RV.total.toLocaleString("en-US")}`];
+  return ["done", `approved ${RV.approved.toLocaleString("en-US")} · rejected ${RV.rejected.toLocaleString("en-US")}`];
+}
 function nodeStatus(a, now) {   // state class + plain-language status line for one agent at time `now`
+  if (a.human) return humanStatus(now);
   const s = agentState(a, now), ups = UP[a.id] || [];
   const pendingUp = ups.filter(u => agentState(A[u], now) !== "done").map(u => A[u].name);
   if (s === "running") { const k = runningStage(a, now); return ["running", `running · ${k} · ${clk(now - S[k].start)}`]; }
@@ -375,9 +407,10 @@ function nodeStatus(a, now) {   // state class + plain-language status line for 
 }
 function renderCanvas(now, animate) {
   D.agents.forEach(a => { const [cls, txt] = nodeStatus(a, now), el = nodes[a.id];
-    el.className = "node s-" + cls; el.querySelector(".badge").innerHTML = ICON[cls] || ""; el.querySelector(".stt").textContent = txt; });
+    el.className = "node s-" + cls + (a.human ? " human" : ""); el.querySelector(".badge").innerHTML = ICON[cls] || ""; el.querySelector(".stt").textContent = txt; });
   edges.forEach(x => {
-    const sent = x.e.at && now >= x.e.at, st = agentState(A[x.e.t], now), active = sent && (st === "running" || st === "idle");
+    const sent = x.e.at && now >= x.e.at, st = A[x.e.t].human ? (humanStatus(now)[0] === "await" ? "running" : humanStatus(now)[0]) : agentState(A[x.e.t], now),
+          active = sent && (st === "running" || st === "idle");
     const pending = !sent && agentState(A[x.e.f], now) === "running";   // sender working → handover coming
     x.p.setAttribute("class", "edge" + (active ? " active" : sent ? " done" : pending ? " pending" : "")); x.g.style.display = sent ? "" : "none";
     if (active && animate) { const pt = x.p.getPointAtLength(((performance.now() / 1400) % 1) * x.len);
@@ -389,17 +422,20 @@ function renderCanvas(now, animate) {
 const nowEl = document.getElementById("now");
 function renderNow(now) {
   const keys = Object.keys(S), total = keys.length, done = keys.filter(k => stageState(k, now) === "done").length;
-  const running = D.agents.filter(a => agentState(a, now) === "running");
-  const failed = D.agents.filter(a => agentState(a, now) === "failed");
-  const waiting = D.agents.filter(a => ["waiting", "idle"].includes(agentState(a, now)));
+  const AG = D.agents.filter(a => !a.human);
+  const running = AG.filter(a => agentState(a, now) === "running");
+  const failed = AG.filter(a => agentState(a, now) === "failed");
+  const waiting = AG.filter(a => ["waiting", "idle"].includes(agentState(a, now)));
   const started = SV.length && now >= T0;
   const span = (k, v, cls) => `<span><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></span>`;
   const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   let html;
   if (failed.length) html = span("Status", "stopped · " + esc(failed.map(a => a.name).join(", ")) + " failed", "fail");
   else if (!started) html = span("Status", D.has || SV.length ? "ready to replay" : "waiting for the run to start");
-  else if (done === total && !running.length) html = span("Status", "run complete", "ok") + span("Stages", `${done} / ${total}`)
-    + (D.have_timings ? span("Elapsed", clk(T1 - T0)) : "");
+  else if (done === total && !running.length) html = (RV.pending > 0
+      ? span("Status", `engine done · awaiting human approval (${RV.pending.toLocaleString("en-US")} of ${RV.total.toLocaleString("en-US")} lines)`, "run")
+      : span("Status", RV.total ? "run complete · review done" : "run complete", "ok"))
+    + span("Stages", `${done} / ${total}`) + (D.have_timings ? span("Elapsed", clk(T1 - T0)) : "");
   else html = span("Now running", running.length ? esc(running.map(a => `${a.name} (${runningStage(a, now)})`).join(" · ")) : "handing over…", "run")
     + span("Waiting", waiting.length ? esc(waiting.map(a => a.name).join(", ")) : "—")
     + span("Stages", `${done} / ${total}`) + (D.have_timings ? span("Elapsed", clk(now - T0)) : "");
