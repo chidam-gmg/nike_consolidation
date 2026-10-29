@@ -30,6 +30,12 @@ def human_ts(iso: str) -> str:
         return str(iso)
 
 
+def _who(x) -> str:
+    """Plain-language run owner: the daily job runs with the job default ('app'); app users are recorded by email."""
+    x = str(x or "").strip()
+    return "scheduled 10:30 run" if x in ("", "app", "manual", "None", "nan") else x
+
+
 def commafy(frame, cols):
     """Format numeric columns as thousands-separated strings (Streamlit 'localized' preset isn't
     supported here, so we format in pandas and render as text)."""
@@ -204,7 +210,7 @@ st.markdown(
 )
 
 # Dark mode — one switch for the whole page (app chrome + Agent lab), so nothing renders half light / half dark.
-_tg = st.columns([6, 1])
+_tg = st.columns([6, 1], vertical_alignment="center")
 DARK = _tg[1].toggle("Dark mode", key="dark_mode", help="Switch the whole app between GMG light and dark.")
 if DARK:
     st.markdown("""
@@ -230,6 +236,15 @@ if DARK:
   [data-baseweb="select"] > div, [data-baseweb="base-input"], [data-baseweb="input"] > div, .stApp input, .stApp textarea,
   [data-testid="stNumberInputContainer"] { background:#161C30 !important; color:#E5E9F4 !important; border-color:#252E48 !important; }
   [data-baseweb="select"] div { background-color:#161C30 !important; color:#E5E9F4 !important; }
+  [data-baseweb="select"], [data-baseweb="select"] > div { background-color:#161C30 !important; border-color:#2E3858 !important; }
+  [data-testid="stMultiSelect"] div:not([data-baseweb="tag"]):not([data-baseweb="tag"] *),
+  [data-testid="stSelectbox"] div { background-color:#161C30 !important; color:#C9D0E4 !important; border-color:#2E3858 !important; }
+  [data-baseweb="select"] input { background:transparent !important; border:0 !important; box-shadow:none !important; }
+  [data-baseweb="select"] input::placeholder, [data-baseweb="select"] [class*="placeholder"] { color:#7A84A3 !important;
+    -webkit-text-fill-color:#7A84A3 !important; opacity:1 !important; }
+  [data-testid="stChatInput"] textarea::placeholder { -webkit-text-fill-color:#7A84A3 !important; opacity:1 !important; }
+  .stApp input::placeholder, .stApp textarea::placeholder, [data-testid="stMultiSelect"] input::placeholder {
+    color:#8C96B4 !important; -webkit-text-fill-color:#8C96B4 !important; opacity:1 !important; }
   [data-baseweb="select"] svg { fill:#8790AB !important; }
   [data-baseweb="tag"], [data-baseweb="tag"] * { background-color:#252E48 !important; }
   [data-baseweb="popover"] ul, [data-baseweb="menu"] { background:#161C30 !important; }
@@ -265,7 +280,7 @@ try:
     if _atp.get("atp_snapshot_date"):
         _upd = human_ts(_atp["atp_updated_at"]) if _atp.get("atp_updated_at") else "—"
         _dmd = f" · demand window through **{_atp['as_of_date']}**" if _atp.get("as_of_date") else ""
-        st.caption(f"📦 Inventory (ATP) as of **{_atp['atp_snapshot_date']}**{_dmd} · upstream loaded **{_upd}**")
+        _tg[0].caption(f"Inventory (ATP) as of **{_atp['atp_snapshot_date']}**{_dmd} · upstream loaded **{_upd}**")
 except Exception:
     pass
 
@@ -374,7 +389,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
             uc[0].error("Kids age-band mapping NOT accepted — fix and re-upload. The live mapping is unchanged.\n\n- "
                         + "\n- ".join(_kb_errs))
         else:
-            uc[0].success(f"✅ Valid: {len(bands_df)} size → band rows, {bands_df['id1'].nunique()} bands — "
+            uc[0].success(f"Valid: {len(bands_df)} size → band rows, {bands_df['id1'].nunique()} bands — "
                           "applied when you click Run.")
         for _w in _kb_warns:
             uc[0].warning(_w)
@@ -394,7 +409,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
         else:
             _nk = int((size_df["gender"] == "KIDS").sum())
             _ng = size_df[size_df["gender"] != "KIDS"].groupby(["division", "ah2_description", "gender"]).ngroups
-            uc[0].success(f"✅ Valid: {len(size_df)} rows ({_ng} adult groups, {_nk} kids rows) — "
+            uc[0].success(f"Valid: {len(size_df)} rows ({_ng} adult groups, {_nk} kids rows) — "
                           "applied when you click Run.")
         for _w in _sc_warns:
             uc[0].warning(_w)
@@ -428,7 +443,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
     if _sl is not None:
         _sl_countries = sorted(_sl["COUNTRY"].dropna().astype(str).str.strip().unique().tolist())
         _prov = dbio.store_list_provenance()
-        st.caption(f"📋 Active store list: **{len(_sl)} stores** across {', '.join(_sl_countries)}  ·  "
+        st.caption(f"Active store list: **{len(_sl)} stores** across {', '.join(_sl_countries)}  ·  "
                    f"last changed by **{_prov['user']}** on {human_ts(_prov['ts'])}")
         rc = st.columns([2, 2, 1])
         run_countries = rc[0].multiselect(
@@ -489,7 +504,7 @@ with st.expander("Run parameters", expanded=(ss.run_state in ("empty", "error"))
                 ss.run_id = res["run_id"]; ss.run_url = res.get("run_url")
                 ss.run_started = time.time()
                 ss.run_state = "running"
-                st.toast(f"Job submitted — run #{ss.run_id}", icon="🚀")
+                st.toast(f"Job submitted — run #{ss.run_id}")
                 st.rerun()
             except Exception as e:
                 ss.run_state = "error"; ss.error_msg = str(e); st.rerun()
@@ -534,7 +549,7 @@ if ss.run_state == "running":
                                (s or {}).get("current_task") or "starting up")
         pct = min(max(done / total, 0.02), 0.99)
         queued = (s or {}).get("queued")
-        head = "⏳ Queued — waiting for a slot…" if queued else f"🔄 Running · {step}"
+        head = "Queued — waiting for a slot…" if queued else f"Running · {step}"
         with st.container(border=True):
             st.markdown(f"**{head}**")
             st.progress(pct, text=f"Step {min(done + 1, total)} of {total}  ·  {elapsed or 0}s elapsed")
@@ -592,14 +607,14 @@ elif ss.run_state == "results":
 
     # provenance — whose run, when, what scope — so a viewer is never silently shown someone else's run
     if VRID:
-        st.caption(f"👁 Viewing **your run** · by **{stats.get('triggered_by', '—')}** · "
+        st.caption(f"Viewing **your run** · by **{_who(stats.get('triggered_by'))}** · "
                    f"{human_ts(stats.get('run_ts', stats.get('computed_at', '—')))} · "
                    f"scope **{stats.get('country_scope', 'ALL')}**"
                    + (f" · category **{stats.get('category_scope')}**"
                       if str(stats.get('category_scope') or 'ALL') not in ('ALL', 'None', 'nan') else "")
                    + f"  ·  run `{VRID}`")
     else:
-        st.caption("👁 Viewing the **latest completed run** (shared across users). "
+        st.caption("Viewing the **latest completed run** (shared across users). "
                    "Run the engine to get your own isolated view.")
 
     # run picker — view any recent run (each user can always return to their own or a full-scope run)
@@ -608,7 +623,7 @@ elif ss.run_state == "results":
     if not _log.empty:
         _labels, _map = [], {}
         for _, r in _log.iterrows():
-            lbl = (f"{human_ts(r['run_ts'])} · {r.get('triggered_by', '—')} · "
+            lbl = (f"{human_ts(r['run_ts'])} · {_who(r.get('triggered_by'))} · "
                    f"{r['country_scope']}"
                    + (f" · {r['category_scope']}" if str(r.get('category_scope') or 'ALL') != 'ALL' else "")
                    + f" · {int(float(r['recommended_moves'] or 0))} moves")
@@ -635,7 +650,7 @@ elif ss.run_state == "results":
         st.rerun()
 
     # ---- definitions (brief) ----
-    with st.expander("ℹ️  Definitions"):
+    with st.expander("Definitions"):
         st.markdown("""
 - **ROS** — units sold/day at a store over the ROS window (0 = dead).
 - **Cover (days)** — ATP ÷ ROS (blank = dead/∞).
@@ -666,7 +681,7 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
         """)
 
     tab_agent, tab_all, tab_replen = st.tabs(
-        ["Agent lab", "🧾  Store consolidation", "🔁  Replenishment (DC→Store)"])
+        ["Agent lab", "Store consolidation", "Replenishment (DC → store)"])
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:
@@ -693,9 +708,7 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                         "approved": int((_dec == "APPROVED").sum()), "rejected": int((_dec == "REJECTED").sum()),
                         "topup": int(_top.sum()), "other": int((~_top).sum())}
             agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))), run_id=_arid,
-                              theme=THEME, review=_rvs)
-            if _jr is None:
-                st.caption("Stage timings for this run are not available — showing results only.")
+                              theme=THEME, review=_rvs, height=984)
         except Exception as e:
             _rv = None
             st.info(f"Agent lab unavailable for this run: {e}")
@@ -731,15 +744,20 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                 "line_type": "Type", "review_reason": "Why review", "parent_article": "Parent",
                 "generic_article_name": "Style", "article": "Article", "size": "Size", "from_site": "From",
                 "to_site": "To", "qty": "Qty", "value_aed": "Value (AED)", "comment": "Comment", "decided_by": "Decided by"})
-            _cols = ["Decision", "Comment", "Type", "Why review", "Parent", "Style", "Article", "Size", "From", "To",
-                     "Qty", "Value (AED)", "Decided by"]
+            for _c in ("Comment", "Decided by"):
+                _show[_c] = _show[_c].fillna("").astype(str).replace({"None": "", "nan": ""})
+            _cols = ["Decision", "Why review", "Type", "Style", "Article", "Size", "From", "To", "Qty", "Value (AED)",
+                     "Comment", "Decided by"]
             _edited = st.data_editor(
                 _show[_cols], key=f"rv_editor_{_arid}_{ss.review_ver}", hide_index=True, use_container_width=True,
                 height=360, disabled=[c for c in _cols if c not in ("Decision", "Comment")],
                 column_config={
-                    "Decision": st.column_config.SelectboxColumn(options=list(_LBL.values()), required=True, width="small"),
-                    "Comment": st.column_config.TextColumn(width="medium"),
-                    "Value (AED)": st.column_config.NumberColumn(format="%,.0f"),
+                    "Decision": st.column_config.SelectboxColumn(options=list(_LBL.values()), required=True, width="medium"),
+                    "Comment": st.column_config.TextColumn(width="medium", help="Optional note saved with the decision"),
+                    "Value (AED)": st.column_config.NumberColumn(format="%,.0f", width="small"),
+                    "Type": st.column_config.TextColumn(width="small"), "Size": st.column_config.TextColumn(width="small"),
+                    "To": st.column_config.TextColumn(width="small"), "Qty": st.column_config.NumberColumn(width="small"),
+                    "Decided by": st.column_config.TextColumn(width="small"),
                 })
             _bc = st.columns([1.3, 1.3, 1.3, 3])
             _pend = _view[_view["decision"].fillna("PENDING") == "PENDING"]
@@ -767,7 +785,7 @@ Every store×size sits in exactly one **Action**: **move** (to action), **held**
                              disabled=_pend.empty):
                 _save(_pend.assign(decision="APPROVED"), "Approved")
             if _bc[2].button(f"Reject {len(_pend):,} pending shown", use_container_width=True, key="rv_rej",
-                             disabled=_pend.empty):
+                             disabled=_pend.empty, type="tertiary"):
                 _save(_pend.assign(decision="REJECTED"), "Rejected")
             _bc[3].caption(f"{len(_view):,} of {len(_rv):,} review lines shown · filter, then decide in the "
                            "Decision column and Save, or use the bulk buttons.")

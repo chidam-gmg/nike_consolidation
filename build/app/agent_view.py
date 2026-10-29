@@ -184,7 +184,7 @@ def _payload(job_run: dict | None, metrics: dict, live: bool, run_id: str | None
         {"k": "Units moved", "v": _n(s.get("total_units")), "at": stages["score"]["end"]},
         {"k": "DC lines", "v": _n(r.get("replen_lines")), "at": stages["replen_output"]["end"]},
         {"k": "DC value", "v": _aed(r.get("fill_value_aed")), "at": stages["replen_output"]["end"]},
-        {"k": "Held for review", "v": _n(s.get("held_lines")), "at": stages["score"]["end"]},
+        {"k": "Held by rules", "v": _n(s.get("held_lines")), "at": stages["score"]["end"]},
     ]
     jr = job_run or {}
     return {
@@ -207,46 +207,46 @@ def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str 
 
 
 _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Source+Code+Pro:wght@400;500;600&display=swap">
 <style>
 :root { /* light = GMG brand (matches the app page); dark = console. Set by the app's Dark mode toggle. */
   color-scheme: light;
-  --bg:#FFFFFF; --panel:#F6F8F9; --panel-2:#FFFFFF; --line:#DCE3E6; --fg:#20274C; --muted:#5C6478; --dim:#8F97AC;
-  --accent:#2658F2; --run:#C47A10; --ok:#1E9E6A; --hold:#B15940; --dot:#E2E8EB; --console:#FBFCFC;
+  --bg:#FFFFFF; --panel:#F6F8F9; --panel-2:#FFFFFF; --line:#DCE3E6; --fg:#20274C; --muted:#5C6478; --dim:#68708A;
+  --accent:#2658F2; --run:#9A5A00; --ok:#12704D; --hold:#9A4A33; --dot:#E2E8EB; --console:#FBFCFC;
   --wire-done:#9DB0E8; --acc-soft:rgba(38,88,242,.10); --run-soft:rgba(196,122,16,.14); --ok-soft:rgba(30,158,106,.12);
-  --ui:"Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono:"Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+  --ui:"Source Sans 3", "Source Sans Pro", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"Source Code Pro", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
 :root[data-theme="dark"] { color-scheme: dark;
-  --bg:#0A0D16; --panel:#111626; --panel-2:#161C30; --line:#252E48; --fg:#E5E9F4; --muted:#8790AB; --dim:#5A6380;
+  --bg:#0A0D16; --panel:#111626; --panel-2:#161C30; --line:#252E48; --fg:#E5E9F4; --muted:#8790AB; --dim:#7A84A3;
   --accent:#5B86FF; --run:#F2A93B; --ok:#34C08F; --hold:#E07A5F; --dot:#1C2338; --console:#080B13;
   --wire-done:#3D4B78; --acc-soft:rgba(91,134,255,.12); --run-soft:rgba(242,169,59,.14); --ok-soft:rgba(52,192,143,.15); }
 * { box-sizing:border-box; }
 html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var(--ui); }
-.wrap { display:grid; gap:12px; padding:4px 2px 8px; }
+.wrap { display:grid; gap:12px; padding:4px 0 8px; }
 .head { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
 .head .t { font-weight:600; font-size:15px; }
-.chip { font:11px var(--mono); color:var(--muted); border:1px solid var(--line); border-radius:6px; padding:3px 8px; background:var(--panel); }
+.chip { font:11px var(--mono); color:var(--muted); border:1px solid var(--line); border-radius:8px; padding:4px 8px; background:var(--panel); }
 .chip b { color:var(--fg); font-weight:500; }
 .live { font:600 11px var(--mono); letter-spacing:.1em; color:var(--run); display:inline-flex; align-items:center; gap:6px; }
 .live::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--run); animation:pulse 1s ease-in-out infinite; }
 [hidden] { display:none !important; }
 .grow { flex:1; }
 .clock { font:12px var(--mono); color:var(--muted); } .clock b { color:var(--fg); font-weight:500; }
-.btn { font:500 12px var(--ui); color:var(--fg); background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+.btn { font:600 13px var(--ui); color:var(--fg); background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:8px 16px; min-height:36px; cursor:pointer; }
 .btn:hover { border-color:var(--accent); } .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
 .btn:focus-visible, .filter:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .kpis { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
-.kpi { padding:9px 14px; border-right:1px solid var(--line); min-width:0; } .kpi:last-child { border-right:0; }
+.kpi { padding:8px 16px; border-right:1px solid var(--line); min-width:0; } .kpi:last-child { border-right:0; }
 .kpi .l { font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
 .kpi .v { font:500 21px var(--mono); font-variant-numeric:tabular-nums; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.stage { border:1px solid var(--line); border-radius:12px; overflow-x:auto;
+.stage { border:1px solid var(--line); border-radius:12px; overflow:hidden; position:relative;
   background-color:var(--bg); background-image:radial-gradient(var(--dot) 1.2px, transparent 1.2px); background-size:18px 18px; }
-.canvas { position:relative; width:1440px; height:462px; margin:0 auto; }
-.canvas svg { position:absolute; left:0; top:0; width:1440px; height:462px; overflow:visible; }
+.canvas { position:absolute; left:0; top:0; width:1440px; height:480px; transform-origin:0 0; }
+.canvas svg { position:absolute; left:0; top:0; width:1440px; height:480px; overflow:visible; }
 .edge { fill:none; stroke:var(--line); stroke-width:2; } .edge.active { stroke:var(--run); } .edge.done { stroke:var(--wire-done); }
 .pkt { fill:var(--run); }
 .cnt rect { fill:var(--panel-2); stroke:var(--line); } .cnt text { fill:var(--muted); font:10px var(--mono); }
-.node { position:absolute; width:150px; display:grid; justify-items:center; gap:6px; }
+.node { position:absolute; width:150px; display:grid; justify-items:center; gap:8px; }
 .box { position:relative; width:84px; height:84px; border-radius:14px; background:var(--panel-2); border:1.5px solid var(--line);
   display:grid; place-items:center; transition:border-color .3s, box-shadow .3s; }
 .glyph { font:600 20px var(--mono); color:var(--muted); }
@@ -266,7 +266,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .node.s-waiting .box { opacity:.55; }
 .lane { position:absolute; font:10px var(--mono); color:var(--dim); letter-spacing:.12em; }
 .stt { font:600 9.5px var(--mono); letter-spacing:.06em; text-transform:uppercase; text-align:center; line-height:1.3;
-  padding:2px 7px; border-radius:5px; border:1px solid var(--line); color:var(--dim); background:var(--panel); max-width:150px; }
+  padding:4px 8px; border-radius:8px; border:1px solid var(--line); color:var(--dim); background:var(--panel); max-width:150px; }
 .node.s-running .stt { color:var(--run); border-color:var(--run); background:var(--run-soft); }
 .node.s-done .stt { color:var(--ok); border-color:transparent; background:transparent; }
 .node.s-failed .stt { color:var(--hold); border-color:var(--hold); }
@@ -280,7 +280,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 .lv.wait { color:var(--accent); }
 .edge.pending { stroke:var(--run); stroke-dasharray:3 6; opacity:.55; animation:dash 1.2s linear infinite; }
 @keyframes dash { to { stroke-dashoffset:-18; } }
-.now { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; padding:9px 14px; border:1px solid var(--line); border-radius:10px;
+.now { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:8px 16px; border:1px solid var(--line); border-radius:10px;
   background:var(--panel); font:12px var(--mono); }
 .now .k { color:var(--muted); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; margin-right:6px; }
 .now .v { color:var(--fg); } .now .v.run { color:var(--run); } .now .v.ok { color:var(--ok); } .now .v.fail { color:var(--hold); }
@@ -289,15 +289,16 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 @keyframes spin { to { transform:rotate(360deg); } }
 @keyframes pulse { 50% { opacity:.3; } }
 .log { border:1px solid var(--line); border-radius:12px; background:var(--console); overflow:hidden; }
-.log-head { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+.log-head { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
 .log-head .t { font:11px var(--mono); letter-spacing:.12em; color:var(--muted); }
 .filters { display:flex; gap:4px; flex-wrap:wrap; }
-.filter { font:500 11px var(--mono); color:var(--muted); background:transparent; border:1px solid var(--line); border-radius:5px; padding:3px 8px; cursor:pointer; }
+.filter { font:500 11px var(--mono); color:var(--muted); background:transparent; border:1px solid var(--line); border-radius:8px; padding:4px 8px; min-height:28px; cursor:pointer; }
 .filter[aria-pressed="true"] { color:var(--fg); border-color:var(--accent); background:var(--acc-soft); }
 .log-body { height:290px; overflow:auto; font:12px var(--mono); }
-.ln { display:grid; grid-template-columns:74px 128px 54px minmax(0,1fr); gap:10px; padding:3px 12px; border-bottom:1px solid var(--panel); }
+.ln { display:grid; grid-template-columns:72px 128px 56px minmax(0,1fr); gap:12px; padding:4px 12px; border-bottom:1px solid var(--panel); }
 .ln:hover { background:var(--acc-soft); }
-.ts { color:var(--dim); font-variant-numeric:tabular-nums; } .ag { color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ts { color:var(--dim); font-variant-numeric:tabular-nums; }
+.nots .ln { grid-template-columns:128px 56px minmax(0,1fr); } .nots .ts { display:none; } .ag { color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .lv { font-size:10.5px; padding-top:1px; } .lv.run { color:var(--run); } .lv.tool { color:var(--accent); } .lv.out { color:var(--ok); }
 .lv.send { color:var(--muted); } .lv.hold { color:var(--hold); }
 .tx { color:var(--fg); overflow-wrap:anywhere; }
@@ -309,7 +310,6 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 @media (prefers-reduced-motion:reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
 </style></head><body><div class="wrap">
 <div class="head">
-  <span class="t">Agent lab</span>
   <span class="chip">RUN <b id="c-run"></b></span><span class="chip">SCOPE <b id="c-scope"></b></span><span class="chip">BY <b id="c-who"></b></span>
   <span class="live" id="live" hidden>LIVE</span>
   <span class="grow"></span>
@@ -319,7 +319,7 @@ html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var
 </div>
 <div class="kpis" id="kpis"></div>
 <div class="now" id="now"></div>
-<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1440 462" aria-hidden="true"></svg></div></div>
+<div class="stage"><div class="canvas" id="canvas"><svg id="edges" viewBox="0 0 1440 480" aria-hidden="true"></svg></div></div>
 <div class="log"><div class="log-head"><span class="t">RUN LOG</span><div class="filters" id="filters"></div></div><div class="log-body" id="logbody"></div></div>
 </div>
 <script>
@@ -433,7 +433,7 @@ function renderNow(now) {
   if (failed.length) html = span("Status", "stopped · " + esc(failed.map(a => a.name).join(", ")) + " failed", "fail");
   else if (!started) html = span("Status", D.has || SV.length ? "ready to replay" : "waiting for the run to start");
   else if (done === total && !running.length) html = (RV.pending > 0
-      ? span("Status", `engine done · awaiting human approval (${RV.pending.toLocaleString("en-US")} of ${RV.total.toLocaleString("en-US")} lines)`, "run")
+      ? span("Status", `engine finished · ${RV.pending.toLocaleString("en-US")} lines awaiting approval`, "run")
       : span("Status", RV.total ? "run complete · review done" : "run complete", "ok"))
     + span("Stages", `${done} / ${total}`) + (D.have_timings ? span("Elapsed", clk(T1 - T0)) : "");
   else html = span("Now running", running.length ? esc(running.map(a => `${a.name} (${runningStage(a, now)})`).join(" · ")) : "handing over…", "run")
@@ -441,6 +441,14 @@ function renderNow(now) {
     + span("Stages", `${done} / ${total}`) + (D.have_timings ? span("Elapsed", clk(now - T0)) : "");
   nowEl.innerHTML = html + `<span class="bar"><i style="width:${Math.round(done / Math.max(1, total) * 100)}%"></i></span>`;
 }
+
+/* fit the canvas to the panel width (scale down, never up) so every node, incl. the Approver, is visible */
+const stageEl = document.querySelector(".stage");
+function fit() { const w = stageEl.clientWidth, sc = Math.min(1, (w - 2) / 1440);
+  canvas.style.transform = `scale(${sc})`; canvas.style.left = Math.max(0, (w - 1440 * sc) / 2) + "px";
+  stageEl.style.height = Math.ceil(480 * sc) + "px"; }
+fit(); window.addEventListener("resize", fit);
+if (!D.have_timings) document.getElementById("logbody").classList.add("nots");
 
 /* KPIs */
 const kbox = document.getElementById("kpis");
