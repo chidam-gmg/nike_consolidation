@@ -35,16 +35,37 @@ WHERE s.distr_channel IN ('10', '20')
   AND s.txn_date > date_sub((SELECT last_day FROM bounds), 7 * 26) AND s.txn_date <= (SELECT last_day FROM bounds)
 GROUP BY 1, 2, 3, 4, 5 HAVING SUM(GREATEST(s.txn_qty, 0)) > 0"""
 
-# active stores (store list) with grade + today's stock / in-transit of CORE sizes + key-size flag
-STOCK = f"""WITH {_CORE}
-SELECT e.country, e.store_id store, MAX(e.store_name) store_name, MAX(e.store_grade) grade, c.parent, c.art, MAX(c.size) size,
-       SUM(e.effective_stock) atp, MAX(COALESCE(it.intransit_qty, 0)) intransit, MAX(COALESCE(ak.is_key_size, 0)) key_size
-FROM {FQ}.effective_stock e JOIN core c ON c.art = e.article_code
-LEFT JOIN {FQ}.store_intransit it ON it.store_id = e.store_id AND it.article_code = e.article_code
-LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = e.article_code
-GROUP BY e.country, e.store_id, c.parent, c.art"""
+# every Nike retail store in the store master (not only the consolidation engine's uploaded store list): today's ATP
+# (latest snapshot, SL01) + in-transit (latest combined_inventory snapshot) of CORE sizes + key-size flag
+STOCK = f"""WITH {_CORE},
+atp_snap AS (SELECT MAX(c_file_date) d FROM sap_gmg_datalake.bronze.atp_detail WHERE c_file_date <= current_date()),
+atp AS (SELECT a.site_code store, a.article_code art, SUM(a.atp_qty) atp FROM sap_gmg_datalake.bronze.atp_detail a
+        JOIN core c ON c.art = a.article_code JOIN nike n ON n.store = a.site_code
+        WHERE a.storage_location = 'SL01' AND a.c_file_date = (SELECT d FROM atp_snap) GROUP BY 1, 2),
+it_snap AS (SELECT MAX(to_date(date)) d FROM prod_mena.silver.combined_inventory
+            WHERE stock_type = 'sports' AND to_date(date) BETWEEN date_sub(current_date(), 7) AND current_date()),
+it AS (SELECT i.plant store, i.material art, SUM(i.Stock_On_Hand_Quantity) intransit FROM prod_mena.silver.combined_inventory i
+       JOIN core c ON c.art = i.material JOIN nike n ON n.store = i.plant
+       WHERE i.stock_type = 'sports' AND (i.stor_loc IS NULL OR i.stor_loc = '') AND to_date(i.date) = (SELECT d FROM it_snap)
+       GROUP BY 1, 2),
+s AS (SELECT COALESCE(atp.store, it.store) store, COALESCE(atp.art, it.art) art,
+             COALESCE(atp.atp, 0) atp, COALESCE(it.intransit, 0) intransit
+      FROM atp FULL OUTER JOIN it ON it.store = atp.store AND it.art = atp.art)
+SELECT n.country, s.store, c.parent, s.art, MAX(c.size) size, SUM(s.atp) atp, SUM(s.intransit) intransit,
+       MAX(COALESCE(ak.is_key_size, 0)) key_size
+FROM s JOIN core c ON c.art = s.art JOIN nike n ON n.store = s.store
+LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = s.art
+WHERE n.country <> ''
+GROUP BY n.country, s.store, c.parent, s.art"""
 
-STORES = f"""SELECT DISTINCT country, store_id store, store_name, store_grade grade FROM {FQ}.effective_stock"""
+# all Nike retail stores; grade from the uploaded store list where the store is on it, else the store master grade
+STORES = f"""SELECT sm.COUNTRY country, sm.PLANT store, MAX(sm.`/BIC/ZNAME1`) store_name,
+       MAX(COALESCE(csg.grade, CASE WHEN TRIM(sm.`/BIC/ZCH_CL_GR`) IN ('', 'NA', 'N-A') OR sm.`/BIC/ZCH_CL_GR` IS NULL
+                                    THEN 'UNGRADED' ELSE TRIM(sm.`/BIC/ZCH_CL_GR`) END)) grade,
+       MAX(CASE WHEN csg.store_code IS NOT NULL THEN 1 ELSE 0 END) on_store_list
+FROM {SM} sm LEFT JOIN {FQ}.cfg_store_grade csg ON csg.store_code = sm.PLANT
+WHERE sm.PLANTCAT = 'A' AND sm.`/BIC/ZBU` = 'NIKE' AND sm.COUNTRY <> ''
+GROUP BY sm.COUNTRY, sm.PLANT"""
 
 KEY_SIZES = f"""WITH {_CORE} SELECT c.parent, c.art, c.size, MAX(COALESCE(ak.is_key_size, 0)) key_size
 FROM core c LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = c.art GROUP BY 1, 2, 3"""
@@ -639,8 +660,9 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             for h in range(HORIZON_WEEKS):
                 fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3),
                                 round(float(fut_raw[i, h]), 3), float(p80[i, h]),
+                                round(float(fut[i, h] + a_ser[i, h] * fut[i, h] ** 2), 3),
                                 round(float(p_sell[i, h]), 3), meth[i], var[i], cls[i], BAND_NAMES[band_of(fut[i].mean())]))
-        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_model", "units_p80", "p_sell", "method",
+        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_model", "units_p80", "units_var", "p_sell", "method",
                                             "variant", "demand_class", "volume_band"])
         fc = fc.merge(meta.reset_index(), on=["country", "parent"], how="left")
         out["forecast"], out["history"] = fc, weekly
@@ -664,7 +686,9 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         sp = sp.merge(carried.assign(carries=1), on=["store", "parent"], how="left")
         sp = sp[sp["carries"].fillna(0) == 1]                       # only styles the store already ranges
         sp["demand_cover"] = sp["cover_units"] * sp["store_share"]          # next 2 weeks incl. seasonality + events
-        log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · {len(active)} active stores")
+        out["scope"] = {"countries": int(sp["country"].nunique()), "stores": int(sp["store"].nunique())}
+        log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · all Nike stores in the store "
+                                    f"master · {out['scope']['stores']} stores selling CORE in {out['scope']['countries']} countries")
         log.say("splitter", "out", f"{len(sp):,} store × style lines · {sp['demand_cover'].sum():,.0f} units of {COVER_DAYS}-day demand")
 
     # 7 · Size curator — country size curve
@@ -729,7 +753,8 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         need["reason"] = np.where(need["cover_qty"] >= need["target"], f"Forecast demand ({SERVICE_LEVEL:.0%} cover)",
                                   "Display: 1 per key size")
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
-                                  np.where(need["alloc_qty"] > 0, "Part-allocated", "No DC stock"))
+                                  np.where(need["alloc_qty"] > 0, "Part-allocated",
+                                           np.where(need["country"].isin(list(dmap)), "No DC stock", "No DC for country")))
         out["allocation"] = need[["country", "store", "store_name", "grade", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
@@ -737,10 +762,17 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         log.say("allocator", "out", f"{int((a['alloc_qty'] > 0).sum()):,} lines · {int(a['alloc_qty'].sum()):,} units allocated · "
                                     f"{int((a['status'] == 'No DC stock').sum()):,} sizes with no DC stock")
         cur = _num(current_replen.copy(), ["qty"])
+        listed = set(stores.loc[pd.to_numeric(stores.get("on_store_list", 1), errors="coerce") == 1, "store"])
+        a_l = a[a["store"].isin(listed)]                                     # like for like: the engine's store list only
         out["vs_current"] = {"current_lines": int(len(cur)), "current_units": int(cur["qty"].sum()),
-                             "plan_lines": int((a["alloc_qty"] > 0).sum()), "plan_units": int(a["alloc_qty"].sum())}
-        log.say("allocator", "out", f"today's engine sends {out['vs_current']['current_units']:,} CORE units on {out['vs_current']['current_lines']:,} lines; "
-                                    f"forecast plan {out['vs_current']['plan_units']:,} units on {out['vs_current']['plan_lines']:,} lines")
+                             "plan_lines": int((a_l["alloc_qty"] > 0).sum()), "plan_units": int(a_l["alloc_qty"].sum()),
+                             "plan_lines_all": int((a["alloc_qty"] > 0).sum()), "plan_units_all": int(a["alloc_qty"].sum())}
+        log.say("allocator", "out", f"on the engine's store list: today's engine sends {out['vs_current']['current_units']:,} CORE "
+                                    f"units on {out['vs_current']['current_lines']:,} lines; forecast plan "
+                                    f"{out['vs_current']['plan_units']:,} units on {out['vs_current']['plan_lines']:,} lines")
+        for c, g in a.groupby("country"):
+            log.say("allocator", "out", f"{c}: {int((g['alloc_qty'] > 0).sum()):,} lines · {int(g['alloc_qty'].sum()):,} units · "
+                                        f"{int(g['store'].nunique())} stores")
 
     out["log"] = log
     return out
@@ -767,7 +799,7 @@ def save(pdf, table):
     print(table, len(pdf))
 
 save(o["forecast"], "fc_forecast")
-hist = o["history"][["country", "parent", "wk", "units"]].copy(); hist["wk"] = hist["wk"].dt.date
+hist = o["history"][["country", "parent", "division", "category", "wk", "units"]].copy(); hist["wk"] = hist["wk"].dt.date
 save(hist, "fc_history")
 save(o["backtest"], "fc_backtest")
 save(o["leaderboard"], "fc_leaderboard")
@@ -784,4 +816,5 @@ save(pd.DataFrame([{"run_ts": datetime.now(timezone.utc).isoformat(), "error_cha
                     "error_baseline": o["error_baseline"], "error_flat_best": o["error_flat_best"],
                     "error_seasonal_best": o["error_seasonal_best"], "error_fast": o["error_fast"], "floor_fast": o["floor_fast"],
                     "p80_coverage": o["p80_coverage"], "p80_coverage_old": o["p80_coverage_old"],
-                    "p_sell_gap_slow": o["p_sell_gap_slow"], **vs}]), "fc_run_summary")
+                    "p_sell_gap_slow": o["p_sell_gap_slow"], "scope_countries": o["scope"]["countries"],
+                    "scope_stores": o["scope"]["stores"], **vs}]), "fc_run_summary")

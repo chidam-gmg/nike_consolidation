@@ -29,16 +29,37 @@ WHERE s.distr_channel IN ('10', '20')
   AND s.txn_date > date_sub((SELECT last_day FROM bounds), 7 * 26) AND s.txn_date <= (SELECT last_day FROM bounds)
 GROUP BY 1, 2, 3, 4, 5 HAVING SUM(GREATEST(s.txn_qty, 0)) > 0"""
 
-# active stores (store list) with grade + today's stock / in-transit of CORE sizes + key-size flag
-STOCK = f"""WITH {_CORE}
-SELECT e.country, e.store_id store, MAX(e.store_name) store_name, MAX(e.store_grade) grade, c.parent, c.art, MAX(c.size) size,
-       SUM(e.effective_stock) atp, MAX(COALESCE(it.intransit_qty, 0)) intransit, MAX(COALESCE(ak.is_key_size, 0)) key_size
-FROM {FQ}.effective_stock e JOIN core c ON c.art = e.article_code
-LEFT JOIN {FQ}.store_intransit it ON it.store_id = e.store_id AND it.article_code = e.article_code
-LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = e.article_code
-GROUP BY e.country, e.store_id, c.parent, c.art"""
+# every Nike retail store in the store master (not only the consolidation engine's uploaded store list): today's ATP
+# (latest snapshot, SL01) + in-transit (latest combined_inventory snapshot) of CORE sizes + key-size flag
+STOCK = f"""WITH {_CORE},
+atp_snap AS (SELECT MAX(c_file_date) d FROM sap_gmg_datalake.bronze.atp_detail WHERE c_file_date <= current_date()),
+atp AS (SELECT a.site_code store, a.article_code art, SUM(a.atp_qty) atp FROM sap_gmg_datalake.bronze.atp_detail a
+        JOIN core c ON c.art = a.article_code JOIN nike n ON n.store = a.site_code
+        WHERE a.storage_location = 'SL01' AND a.c_file_date = (SELECT d FROM atp_snap) GROUP BY 1, 2),
+it_snap AS (SELECT MAX(to_date(date)) d FROM prod_mena.silver.combined_inventory
+            WHERE stock_type = 'sports' AND to_date(date) BETWEEN date_sub(current_date(), 7) AND current_date()),
+it AS (SELECT i.plant store, i.material art, SUM(i.Stock_On_Hand_Quantity) intransit FROM prod_mena.silver.combined_inventory i
+       JOIN core c ON c.art = i.material JOIN nike n ON n.store = i.plant
+       WHERE i.stock_type = 'sports' AND (i.stor_loc IS NULL OR i.stor_loc = '') AND to_date(i.date) = (SELECT d FROM it_snap)
+       GROUP BY 1, 2),
+s AS (SELECT COALESCE(atp.store, it.store) store, COALESCE(atp.art, it.art) art,
+             COALESCE(atp.atp, 0) atp, COALESCE(it.intransit, 0) intransit
+      FROM atp FULL OUTER JOIN it ON it.store = atp.store AND it.art = atp.art)
+SELECT n.country, s.store, c.parent, s.art, MAX(c.size) size, SUM(s.atp) atp, SUM(s.intransit) intransit,
+       MAX(COALESCE(ak.is_key_size, 0)) key_size
+FROM s JOIN core c ON c.art = s.art JOIN nike n ON n.store = s.store
+LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = s.art
+WHERE n.country <> ''
+GROUP BY n.country, s.store, c.parent, s.art"""
 
-STORES = f"""SELECT DISTINCT country, store_id store, store_name, store_grade grade FROM {FQ}.effective_stock"""
+# all Nike retail stores; grade from the uploaded store list where the store is on it, else the store master grade
+STORES = f"""SELECT sm.COUNTRY country, sm.PLANT store, MAX(sm.`/BIC/ZNAME1`) store_name,
+       MAX(COALESCE(csg.grade, CASE WHEN TRIM(sm.`/BIC/ZCH_CL_GR`) IN ('', 'NA', 'N-A') OR sm.`/BIC/ZCH_CL_GR` IS NULL
+                                    THEN 'UNGRADED' ELSE TRIM(sm.`/BIC/ZCH_CL_GR`) END)) grade,
+       MAX(CASE WHEN csg.store_code IS NOT NULL THEN 1 ELSE 0 END) on_store_list
+FROM {SM} sm LEFT JOIN {FQ}.cfg_store_grade csg ON csg.store_code = sm.PLANT
+WHERE sm.PLANTCAT = 'A' AND sm.`/BIC/ZBU` = 'NIKE' AND sm.COUNTRY <> ''
+GROUP BY sm.COUNTRY, sm.PLANT"""
 
 KEY_SIZES = f"""WITH {_CORE} SELECT c.parent, c.art, c.size, MAX(COALESCE(ak.is_key_size, 0)) key_size
 FROM core c LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = c.art GROUP BY 1, 2, 3"""

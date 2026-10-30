@@ -4,6 +4,18 @@ Running backlog of known shortcuts / deferred work. Newest first.
 
 ---
 
+## TD-9 · Allocation sign-off: connect directory, notifications, SAP (2026-10-30)
+
+**Status:** Flow built in the dev app (Forecast & allocation → Allocation plan + Line manager review); three stubs
+to connect.
+- **Line manager lookup** — `databricks_io.line_manager_of()` reads `cfg_line_manager` (empty today). Replace with
+  Microsoft Entra ID (Graph `GET /users/{email}/manager`) or the HR system; keep the signature. Until then, Modify /
+  Reject lines have no manager; the dev app lets anyone act as manager (toggle) to test.
+- **Notification** — `databricks_io.notify_line_manager()` is a no-op; connect Teams / Outlook.
+- **SAP push** — reads view `al_final` (Approved → recommended qty; Change approved → planner qty, 0 for a
+  reject; Change declined → recommended qty). Lines still awaiting a manager are not in the view.
+- Tables: `al_decisions` (one row per run × store|article), `cfg_line_manager`.
+
 ## TD-8 · Article-level open-STO feed for receiver checks (2026-10-07)
 
 **Status:** Requested from data team — engine uses in-transit only until it lands.

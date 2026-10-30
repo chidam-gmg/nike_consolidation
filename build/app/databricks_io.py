@@ -582,11 +582,136 @@ def load_fc_calendar(country: str, parent: str) -> pd.DataFrame:
                          AND s.week_start >= date_sub(current_date(), 7 * 30) ORDER BY s.week_start""")
 
 
+def load_fc_hierarchy() -> pd.DataFrame:
+    """Country x division x category of the forecast, with next-8-week units (explorer pickers)."""
+    return run_sql(f"""SELECT country, division, category, ROUND(SUM(units_p50), 0) units_8w FROM {FQ}.fc_forecast
+                       GROUP BY 1, 2, 3""")
+
+
+def load_fc_agg(level: str, value: str, country: str | None) -> pd.DataFrame:
+    """Actual (52 weeks) + forecast summed to a division or category, one country or all. P80 for the group comes
+    from the summed variance (styles' own P80s do not add up)."""
+    col = "division" if level == "division" else "category"
+    cond = f"{col} = '{str(value).replace(chr(39), chr(39) * 2)}'" + (
+        f" AND country = '{str(country).replace(chr(39), chr(39) * 2)}'" if country else "")
+    return run_sql(f"""SELECT wk, SUM(units) units, CAST(NULL AS DOUBLE) p50, CAST(NULL AS DOUBLE) p80 FROM {FQ}.fc_history
+                       WHERE {cond} AND wk >= date_sub(current_date(), 7 * 52) GROUP BY wk
+                       UNION ALL
+                       SELECT week_start, NULL, SUM(units_p50), SUM(units_p50) + 0.8416 * SQRT(SUM(units_var))
+                       FROM {FQ}.fc_forecast WHERE {cond} GROUP BY week_start ORDER BY 1""")
+
+
+def load_fc_calendar_div(division: str, country: str | None) -> pd.DataFrame:
+    """Season + event factor by week for a division (one country, or the average across countries)."""
+    d = str(division).replace("'", "''")
+    cc = f" AND country = '{str(country).replace(chr(39), chr(39) * 2)}'" if country else ""
+    return run_sql(f"""SELECT week_start, AVG(season_factor) season_factor, AVG(factor) factor, MAX(events) events
+                       FROM {FQ}.fc_seasonality WHERE division = '{d}'{cc} AND week_start >= date_sub(current_date(), 7 * 52)
+                       GROUP BY week_start ORDER BY week_start""")
+
+
 def load_al_allocation() -> pd.DataFrame:
-    return run_sql(f"""SELECT store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d,
+    return run_sql(f"""SELECT run_id, country, store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d,
                        ROUND(p_sell * 100, 0) p_sell_pct, CAST(target AS INT) target,
                        atp, intransit, need, alloc_qty, source, reason, status FROM {FQ}.al_allocation
                        ORDER BY status, alloc_qty DESC, store""")
+
+
+# ---- Allocation sign-off: Approve / Modify / Reject per line; changes go to the planner's line manager ----
+# Approve      -> final (the recommended quantity is released).
+# Modify/Reject -> "Awaiting line manager" (routed to the planner's manager) -> "Change approved" (planner's quantity,
+#                  0 for a reject) or "Change declined" (the recommendation stands). Only final lines reach al_final,
+#                  the view a SAP push will read. Org chart + notifications are stubs to be connected later.
+AL_DEC_FQ = f"{FQ}.al_decisions"
+LM_FQ = f"{FQ}.cfg_line_manager"
+AL_REASONS = ["Store space / display limit", "Size mix not right for this store", "Local event or promotion",
+              "Stock better used in another store", "Quantity too high", "Quantity too low", "Other"]
+AL_FINAL_STATES = ("Approved", "Change approved", "Change declined")
+
+
+def line_manager_of(email: str) -> tuple:
+    """(manager_email, manager_name) for a planner, or (None, None).
+    Today: the cfg_line_manager mapping. Later: Microsoft Entra ID (Graph GET /users/{email}/manager) or the HR
+    system — replace this body, keep the signature."""
+    e = str(email or "").replace("'", "''")
+    try:
+        df = run_sql(f"SELECT manager_email, manager_name FROM {LM_FQ} WHERE lower(user_email) = lower('{e}') LIMIT 1")
+    except Exception:
+        return None, None
+    return (df.iloc[0]["manager_email"], df.iloc[0]["manager_name"]) if len(df) else (None, None)
+
+
+def notify_line_manager(manager_email: str, n_items: int, planner: str, run_id: str) -> bool:
+    """Tell the manager there is something to sign off. Stub — connect Teams / Outlook here. Returns True if sent."""
+    return False
+
+
+def load_al_decisions(run_id: str) -> pd.DataFrame:
+    r = str(run_id).replace("'", "''")
+    return run_sql(f"SELECT * FROM {AL_DEC_FQ} WHERE run_id = '{r}'")
+
+
+def save_al_decisions(run_id: str, rows: pd.DataFrame, user: str) -> dict:
+    """Upsert planner decisions. rows: line_key, country, store, store_name, parent, art, size, recommended_qty,
+    decision (Approve / Modify / Reject), new_qty, reason, comment. Lines a manager already signed off are locked."""
+    if rows is None or rows.empty:
+        return {"saved": 0, "routed": 0, "manager": None}
+    mgr, mgr_name = line_manager_of(user)
+    lit = lambda x: "NULL" if x is None or (isinstance(x, float) and x != x) or str(x) in ("nan", "None", "") else "'" + str(x).replace("'", "''") + "'"
+    num = lambda x: "NULL" if x is None or pd.isna(x) else str(int(float(x)))
+    rec = []
+    for _, r in rows.iterrows():
+        d = {"Approve": "Approved", "Modify": "Modified", "Reject": "Rejected"}[r["decision"]]
+        final = r["recommended_qty"] if d == "Approved" else (0 if d == "Rejected" else r["new_qty"])
+        status = "Approved" if d == "Approved" else "Awaiting line manager"
+        rec.append(f"({lit(run_id)}, {lit(r['line_key'])}, {lit(r['country'])}, {lit(r['store'])}, {lit(r['store_name'])}, "
+                   f"{lit(r['parent'])}, {lit(r['art'])}, {lit(r['size'])}, {num(r['recommended_qty'])}, {lit(d)}, {num(final)}, "
+                   f"{lit(r.get('reason'))}, {lit(r.get('comment'))}, {lit(user)}, {lit(status)}, "
+                   f"{lit(mgr if status != 'Approved' else None)}, {lit(mgr_name if status != 'Approved' else None)})")
+    cols = ("run_id, line_key, country, store, store_name, parent, art, size, recommended_qty, decision, final_qty, reason, "
+            "comment, decided_by, status, route_to, route_to_name")
+    for i in range(0, len(rec), 300):
+        run_sql(f"""
+            MERGE INTO {AL_DEC_FQ} t
+            USING (SELECT * FROM VALUES {", ".join(rec[i:i + 300])} AS v({cols})) s
+            ON t.run_id = s.run_id AND t.line_key = s.line_key
+            WHEN MATCHED AND t.status IN ('Approved', 'Awaiting line manager') THEN UPDATE SET
+              decision = s.decision, final_qty = CAST(s.final_qty AS INT), reason = s.reason, comment = s.comment,
+              decided_by = s.decided_by, decided_at = current_timestamp(), status = s.status, route_to = s.route_to,
+              route_to_name = s.route_to_name
+            WHEN NOT MATCHED THEN INSERT ({cols}, decided_at)
+              VALUES (s.run_id, s.line_key, s.country, s.store, s.store_name, s.parent, s.art, s.size,
+                      CAST(s.recommended_qty AS INT), s.decision, CAST(s.final_qty AS INT), s.reason, s.comment,
+                      s.decided_by, s.status, s.route_to, s.route_to_name, current_timestamp())""")
+    routed = int((rows["decision"] != "Approve").sum())
+    if routed and mgr:
+        notify_line_manager(mgr, routed, user, run_id)
+    return {"saved": len(rec), "routed": routed, "manager": mgr_name or mgr}
+
+
+def load_manager_queue(run_id: str, manager_email: str, include_unassigned: bool = False) -> pd.DataFrame:
+    """Changes waiting for this manager (dev: optionally also changes with no manager mapped)."""
+    r, m = str(run_id).replace("'", "''"), str(manager_email or "").replace("'", "''")
+    who = f"lower(route_to) = lower('{m}')" + (" OR route_to IS NULL" if include_unassigned else "")
+    return run_sql(f"""SELECT line_key, country, store_name, parent, art, size, recommended_qty, decision, final_qty, reason,
+                       comment, decided_by, decided_at, route_to FROM {AL_DEC_FQ}
+                       WHERE run_id = '{r}' AND status = 'Awaiting line manager' AND ({who}) ORDER BY decided_at""")
+
+
+def save_manager_decisions(run_id: str, rows: pd.DataFrame, user: str) -> int:
+    """rows: line_key, manager_decision (Approve change / Decline change), manager_comment."""
+    if rows is None or rows.empty:
+        return 0
+    lit = lambda x: "NULL" if x is None or (isinstance(x, float) and x != x) or str(x) in ("nan", "None", "") else "'" + str(x).replace("'", "''") + "'"
+    vals = ", ".join(f"({lit(r['line_key'])}, {lit('Change approved' if r['manager_decision'] == 'Approve change' else 'Change declined')}, "
+                     f"{lit(r.get('manager_comment'))})" for _, r in rows.iterrows())
+    run_sql(f"""
+        MERGE INTO {AL_DEC_FQ} t
+        USING (SELECT * FROM VALUES {vals} AS v(line_key, status, manager_comment)) s
+        ON t.run_id = '{str(run_id).replace("'", "''")}' AND t.line_key = s.line_key AND t.status = 'Awaiting line manager'
+        WHEN MATCHED THEN UPDATE SET status = s.status, manager_comment = s.manager_comment,
+                                     manager_by = '{str(user).replace("'", "''")}', manager_at = current_timestamp()""")
+    return len(rows)
 
 
 def current_user() -> str:

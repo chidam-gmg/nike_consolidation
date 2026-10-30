@@ -570,8 +570,9 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             for h in range(HORIZON_WEEKS):
                 fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3),
                                 round(float(fut_raw[i, h]), 3), float(p80[i, h]),
+                                round(float(fut[i, h] + a_ser[i, h] * fut[i, h] ** 2), 3),
                                 round(float(p_sell[i, h]), 3), meth[i], var[i], cls[i], BAND_NAMES[band_of(fut[i].mean())]))
-        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_model", "units_p80", "p_sell", "method",
+        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_model", "units_p80", "units_var", "p_sell", "method",
                                             "variant", "demand_class", "volume_band"])
         fc = fc.merge(meta.reset_index(), on=["country", "parent"], how="left")
         out["forecast"], out["history"] = fc, weekly
@@ -595,7 +596,9 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         sp = sp.merge(carried.assign(carries=1), on=["store", "parent"], how="left")
         sp = sp[sp["carries"].fillna(0) == 1]                       # only styles the store already ranges
         sp["demand_cover"] = sp["cover_units"] * sp["store_share"]          # next 2 weeks incl. seasonality + events
-        log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · {len(active)} active stores")
+        out["scope"] = {"countries": int(sp["country"].nunique()), "stores": int(sp["store"].nunique())}
+        log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · all Nike stores in the store "
+                                    f"master · {out['scope']['stores']} stores selling CORE in {out['scope']['countries']} countries")
         log.say("splitter", "out", f"{len(sp):,} store × style lines · {sp['demand_cover'].sum():,.0f} units of {COVER_DAYS}-day demand")
 
     # 7 · Size curator — country size curve
@@ -660,7 +663,8 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         need["reason"] = np.where(need["cover_qty"] >= need["target"], f"Forecast demand ({SERVICE_LEVEL:.0%} cover)",
                                   "Display: 1 per key size")
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
-                                  np.where(need["alloc_qty"] > 0, "Part-allocated", "No DC stock"))
+                                  np.where(need["alloc_qty"] > 0, "Part-allocated",
+                                           np.where(need["country"].isin(list(dmap)), "No DC stock", "No DC for country")))
         out["allocation"] = need[["country", "store", "store_name", "grade", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
@@ -668,10 +672,17 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         log.say("allocator", "out", f"{int((a['alloc_qty'] > 0).sum()):,} lines · {int(a['alloc_qty'].sum()):,} units allocated · "
                                     f"{int((a['status'] == 'No DC stock').sum()):,} sizes with no DC stock")
         cur = _num(current_replen.copy(), ["qty"])
+        listed = set(stores.loc[pd.to_numeric(stores.get("on_store_list", 1), errors="coerce") == 1, "store"])
+        a_l = a[a["store"].isin(listed)]                                     # like for like: the engine's store list only
         out["vs_current"] = {"current_lines": int(len(cur)), "current_units": int(cur["qty"].sum()),
-                             "plan_lines": int((a["alloc_qty"] > 0).sum()), "plan_units": int(a["alloc_qty"].sum())}
-        log.say("allocator", "out", f"today's engine sends {out['vs_current']['current_units']:,} CORE units on {out['vs_current']['current_lines']:,} lines; "
-                                    f"forecast plan {out['vs_current']['plan_units']:,} units on {out['vs_current']['plan_lines']:,} lines")
+                             "plan_lines": int((a_l["alloc_qty"] > 0).sum()), "plan_units": int(a_l["alloc_qty"].sum()),
+                             "plan_lines_all": int((a["alloc_qty"] > 0).sum()), "plan_units_all": int(a["alloc_qty"].sum())}
+        log.say("allocator", "out", f"on the engine's store list: today's engine sends {out['vs_current']['current_units']:,} CORE "
+                                    f"units on {out['vs_current']['current_lines']:,} lines; forecast plan "
+                                    f"{out['vs_current']['plan_units']:,} units on {out['vs_current']['plan_lines']:,} lines")
+        for c, g in a.groupby("country"):
+            log.say("allocator", "out", f"{c}: {int((g['alloc_qty'] > 0).sum()):,} lines · {int(g['alloc_qty'].sum()):,} units · "
+                                        f"{int(g['store'].nunique())} stores")
 
     out["log"] = log
     return out

@@ -32,7 +32,7 @@ def _n(v):
 
 
 def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboard: pd.DataFrame,
-            forecast_series: int, next_week_units: float, alloc: dict) -> dict:
+            forecast_series: int, next_week_units: float, alloc: dict, signoff: dict | None = None) -> dict:
     st = {}
     for _, r in stages.iterrows():
         st[r["stage"]] = {"start": int(float(r["start"])), "end": int(float(r["end"])),
@@ -58,13 +58,17 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
         {"k": "Forecast error", "v": f"{err_c*100:.0f}% (flat {float(summary.get('error_flat_best', 0))*100:.0f}%)",
          "at": st.get("tournament", {}).get("end")},
         {"k": "Units to allocate", "v": _n(alloc.get("units")), "at": end},
-        {"k": "Lines to approve", "v": _n(alloc.get("lines")), "at": end, "accent": True},
+        {"k": "Lines to decide", "v": _n(signoff["to_decide"] if signoff else alloc.get("lines")), "at": end, "accent": True},
     ]
     return {"agents": AGENTS, "stages": st, "edges": edges, "events": ev, "kpis": kpis, "have_timings": bool(st),
             "has": True, "run_id": summary.get("run_id", ""), "who": "forecast job",
-            "scope": "CORE · all countries → 21 active stores", "colw": 150, "cw": 1520,
+            "scope": (f"CORE · {_n(summary.get('scope_countries'))} countries · {_n(summary.get('scope_stores'))} stores"
+                      if summary.get("scope_stores") not in (None, "", "nan") else "CORE · all countries"),
+            "colw": 150, "cw": 1520,
             "lanes": [["FORECAST", 2, "top"], ["ALLOCATION", 6, "bottom"]],
-            "human_text": f"plan ready · {_n(alloc.get('lines'))} lines", "human_cls": "await"}
+            "human_text": (f"{_n(signoff['to_decide'])} to decide · {_n(signoff['with_manager'])} with managers"
+                           if signoff else f"plan ready · {_n(alloc.get('lines'))} lines"),
+            "human_cls": "done" if signoff and not signoff["to_decide"] and not signoff["with_manager"] else "await"}
 
 
 def render(*args, theme="light", **kw):

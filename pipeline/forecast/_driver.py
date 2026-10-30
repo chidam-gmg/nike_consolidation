@@ -20,7 +20,7 @@ def save(pdf, table):
     print(table, len(pdf))
 
 save(o["forecast"], "fc_forecast")
-hist = o["history"][["country", "parent", "wk", "units"]].copy(); hist["wk"] = hist["wk"].dt.date
+hist = o["history"][["country", "parent", "division", "category", "wk", "units"]].copy(); hist["wk"] = hist["wk"].dt.date
 save(hist, "fc_history")
 save(o["backtest"], "fc_backtest")
 save(o["leaderboard"], "fc_leaderboard")
@@ -37,4 +37,5 @@ save(pd.DataFrame([{"run_ts": datetime.now(timezone.utc).isoformat(), "error_cha
                     "error_baseline": o["error_baseline"], "error_flat_best": o["error_flat_best"],
                     "error_seasonal_best": o["error_seasonal_best"], "error_fast": o["error_fast"], "floor_fast": o["floor_fast"],
                     "p80_coverage": o["p80_coverage"], "p80_coverage_old": o["p80_coverage_old"],
-                    "p_sell_gap_slow": o["p_sell_gap_slow"], **vs}]), "fc_run_summary")
+                    "p_sell_gap_slow": o["p_sell_gap_slow"], "scope_countries": o["scope"]["countries"],
+                    "scope_stores": o["scope"]["stores"], **vs}]), "fc_run_summary")

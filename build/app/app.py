@@ -102,6 +102,27 @@ def get_al_allocation():
     return dbio.load_al_allocation()
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_hierarchy():
+    return dbio.load_fc_hierarchy()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_agg(level, value, country):
+    return dbio.load_fc_agg(level, value, country)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_calendar_div(division, country):
+    return dbio.load_fc_calendar_div(division, country)
+
+
+@st.cache_data(show_spinner=False)
+def get_al_decisions(run_id, ver: int = 0):
+    """Sign-off decisions for an allocation run; `ver` bumps after every save so the cache refreshes."""
+    return dbio.load_al_decisions(run_id)
+
+
 @st.cache_data(show_spinner=False)
 def get_review_items(run_id, ver: int = 0):
     """Review queue for a run; `ver` bumps after every save so the cache refreshes."""
@@ -694,11 +715,32 @@ elif ss.run_state == "results":
             _sm = _fr["summary"].iloc[0].to_dict()
             _ft, _at = _fr["fc_tot"].iloc[0], _fr["al_tot"].iloc[0]
             _num = lambda v: float(pd.to_numeric(v, errors="coerce") or 0)
+            ss.setdefault("al_ver", 0)
+            try:
+                _al = get_al_allocation()
+                _alrid = str(_al["run_id"].iloc[0]) if len(_al) else ""
+                _dec = get_al_decisions(_alrid, ss.al_ver) if _alrid else pd.DataFrame()
+            except Exception as e:
+                _al, _alrid, _dec = None, "", pd.DataFrame()
+                _al_err = e
+            _so = None
+            if _al is not None:
+                _al["line_key"] = _al["store"].astype(str) + "|" + _al["art"].astype(str)
+                _dcols = ["line_key", "decision", "final_qty", "so_reason", "so_comment", "so_status", "route_to",
+                          "route_to_name", "decided_by", "manager_by", "manager_comment"]
+                _dec = _dec.rename(columns={"reason": "so_reason", "comment": "so_comment", "status": "so_status"})
+                _al = _al.merge(_dec[_dcols] if not _dec.empty else pd.DataFrame(columns=_dcols), on="line_key", how="left")
+                _al["Sign-off"] = _al["so_status"].fillna("To decide")
+                _al["alloc_qty"] = pd.to_numeric(_al["alloc_qty"], errors="coerce").fillna(0).astype(int)
+                _rec_all = _al[_al["alloc_qty"] > 0]
+                _so = {k: int((_rec_all["Sign-off"] == v).sum()) for k, v in
+                       [("to_decide", "To decide"), ("approved", "Approved"), ("with_manager", "Awaiting line manager"),
+                        ("change_approved", "Change approved"), ("change_declined", "Change declined")]}
             forecast_view.render(_fr["stages"], _fr["events"], _sm, _fr["leaderboard"], int(_num(_ft["series"])),
                                  _num(_ft["next_week"]),
                                  {"store_styles": _num(_at["store_styles"]), "size_lines": _num(_at["need_lines"]),
                                   "need_lines": _num(_at["need_lines"]), "lines": _num(_at["lines"]), "units": _num(_at["units"])},
-                                 theme=THEME)
+                                 signoff=_so, theme=THEME)
 
             st.markdown("##### Model contest")
             st.caption("Each model learned from all sales since March 2024, then forecast the 4 weeks after 3 past cut-off "
@@ -747,22 +789,32 @@ elif ss.run_state == "results":
 
             st.markdown("##### Forecast explorer")
             try:
-                _sty = get_fc_styles()
-                _sty["label"] = (_sty["country"] + " · " + _sty["parent"] + " · " + _sty["category"].fillna("") +
-                                 " · " + _sty["demand_class"] + " · " + _sty["method"])
-                _pick = st.selectbox("Style", _sty["label"].tolist(), key="fc_pick", label_visibility="collapsed")
-                _row = _sty[_sty["label"] == _pick].iloc[0]
-                _ser = get_fc_series(_row["country"], _row["parent"])
+                _h = get_fc_hierarchy()
+                _h["units_8w"] = pd.to_numeric(_h["units_8w"], errors="coerce").fillna(0)
+                _xc = st.columns([1.1, 1.3, 2.6])
+                _lvl = _xc[0].selectbox("Level", ["Division (AH1)", "Category (AH2)"], index=1, key="fc_lvl",
+                                        label_visibility="collapsed")
+                _ctry = _xc[1].selectbox("Country", ["All countries"] + sorted(_h["country"].dropna().unique()),
+                                         key="fc_ctry", label_visibility="collapsed")
+                _hc = _h if _ctry == "All countries" else _h[_h["country"] == _ctry]
+                _key = "division" if _lvl.startswith("Division") else "category"
+                _opts = _hc.groupby(_key)["units_8w"].sum().sort_values(ascending=False)
+                _val = _xc[2].selectbox(_lvl, [f"{k} · {v:,.0f} units next 8 weeks" for k, v in _opts.items()],
+                                        key=f"fc_val_{_key}", label_visibility="collapsed").split(" · ")[0]
+                _cc = None if _ctry == "All countries" else _ctry
+                _ser = get_fc_agg(_key, _val, _cc)
                 for _c in ("units", "p50", "p80"):
                     _ser[_c] = pd.to_numeric(_ser[_c], errors="coerce")
                 _ser["wk"] = pd.to_datetime(_ser["wk"])
                 st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
                               height=260)
-                st.caption("Weekly units for the style in the country: actual for the last 30 weeks, then the 8-week forecast "
-                           "(P50 = most likely, P80 = high case: sales stay at or below it in 8 of 10 weeks, from a "
-                           "negative binomial fitted to how much styles of this volume swing). The forecast follows the "
-                           "seasonality and events below.")
-                _cal = get_fc_calendar(_row["country"], _row["parent"])
+                st.caption(f"Weekly units for {_val.title()} in {_ctry.lower() if _cc is None else _ctry}: actual for the last "
+                           "52 weeks, then the 8-week forecast — the sum of every CORE style's forecast in the group "
+                           "(P50 = most likely; P80 = high case for the group as a whole, from the styles' combined "
+                           "spread). The forecast follows the seasonality and events below.")
+                _div = _val if _key == "division" else (_hc[_hc["category"] == _val].sort_values("units_8w")["division"].iloc[-1]
+                                                        if (_hc["category"] == _val).any() else None)
+                _cal = get_fc_calendar_div(_div, _cc) if _div else pd.DataFrame()
                 if not _cal.empty:
                     for _c in ("season_factor", "factor"):
                         _cal[_c] = pd.to_numeric(_cal[_c], errors="coerce")
@@ -770,7 +822,8 @@ elif ss.run_state == "results":
                     st.line_chart(_cal.set_index("week_start")[["season_factor", "factor"]]
                                   .rename(columns={"season_factor": "Seasonality", "factor": "Seasonality × events"}), height=180)
                     _up = _cal[(_cal["week_start"] > pd.Timestamp.now()) & (_cal["events"].fillna("") != "")]
-                    st.caption("Index 1.0 = an average week for this country and division. Upcoming: " +
+                    st.caption(f"Index 1.0 = an average week for {str(_div).title()}"
+                               f"{'' if _cc else ' (average across countries)'}. Upcoming: " +
                                ("; ".join(f"week of {d:%d %b} — {e}" for d, e in zip(_up["week_start"], _up["events"]))
                                 if len(_up) else "no events in the next 8 weeks."))
             except Exception as e:
@@ -791,22 +844,145 @@ elif ss.run_state == "results":
             st.caption("Forecast for the next 14 days (with seasonality + events) → each store's share of the style → country "
                        "size curve → stock target = units that cover 80% of likely 14-day sales at that store and size "
                        "(most sizes sell 0 or 1, so a size with under 20% chance of selling gets nothing beyond display) → "
-                       "at least 1 unit per key size → minus ATP and in-transit → DC stock rationed by grade, then demand.")
-            try:
-                _al = get_al_allocation()
-                _sel = st.multiselect("Status", sorted(_al["status"].unique()), default=["Allocated", "Part-allocated"],
-                                      key="al_status", placeholder="All statuses", label_visibility="collapsed")
-                _alv = _al[_al["status"].isin(_sel)] if _sel else _al
-                st.dataframe(_alv.rename(columns={"store_name": "Store name", "parent": "Style", "art": "Article",
-                                                  "demand_14d": "Demand (14d)", "p_sell_pct": "Chance to sell (14d) %",
-                                                  "target": "Stock target", "atp": "ATP", "intransit": "In-transit",
-                                                  "need": "Need", "alloc_qty": "Allocate", "source": "Source",
-                                                  "reason": "Reason", "status": "Status"}),
-                             hide_index=True, use_container_width=True, height=360)
-                st.download_button(f"Download allocation plan ({len(_alv):,} lines)", data=dbio.to_csv_bytes(_alv),
-                                   file_name="core_allocation_plan.csv", mime="text/csv", key="al_dl")
-            except Exception as e:
-                st.info(f"Allocation plan unavailable: {e}")
+                       "at least 1 unit per key size → minus ATP and in-transit → DC stock rationed by grade, then demand. "
+                       "All Nike stores in the store master; grade from the uploaded store list, else the store master.")
+            if _al is None:
+                st.info(f"Allocation plan unavailable: {_al_err}")
+            else:
+                _me = dbio.current_user()
+                _mgr, _mgr_name = dbio.line_manager_of(_me)
+                st.markdown(
+                    f"**Sign-off** · {_so['to_decide']:,} to decide · {_so['approved']:,} approved · "
+                    f"{_so['with_manager']:,} with line manager · {_so['change_approved']:,} change approved · "
+                    f"{_so['change_declined']:,} change declined")
+                st.caption("Approve releases the recommended quantity. Change 'Qty to send' to modify a line; Modify or Reject "
+                           "needs a reason and goes "
+                           "to your line manager" + (f" ({_mgr_name or _mgr})" if _mgr else
+                           " — none is mapped for you yet (cfg_line_manager; to be replaced by the company directory)") +
+                           ". Lines a manager has signed off are locked.")
+                _fc = st.columns([1.4, 2, 1.6])
+                _f_ct = _fc[0].multiselect("Country", sorted(_al["country"].dropna().unique()), key="al_ctry",
+                                           placeholder="All countries", label_visibility="collapsed")
+                _f_so = _fc[1].multiselect("Sign-off", ["To decide", "Approved", "Awaiting line manager", "Change approved",
+                                                        "Change declined"], default=["To decide"], key="al_so",
+                                           placeholder="All sign-off states", label_visibility="collapsed")
+                _nodc = _fc[2].toggle("Show sizes with no DC stock", key="al_nodc",
+                                      help="Sizes the forecast wants but no DC holds — not actionable, shown for information")
+                _v = _al if _nodc else _al[_al["alloc_qty"] > 0]
+                if _f_ct:
+                    _v = _v[_v["country"].isin(_f_ct)]
+                if _f_so:
+                    _v = _v[_v["Sign-off"].isin(_f_so) | (_v["alloc_qty"] == 0)]
+                _v = _v.reset_index(drop=True)
+                _act = {"Approved": "Approve", "Modified": "Modify", "Rejected": "Reject"}
+                _ed = pd.DataFrame({
+                    "Decision": _v["decision"].map(_act).fillna("To decide"),
+                    "Qty to send": pd.to_numeric(_v["final_qty"], errors="coerce").fillna(_v["alloc_qty"]).astype(int),
+                    "Reason": _v["so_reason"].fillna("—"), "Comment": _v["so_comment"].fillna(""),
+                    "Sign-off": _v["Sign-off"].where(_v["alloc_qty"] > 0, _v["status"]),
+                    "Country": _v["country"], "Store name": _v["store_name"], "Grade": _v["grade"], "Style": _v["parent"],
+                    "Article": _v["art"], "Size": _v["size"], "Chance to sell (14d) %": _v["p_sell_pct"],
+                    "Stock target": _v["target"], "ATP": _v["atp"], "In-transit": _v["intransit"],
+                    "Recommended": _v["alloc_qty"], "Source": _v["source"]})
+                _edited = st.data_editor(
+                    _ed, key=f"al_editor_{_alrid}_{ss.al_ver}", hide_index=True, use_container_width=True, height=380,
+                    disabled=[c for c in _ed.columns if c not in ("Decision", "Qty to send", "Reason", "Comment")],
+                    column_config={
+                        "Decision": st.column_config.SelectboxColumn(options=["To decide", "Approve", "Modify", "Reject"],
+                                                                     required=True, width="medium"),
+                        "Qty to send": st.column_config.NumberColumn(min_value=0, step=1, width="medium",
+                                                                     help="Change it to modify the line (it then goes to your line manager)"),
+                        "Reason": st.column_config.SelectboxColumn(options=["—"] + dbio.AL_REASONS, required=True,
+                                                                   width="medium", help="Required for Modify and Reject"),
+                        "Comment": st.column_config.TextColumn(width="medium"),
+                        "Sign-off": st.column_config.TextColumn(width="medium"),
+                        "Recommended": st.column_config.NumberColumn(width="small"),
+                    })
+
+                def _al_save(rows, msg):
+                    try:
+                        r = dbio.save_al_decisions(_alrid, rows, _me)
+                        ss.al_ver += 1
+                        st.toast(f"{msg}: {r['saved']:,} line{'s' if r['saved'] != 1 else ''}" +
+                                 (f" · {r['routed']:,} sent to {r['manager'] or 'line manager (not mapped yet)'}" if r["routed"] else ""))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save decisions: {e}. You need write access to {dbio.AL_DEC_FQ}.")
+
+                _rows = lambda idx, dec: pd.DataFrame({
+                    "line_key": _v.loc[idx, "line_key"], "country": _v.loc[idx, "country"], "store": _v.loc[idx, "store"],
+                    "store_name": _v.loc[idx, "store_name"], "parent": _v.loc[idx, "parent"], "art": _v.loc[idx, "art"],
+                    "size": _v.loc[idx, "size"], "recommended_qty": _v.loc[idx, "alloc_qty"], "decision": dec,
+                    "new_qty": _edited.loc[idx, "Qty to send"], "reason": _edited.loc[idx, "Reason"].replace({"—": None}),
+                    "comment": _edited.loc[idx, "Comment"]})
+                _bc = st.columns([1.3, 1.5, 1.6, 2.4])
+                _edited = _edited.fillna({"Decision": "To decide", "Reason": "—", "Comment": ""})
+                _qty_chg = pd.to_numeric(_edited["Qty to send"], errors="coerce") != _v["alloc_qty"]
+                _edited.loc[_qty_chg & _edited["Decision"].isin(["To decide", "Approve"]), "Decision"] = "Modify"   # new qty = modify
+                if _bc[0].button("Save decisions", type="primary", use_container_width=True, key="al_save"):
+                    _chg = ((_edited["Decision"] != _ed["Decision"]) | (_edited["Reason"] != _ed["Reason"]) |
+                            (_edited["Comment"] != _ed["Comment"]) | (_edited["Qty to send"] != _ed["Qty to send"])) & \
+                           (_edited["Decision"] != "To decide") & (_v["alloc_qty"] > 0)
+                    _bad_r = _chg & _edited["Decision"].isin(["Modify", "Reject"]) & (_edited["Reason"] == "—")
+                    _bad_q = _chg & (_edited["Decision"] == "Modify") & ~_qty_chg
+                    _locked = _chg & _v["Sign-off"].isin(["Change approved", "Change declined"])
+                    if _bad_r.any() or _bad_q.any():
+                        st.warning(f"{int(_bad_r.sum())} line(s) need a reason and {int(_bad_q.sum())} Modify line(s) need a "
+                                   "quantity different from the recommendation — nothing saved.")
+                    elif (_chg & ~_locked).any():
+                        _ix = _v.index[_chg & ~_locked]
+                        _al_save(_rows(_ix, _edited.loc[_ix, "Decision"].values), "Saved")
+                    else:
+                        st.toast("No changes to save" if not _locked.any() else "Those lines are already signed off by a manager")
+                _undec = _v.index[(_v["Sign-off"] == "To decide") & (_v["alloc_qty"] > 0)]
+                if _bc[1].button(f"Approve {len(_undec):,} to decide shown", use_container_width=True, key="al_appr",
+                                 disabled=len(_undec) == 0):
+                    _al_save(_rows(_undec, "Approve").assign(reason=None, new_qty=None, comment=None), "Approved")
+                _bc[2].download_button(f"Download plan ({len(_v):,} lines)", data=dbio.to_csv_bytes(_ed),
+                                       file_name="core_allocation_plan.csv", mime="text/csv", key="al_dl",
+                                       use_container_width=True)
+
+                # ---------- Line manager review: modified / rejected lines routed to the signed-in manager ----------
+                st.markdown("##### Line manager review")
+                _dev_all = DEV and st.toggle("Dev: also show changes with no line manager mapped", value=True, key="lm_all",
+                                             help="Until the company directory is connected, unmapped changes have no "
+                                                  "manager; in the dev app you can act as one to test the flow")
+                try:
+                    _mq = dbio.load_manager_queue(_alrid, _me, include_unassigned=_dev_all)
+                except Exception as e:
+                    _mq = pd.DataFrame()
+                    st.info(f"Manager queue unavailable: {e}")
+                if _mq.empty:
+                    st.caption("Nothing waiting for you. Modified and rejected lines appear here for the planner's line "
+                               "manager: approve the change (the planner's quantity is released) or decline it (the "
+                               "recommendation stands).")
+                else:
+                    st.caption(f"{len(_mq):,} change(s) waiting for your sign-off. Approve change → the planner's quantity "
+                               "is released (0 for a reject). Decline change → the recommendation stands.")
+                    _me_ed = pd.DataFrame({
+                        "Manager decision": "", "Manager comment": "", "Planner": _mq["decided_by"],
+                        "Change": _mq["decision"], "Recommended": _mq["recommended_qty"], "Planner qty": _mq["final_qty"],
+                        "Reason": _mq["reason"], "Planner comment": _mq["comment"].fillna(""), "Country": _mq["country"],
+                        "Store name": _mq["store_name"], "Style": _mq["parent"], "Article": _mq["art"], "Size": _mq["size"]})
+                    _me_out = st.data_editor(
+                        _me_ed, key=f"lm_editor_{_alrid}_{ss.al_ver}", hide_index=True, use_container_width=True, height=300,
+                        disabled=[c for c in _me_ed.columns if c not in ("Manager decision", "Manager comment")],
+                        column_config={"Manager decision": st.column_config.SelectboxColumn(
+                            options=["", "Approve change", "Decline change"], width="medium")})
+                    if st.button("Save manager decisions", type="primary", key="lm_save"):
+                        _k = _me_out["Manager decision"].fillna("") != ""
+                        if not _k.any():
+                            st.toast("No manager decisions to save")
+                        else:
+                            try:
+                                n = dbio.save_manager_decisions(_alrid, pd.DataFrame({
+                                    "line_key": _mq.loc[_k, "line_key"], "manager_decision": _me_out.loc[_k, "Manager decision"],
+                                    "manager_comment": _me_out.loc[_k, "Manager comment"]}), _me)
+                                ss.al_ver += 1
+                                st.toast(f"Signed off {n:,} change(s)")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not save manager decisions: {e}")
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:
