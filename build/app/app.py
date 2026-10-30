@@ -842,9 +842,10 @@ elif ss.run_state == "results":
 
             st.markdown("##### Allocation plan")
             st.caption("Forecast for the next 14 days (with seasonality + events) → split to stores and sizes by product "
-                       "cluster (division × gender × sport, e.g. Apparel · Mens · Running): the store's share of that cluster "
-                       "in its country, and the country's size curve for it (small countries lean on the GCC curve) — a single "
-                       "style's own history is too thin to split reliably → stock target = units that cover 80% of likely 14-day sales at that store and size "
+                       "cluster (division × AH2 × gender, e.g. Apparel · Tees · Mens — the key of the business size config): the "
+                       "country's size curve for the cluster (small countries lean on the GCC curve), and the store's share of "
+                       "the cluster one level up (division × gender) — a single style's own history is too thin to split "
+                       "reliably → stock target = units that cover 80% of likely 14-day sales at that store and size "
                        "(most sizes sell 0 or 1, so a size with under 20% chance of selling gets nothing beyond display) → "
                        "at least 1 unit per key size → minus ATP and in-transit → DC stock rationed by grade, then demand. "
                        "All Nike stores in the store master; grade from the uploaded store list, else the store master.")
