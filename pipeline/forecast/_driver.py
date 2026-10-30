@@ -25,8 +25,11 @@ save(hist, "fc_history")
 save(o["backtest"], "fc_backtest")
 save(o["leaderboard"], "fc_leaderboard")
 save(o["allocation"], "al_allocation")
+save(o["seasonality"], "fc_seasonality")
+save(o["events"], "fc_events")
+save(o["event_uplift"], "fc_event_uplift")
 save(pd.DataFrame(log.stages), "fc_run_stages")
 save(pd.DataFrame(log.events), "fc_run_events")
 vs = o["vs_current"]
 save(pd.DataFrame([{"run_ts": datetime.now(timezone.utc).isoformat(), "error_champion": o["error_champion"],
-                    "error_baseline": o["error_baseline"], **vs}]), "fc_run_summary")
+                    "error_baseline": o["error_baseline"], "error_flat_best": o["error_flat_best"], **vs}]), "fc_run_summary")

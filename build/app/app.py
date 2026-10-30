@@ -88,6 +88,16 @@ def get_fc_series(country, parent):
 
 
 @st.cache_data(show_spinner=False, ttl=300)
+def get_fc_events():
+    return dbio.load_fc_events()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_calendar(country, parent):
+    return dbio.load_fc_calendar(country, parent)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
 def get_al_allocation():
     return dbio.load_al_allocation()
 
@@ -691,21 +701,26 @@ elif ss.run_state == "results":
                                  theme=THEME)
 
             st.markdown("##### Model contest")
-            st.caption("Each model forecast the 4 weeks after 3 past cut-off dates and was scored against what actually sold. "
-                       "Error = units missed ÷ units sold (volume-weighted). The lowest error per demand pattern wins and is "
-                       "used for the forecast — no model is fixed up front.")
+            st.caption("Each model forecast the 4 weeks after 3 past cut-off dates, once flat and once with seasonality + "
+                       "events, and was scored against what actually sold (error = units missed ÷ units sold). The lowest "
+                       "error per demand pattern wins and is used for the forecast — no model is fixed up front.")
             _lb = _fr["leaderboard"].copy()
-            _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce")
+            _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce") * 100
             _lb = _lb[_lb["demand_class"] != "inactive"]
-            _pv = _lb.pivot_table(index="demand_class", columns="method", values="wape").mul(100).round(0)
-            _ch = _lb[_lb["champion"].astype(str).str.lower() == "true"].set_index("demand_class")["method"]
-            _pv.insert(0, "Winner", _ch.reindex(_pv.index))
-            _pv.index.name = "Demand pattern"
-            _pv = _pv.rename(index={"smooth": "Smooth (steady)", "erratic": "Erratic (jumpy volume)",
-                                    "intermittent": "Intermittent (occasional)", "lumpy": "Lumpy (occasional, jumpy)"},
-                             columns={"MA4": "4-wk avg %", "MA12": "12-wk avg %", "SES": "Smoothing %",
-                                      "CROSTON_SBA": "Croston %", "TSB": "TSB %"})
-            st.dataframe(_pv, use_container_width=True)
+            _MN = {"MA4": "4-wk avg", "MA12": "12-wk avg", "SES": "Smoothing", "CROSTON_SBA": "Croston", "TSB": "TSB"}
+            _rows = []
+            for _c, _g in _lb.groupby("demand_class"):
+                _w = _g[_g["champion"].astype(str).str.lower() == "true"]
+                _w = _w.iloc[0] if len(_w) else _g.sort_values("wape").iloc[0]
+                _rows.append({"Demand pattern": {"smooth": "Smooth (steady)", "erratic": "Erratic (jumpy volume)",
+                                                 "intermittent": "Intermittent (occasional)",
+                                                 "lumpy": "Lumpy (occasional, jumpy)"}.get(_c, _c),
+                              "Winner": f"{_MN.get(_w['method'], _w['method'])} · {_w['variant']}",
+                              "Winner error %": round(_w["wape"]),
+                              "Best seasonal %": round(_g[_g["variant"] == "seasonal"]["wape"].min()),
+                              "Best flat %": round(_g[_g["variant"] == "flat"]["wape"].min()),
+                              "12-wk average %": round(_g[(_g["method"] == "MA12") & (_g["variant"] == "flat")]["wape"].min())})
+            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
 
             st.markdown("##### Forecast explorer")
             try:
@@ -721,12 +736,34 @@ elif ss.run_state == "results":
                 st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
                               height=260)
                 st.caption("Weekly units for the style in the country: actual for the last 30 weeks, then the 8-week forecast "
-                           "(P50 = most likely, P80 = high case).")
+                           "(P50 = most likely, P80 = high case). The forecast follows the seasonality and events below.")
+                _cal = get_fc_calendar(_row["country"], _row["parent"])
+                if not _cal.empty:
+                    for _c in ("season_factor", "factor"):
+                        _cal[_c] = pd.to_numeric(_cal[_c], errors="coerce")
+                    _cal["week_start"] = pd.to_datetime(_cal["week_start"])
+                    st.line_chart(_cal.set_index("week_start")[["season_factor", "factor"]]
+                                  .rename(columns={"season_factor": "Seasonality", "factor": "Seasonality × events"}), height=180)
+                    _up = _cal[(_cal["week_start"] > pd.Timestamp.now()) & (_cal["events"].fillna("") != "")]
+                    st.caption("Index 1.0 = an average week for this country and division. Upcoming: " +
+                               ("; ".join(f"week of {d:%d %b} — {e}" for d, e in zip(_up["week_start"], _up["events"]))
+                                if len(_up) else "no events in the next 8 weeks."))
             except Exception as e:
                 st.info(f"Forecast explorer unavailable: {e}")
 
+            st.markdown("##### Events calendar")
+            st.caption("Events the forecast accounts for, with the lift each showed in past CORE sales (×1.20 = 20% above a "
+                       "normal week). Islamic holiday dates follow the moon sighting and Dubai Shopping Festival dates are "
+                       "announced each year — business should confirm them.")
+            try:
+                _ev = get_fc_events()
+                st.dataframe(_ev.rename(columns={"event": "Event", "start": "Start", "end": "End", "lift": "Past lift (×)"}),
+                             hide_index=True, use_container_width=True, height=300)
+            except Exception as e:
+                st.info(f"Events calendar unavailable: {e}")
+
             st.markdown("##### Allocation plan")
-            st.caption("Forecast for the next 14 days → each store's share of the style → country size curve → at least 1 "
+            st.caption("Forecast for the next 14 days (with seasonality + events) → each store's share of the style → country size curve → at least 1 "
                        "unit per key size → minus ATP and in-transit (rounded up) → DC stock rationed by grade, then demand.")
             try:
                 _al = get_al_allocation()

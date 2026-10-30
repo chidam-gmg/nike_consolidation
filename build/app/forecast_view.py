@@ -10,17 +10,18 @@ import agent_view
 AGENTS = [
     dict(id="scout", g="SC", name="Scout", role="Sales history", stages=["history"], col=0, row=1),
     dict(id="profiler", g="PR", name="Profiler", role="Demand patterns", stages=["profile"], col=1, row=0),
-    dict(id="tournament", g="MC", name="Model contest", role="Backtest 5 models", stages=["tournament"], col=2, row=0),
-    dict(id="forecaster", g="FC", name="Forecaster", role="8-week forecast", stages=["forecast"], col=3, row=0),
-    dict(id="splitter", g="SP", name="Store splitter", role="Forecast to stores", stages=["store_split"], col=4, row=1),
-    dict(id="curator", g="SZ", name="Size curator", role="Stores to sizes", stages=["size_split"], col=5, row=2),
-    dict(id="stock", g="ST", name="Stock checker", role="ATP + in-transit", stages=["stock_check"], col=6, row=2),
-    dict(id="allocator", g="AL", name="Allocator", role="DC rationing", stages=["allocate"], col=7, row=1),
-    dict(id="human", g="HU", name="Approver", role="Human review", stages=[], col=8, row=1, human=True),
+    dict(id="calendar", g="CA", name="Calendar", role="Events + seasonality", stages=["calendar"], col=2, row=0),
+    dict(id="tournament", g="MC", name="Model contest", role="Flat vs seasonal", stages=["tournament"], col=3, row=0),
+    dict(id="forecaster", g="FC", name="Forecaster", role="8-week forecast", stages=["forecast"], col=4, row=0),
+    dict(id="splitter", g="SP", name="Store splitter", role="Forecast to stores", stages=["store_split"], col=5, row=1),
+    dict(id="curator", g="SZ", name="Size curator", role="Stores to sizes", stages=["size_split"], col=6, row=2),
+    dict(id="stock", g="ST", name="Stock checker", role="ATP + in-transit", stages=["stock_check"], col=7, row=2),
+    dict(id="allocator", g="AL", name="Allocator", role="DC rationing", stages=["allocate"], col=8, row=1),
+    dict(id="human", g="HU", name="Approver", role="Human review", stages=[], col=9, row=1, human=True),
 ]
-EDGES = [("scout", "profiler", "history"), ("profiler", "tournament", "profile"), ("tournament", "forecaster", "tournament"),
-         ("forecaster", "splitter", "forecast"), ("splitter", "curator", "store_split"), ("curator", "stock", "size_split"),
-         ("stock", "allocator", "stock_check"), ("allocator", "human", "allocate")]
+EDGES = [("scout", "profiler", "history"), ("profiler", "calendar", "profile"), ("calendar", "tournament", "calendar"),
+         ("tournament", "forecaster", "tournament"), ("forecaster", "splitter", "forecast"), ("splitter", "curator", "store_split"),
+         ("curator", "stock", "size_split"), ("stock", "allocator", "stock_check"), ("allocator", "human", "allocate")]
 
 
 def _n(v):
@@ -37,7 +38,8 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
         st[r["stage"]] = {"start": int(float(r["start"])), "end": int(float(r["end"])),
                           "state": "done" if r["result"] == "SUCCESS" else "failed"}
     k = lambda v: (f"{float(v)/1000:.1f}K" if float(v or 0) >= 10000 else _n(v))   # short wire labels
-    lab = {"history": f"{k(forecast_series)} series", "profile": "4 patterns", "tournament": "winners",
+    lab = {"history": f"{k(forecast_series)} series", "profile": "4 patterns", "calendar": "season + events",
+           "tournament": "winners",
            "forecast": f"{k(next_week_units)}/wk", "store_split": f"{k(alloc.get('store_styles'))} lines",
            "size_split": f"{k(alloc.get('size_lines'))} sizes", "stock_check": f"{k(alloc.get('need_lines'))} short",
            "allocate": f"{k(alloc.get('lines'))} lines"}
@@ -51,14 +53,15 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
     kpis = [
         {"k": "Styles forecast", "v": _n(forecast_series), "at": st.get("forecast", {}).get("end")},
         {"k": "Next week (P50)", "v": _n(next_week_units), "at": st.get("forecast", {}).get("end")},
-        {"k": "Forecast error", "v": f"{err_c*100:.0f}% (avg {err_b*100:.0f}%)", "at": st.get("tournament", {}).get("end")},
+        {"k": "Forecast error", "v": f"{err_c*100:.0f}% (flat {float(summary.get('error_flat_best', 0))*100:.0f}%)",
+         "at": st.get("tournament", {}).get("end")},
         {"k": "Units to allocate", "v": _n(alloc.get("units")), "at": end},
         {"k": "Lines to approve", "v": _n(alloc.get("lines")), "at": end, "accent": True},
     ]
     return {"agents": AGENTS, "stages": st, "edges": edges, "events": ev, "kpis": kpis, "have_timings": bool(st),
             "has": True, "run_id": summary.get("run_id", ""), "who": "forecast job",
-            "scope": "CORE · all countries → 21 active stores", "colw": 166, "cw": 1500,
-            "lanes": [["FORECAST", 1, "top"], ["ALLOCATION", 5, "bottom"]],
+            "scope": "CORE · all countries → 21 active stores", "colw": 150, "cw": 1520,
+            "lanes": [["FORECAST", 2, "top"], ["ALLOCATION", 6, "bottom"]],
             "human_text": f"plan ready · {_n(alloc.get('lines'))} lines", "human_cls": "await"}
 
 

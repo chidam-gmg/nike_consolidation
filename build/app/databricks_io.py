@@ -562,6 +562,22 @@ def load_fc_series(country: str, parent: str) -> pd.DataFrame:
                        WHERE country = '{c}' AND parent = '{p}' ORDER BY 1""")
 
 
+def load_fc_events() -> pd.DataFrame:
+    """Events calendar with the lift each event showed in past sales (median across country x division)."""
+    return run_sql(f"""SELECT e.event, e.start, e.end, ROUND(percentile(u.uplift, 0.5), 2) lift
+                       FROM {FQ}.fc_events e LEFT JOIN {FQ}.fc_event_uplift u ON u.event = e.event
+                       GROUP BY e.event, e.start, e.end ORDER BY e.start""")
+
+
+def load_fc_calendar(country: str, parent: str) -> pd.DataFrame:
+    """Season + event factor by week for the style's country x division (history and the 8 forecast weeks)."""
+    c, p = str(country).replace("'", "''"), str(parent).replace("'", "''")
+    return run_sql(f"""SELECT s.week_start, s.season_factor, s.factor, s.events FROM {FQ}.fc_seasonality s
+                       WHERE s.country = '{c}' AND s.division = (SELECT MAX(division) FROM {FQ}.fc_forecast
+                                                                  WHERE country = '{c}' AND parent = '{p}')
+                         AND s.week_start >= date_sub(current_date(), 7 * 30) ORDER BY s.week_start""")
+
+
 def load_al_allocation() -> pd.DataFrame:
     return run_sql(f"""SELECT store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d, ROUND(target, 2) target,
                        atp, intransit, need, alloc_qty, source, reason, status FROM {FQ}.al_allocation

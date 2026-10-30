@@ -1,6 +1,7 @@
 """CORE forecast + allocation engine (dev, 2026-10-30).
 
-1. Weekly style x country history (zero-filled) -> demand pattern per series (ADI / CV2: smooth, erratic,
+1. Weekly style x country history (zero-filled) -> demand pattern per series; events calendar + month / week-of-year
+   seasonality per country x division (models forecast the de-seasonalised level, the pattern is put back) (ADI / CV2: smooth, erratic,
    intermittent, lumpy).
 2. Model contest — 5 simple models, 3 backtest cut-offs, 4-week horizon; error = volume-weighted (WAPE) and bias,
    scored per demand pattern; the champion per pattern is used for the forecast (no model is fixed up front).
@@ -116,6 +117,78 @@ def classify(y):
                      ["inactive", "smooth", "erratic", "intermittent"], "lumpy")
 
 
+
+# ---------------- events calendar + seasonality ----------------
+# GCC retail calendar. Islamic dates follow the moon sighting (±1 day) and DSF dates are announced yearly —
+# business should confirm these each year (the table fc_events is what the forecast used).
+EVENTS = [
+    ("Eid al-Adha", "2025-06-05", "2025-06-09"), ("Back to school", "2025-08-18", "2025-08-31"),
+    ("11.11", "2025-11-10", "2025-11-12"), ("White Friday", "2025-11-24", "2025-12-01"),
+    ("UAE National Day", "2025-12-01", "2025-12-03"), ("Dubai Shopping Festival", "2025-12-05", "2026-01-11"),
+    ("Ramadan", "2026-02-18", "2026-03-19"), ("Eid al-Fitr", "2026-03-20", "2026-03-23"),
+    ("Eid al-Adha", "2026-05-26", "2026-05-30"), ("Back to school", "2026-08-17", "2026-08-30"),
+    ("11.11", "2026-11-10", "2026-11-12"), ("White Friday", "2026-11-23", "2026-11-30"),
+    ("UAE National Day", "2026-12-01", "2026-12-03"), ("Dubai Shopping Festival", "2026-12-04", "2027-01-10"),
+    ("Ramadan", "2027-02-08", "2027-03-09"), ("Eid al-Fitr", "2027-03-10", "2027-03-13"),
+]
+
+
+def event_overlap(weeks):
+    """{event name: array of the share of each week (Mon–Sun) covered by the event}."""
+    out = {}
+    for name, a, b in EVENTS:
+        a, b = pd.Timestamp(a), pd.Timestamp(b)
+        ov = np.array([max(0, (min(b, w + pd.Timedelta(days=6)) - max(a, w)).days + 1) / 7 for w in weeks])
+        out[name] = out.get(name, 0) + ov
+    return {k: np.clip(v, 0, 1) for k, v in out.items()}
+
+
+def seasonal_factors(pool, weeks, upto, ev):
+    """Per group (country x division): month-of-year x week-of-year seasonality and event uplifts, learned only from
+    weeks < upto. Returns (factor matrix groups x len(weeks), season matrix, uplift dict per group)."""
+    G, W = pool.shape
+    month = np.array([w.month for w in weeks]); woy = np.array([w.isocalendar()[1] for w in weeks])
+    any_ev = np.zeros(W, bool)
+    for v in ev.values():
+        any_ev |= v > 0
+    F, S, U = np.ones((G, W)), np.ones((G, W)), []
+    k = 13
+    for g in range(G):
+        p = pool[g, :upto].astype(float)
+        if p.sum() <= 0:
+            U.append({}); continue
+        ma = np.convolve(np.pad(p, (k // 2, k // 2), mode="edge"), np.ones(k) / k, mode="valid")
+        r = np.where(ma > 0, p / np.maximum(ma, 1e-9), 1.0)
+        clean = ~any_ev[:upto]
+        m_idx = {m: np.mean(r[(month[:upto] == m) & clean]) for m in range(1, 13) if ((month[:upto] == m) & clean).any()}
+        if m_idx:
+            mm = np.mean(list(m_idx.values())); m_idx = {m: v / mm for m, v in m_idx.items()}
+        w_raw = {w: np.mean(r[(woy[:upto] == w) & clean]) for w in range(1, 54) if ((woy[:upto] == w) & clean).any()}
+        def mf(m): return m_idx.get(m, 1.0)
+        def wf(w):
+            vals = [(w_raw.get(((w - 1 + d) % 53) + 1), wt) for d, wt in ((-1, .25), (0, .5), (1, .25))]
+            vals = [(v, wt) for v, wt in vals if v is not None]
+            return sum(v * wt for v, wt in vals) / sum(wt for _, wt in vals) if vals else None
+        s = np.array([0.5 * mf(month[i]) + 0.5 * (wf(woy[i]) if wf(woy[i]) is not None else mf(month[i])) for i in range(W)])
+        s = np.clip(s, 0.6, 1.8); s = s / s[:upto].mean()
+        ups = {}
+        for name, ov in ev.items():
+            hit = ov[:upto] >= 3 / 7
+            if hit.any():
+                u = float(np.median(r[hit] / np.maximum(s[:upto][hit], 1e-9)))
+                ups[name] = float(np.clip(1 + 0.8 * (u - 1), 0.7, 2.5))
+        S[g] = s
+        U.append(ups)
+    # one past occurrence per event is noisy at group level: blend each group's lift 50/50 with the all-group median
+    med = {n: float(np.median([u[n] for u in U if n in u])) for n in ev if any(n in u for u in U)}
+    for g in range(G):
+        U[g] = {n: round(0.5 * U[g].get(n, med[n]) + 0.5 * med[n], 3) for n in med}
+        e = np.ones(W)
+        for name, ov in ev.items():
+            e *= 1 + (U[g].get(name, 1.0) - 1) * ov
+        F[g] = S[g] * e
+    return F, S, U
+
 # ---------------- pipeline ----------------
 def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen, log: RunLog | None = None):
     log = log or RunLog()
@@ -146,67 +219,113 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         log.say("profiler", "hold", f"long tail: {int(mix.loc[mix.index.isin(['intermittent', 'lumpy']), 'size'].sum()):,} series carry "
                                     f"{mix.loc[mix.index.isin(['intermittent', 'lumpy']), 'pct'].sum():.0f}% of units")
 
-    # 3 · Tournament — backtest every model per demand pattern
+    # 3 · Calendar — events + month / week-of-year seasonality per country x division (pooled: style-level is too noisy)
+    with log.stage("calendar", "calendar"):
+        T = y.shape[1]
+        all_weeks = list(weeks) + [last_week + pd.Timedelta(days=7 * h) for h in range(1, HORIZON_WEEKS + 1)]
+        ev = event_overlap(all_weeks)
+        grp = pd.Series(list(zip(piv.index.get_level_values(0), meta.reindex(piv.index)["division"].fillna("OTHER"))))
+        groups = sorted(set(grp))
+        gidx = grp.map({g: i for i, g in enumerate(groups)}).to_numpy()
+        pool = np.zeros((len(groups), len(all_weeks)))
+        for gi in range(len(groups)):
+            pool[gi, :T] = y[gidx == gi].sum(axis=0)
+        F_full, S_full, U_full = seasonal_factors(pool, all_weeks, T, ev)
+        cal = []
+        for gi, (country, division) in enumerate(groups):
+            for wi, w in enumerate(all_weeks):
+                names = [n for n, ov in ev.items() if ov[wi] > 0]
+                cal.append({"country": country, "division": division, "week_start": w.date(), "future": wi >= T,
+                            "season_factor": round(float(S_full[gi, wi]), 3),
+                            "event_factor": round(float(F_full[gi, wi] / max(S_full[gi, wi], 1e-9)), 3),
+                            "factor": round(float(F_full[gi, wi]), 3), "events": ", ".join(names)})
+        out["seasonality"] = pd.DataFrame(cal)
+        out["events"] = pd.DataFrame([{"event": n, "start": a, "end": b} for n, a, b in EVENTS])
+        out["event_uplift"] = pd.DataFrame([{"country": c, "division": d, "event": k, "uplift": round(v, 2)}
+                                            for (c, d), u in zip(groups, U_full) for k, v in u.items()])
+        log.say("calendar", "tool", f"events calendar: {len(EVENTS)} events (Ramadan, Eids, back to school, 11.11, White Friday, "
+                                    f"National Day, Dubai Shopping Festival) · seasonality per country × division ({len(groups)} groups)")
+        upl = out["event_uplift"]
+        if not upl.empty:
+            top = upl.groupby("event")["uplift"].median().sort_values(ascending=False)
+            log.say("calendar", "out", "event lift (median): " + " · ".join(f"{k} ×{v:.2f}" for k, v in top.items()))
+        fut = [n for n, ov in ev.items() if ov[T:].sum() > 0]
+        log.say("calendar", "out", "in the next 8 weeks: " + (", ".join(fut) if fut else "no events"))
+
+    # 4 · Tournament — every model scored flat and with seasonality + events, per demand pattern
     with log.stage("tournament", "tournament"):
         rows = []
-        T = y.shape[1]
         for back in BACKTEST_CUTOFFS:
             cut = T - back
+            Fc, _, _ = seasonal_factors(pool, all_weeks, cut, ev)            # factors learned only before the cut-off
+            Fs = Fc[gidx]
             hist, act = y[:, :cut], y[:, cut:cut + BACKTEST_H].sum(axis=1)
+            adj = hist / np.maximum(Fs[:, :cut], 1e-9)
             for m in METHODS:
-                f = level(hist, m) * BACKTEST_H
-                for c in np.unique(cls):
-                    k = cls == c
-                    a_sum = act[k].sum()
-                    rows.append({"cutoff_week": str(weeks[cut - 1].date()), "demand_class": c, "method": m,
-                                 "series": int(k.sum()), "actual_units": float(a_sum),
-                                 "wape": float(np.abs(f[k] - act[k]).sum() / a_sum) if a_sum else np.nan,
-                                 "bias": float((f[k] - act[k]).sum() / a_sum) if a_sum else np.nan})
+                variants = {"flat": level(hist, m) * BACKTEST_H,
+                            "seasonal": level(adj, m) * Fs[:, cut:cut + BACKTEST_H].sum(axis=1)}
+                for var, f in variants.items():
+                    for c in np.unique(cls):
+                        k = cls == c
+                        a_sum = act[k].sum()
+                        rows.append({"cutoff_week": str(weeks[cut - 1].date()), "demand_class": c, "method": m, "variant": var,
+                                     "series": int(k.sum()), "actual_units": float(a_sum),
+                                     "wape": float(np.abs(f[k] - act[k]).sum() / a_sum) if a_sum else np.nan,
+                                     "bias": float((f[k] - act[k]).sum() / a_sum) if a_sum else np.nan})
         bt = pd.DataFrame(rows)
-        board = bt.groupby(["demand_class", "method"]).agg(wape=("wape", "mean"), bias=("bias", "mean"),
-                                                           actual_units=("actual_units", "sum")).reset_index()
+        board = bt.groupby(["demand_class", "method", "variant"]).agg(wape=("wape", "mean"), bias=("bias", "mean"),
+                                                                      actual_units=("actual_units", "sum")).reset_index()
         champ = (board.dropna(subset=["wape"]).sort_values(["demand_class", "wape"])
                  .groupby("demand_class").head(1).set_index("demand_class"))
-        base = board[board["method"] == "MA12"].set_index("demand_class")
-        out["backtest"], out["leaderboard"] = bt, board.assign(champion=board.apply(
-            lambda r: r["demand_class"] in champ.index and champ.loc[r["demand_class"], "method"] == r["method"], axis=1))
-        log.say("tournament", "tool", f"{len(METHODS)} models × {len(BACKTEST_CUTOFFS)} cut-offs × {BACKTEST_H}-week horizon")
+        base = board[(board["method"] == "MA12") & (board["variant"] == "flat")].set_index("demand_class")
+        flat_best = board[board["variant"] == "flat"].sort_values("wape").groupby("demand_class").head(1).set_index("demand_class")
+        out["backtest"] = bt
+        out["leaderboard"] = board.assign(champion=board.apply(
+            lambda r: r["demand_class"] in champ.index and champ.loc[r["demand_class"], "method"] == r["method"]
+            and champ.loc[r["demand_class"], "variant"] == r["variant"], axis=1))
+        log.say("tournament", "tool", f"{len(METHODS)} models × flat / seasonal × {len(BACKTEST_CUTOFFS)} cut-offs × {BACKTEST_H}-week horizon")
         for c, r in champ.iterrows():
             if c == "inactive":
                 continue
             b = base.loc[c, "wape"] if c in base.index else np.nan
-            log.say("tournament", "out", f"{c}: {r['method']} wins · error {r['wape']*100:.0f}% (12-week average {b*100:.0f}%) · bias {r['bias']*100:+.0f}%")
-        w_all = (champ["wape"] * champ["actual_units"]).sum() / champ["actual_units"].sum()
-        w_base = (base["wape"] * base["actual_units"]).sum() / base["actual_units"].sum()
-        out["error_champion"], out["error_baseline"] = float(w_all), float(w_base)
-        log.say("tournament", "out", f"overall error {w_all*100:.0f}% vs {w_base*100:.0f}% for a plain 12-week average")
+            fb = flat_best.loc[c, "wape"] if c in flat_best.index else np.nan
+            log.say("tournament", "out", f"{c}: {r['method']} ({r['variant']}) wins · error {r['wape']*100:.0f}% "
+                                         f"(best flat {fb*100:.0f}%, 12-week average {b*100:.0f}%) · bias {r['bias']*100:+.0f}%")
+        wtd = lambda d: float((d["wape"] * d["actual_units"]).sum() / d["actual_units"].sum())
+        act_cls = [c for c in champ.index if c != "inactive"]
+        out["error_champion"], out["error_baseline"] = wtd(champ.loc[act_cls]), wtd(base.loc[[c for c in act_cls if c in base.index]])
+        out["error_flat_best"] = wtd(flat_best.loc[[c for c in act_cls if c in flat_best.index]])
+        log.say("tournament", "out", f"overall error {out['error_champion']*100:.0f}% · best flat {out['error_flat_best']*100:.0f}% · "
+                                     f"plain 12-week average {out['error_baseline']*100:.0f}%")
 
-    # 4 · Forecaster — champion per pattern, 8 weeks
+    # 5 · Forecaster — level from the winner, then seasonality + events put back week by week
     with log.stage("forecast", "forecaster"):
-        lv = np.zeros(len(piv))
-        meth = np.array(["MA12"] * len(piv), dtype=object)
+        Fser = F_full[gidx]
+        adj_full = y / np.maximum(Fser[:, :T], 1e-9)
+        lv = np.zeros(len(piv)); meth = np.array(["MA12"] * len(piv), dtype=object); var = np.array(["flat"] * len(piv), dtype=object)
         for c in np.unique(cls):
-            m = champ.loc[c, "method"] if c in champ.index else "MA12"
+            m, v = (champ.loc[c, "method"], champ.loc[c, "variant"]) if c in champ.index else ("MA12", "flat")
             k = cls == c
-            lv[k] = level(y[k], m); meth[k] = m
-        p80 = lv + 0.84 * np.sqrt(np.maximum(lv, 0))
+            lv[k] = level(adj_full[k] if v == "seasonal" else y[k], m); meth[k] = m; var[k] = v
+        fut = np.where((var == "seasonal")[:, None], Fser[:, T:], 1.0) * lv[:, None]
+        p80 = fut + 0.84 * np.sqrt(np.maximum(fut, 0))
         fc_rows = []
         for i, (country, parent) in enumerate(piv.index):
             if lv[i] <= 0:
                 continue
-            for h in range(1, HORIZON_WEEKS + 1):
-                fc_rows.append((country, parent, (last_week + pd.Timedelta(days=7 * h)).date(), round(float(lv[i]), 3),
-                                round(float(p80[i]), 3), meth[i], cls[i]))
-        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_p80", "method", "demand_class"])
+            for h in range(HORIZON_WEEKS):
+                fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3), round(float(p80[i, h]), 3),
+                                meth[i], var[i], cls[i]))
+        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_p80", "method", "variant", "demand_class"])
         fc = fc.merge(meta.reset_index(), on=["country", "parent"], how="left")
-        out["forecast"] = fc
-        out["history"] = weekly
-        nxt = fc[fc["week_start"] == fc["week_start"].min()]
-        log.say("forecaster", "out", f"{fc[['country','parent']].drop_duplicates().shape[0]:,} series forecast {HORIZON_WEEKS} weeks ahead · "
-                                     f"next week {nxt['units_p50'].sum():,.0f} units (P80 {nxt['units_p80'].sum():,.0f})")
-        fcl = pd.DataFrame({"weekly_p50": lv}, index=piv.index).reset_index()
+        out["forecast"], out["history"] = fc, weekly
+        wk_tot = fc.groupby("week_start")["units_p50"].sum()
+        log.say("forecaster", "out", f"{fc[['country','parent']].drop_duplicates().shape[0]:,} series · {HORIZON_WEEKS} weeks · "
+                                     f"weekly total {wk_tot.min():,.0f}–{wk_tot.max():,.0f} units (peak week of {pd.Timestamp(wk_tot.idxmax()):%d %b})")
+        cover_w = max(1, round(COVER_DAYS / 7))
+        fcl = pd.DataFrame({"cover_units": fut[:, :cover_w].sum(axis=1)}, index=piv.index).reset_index()
 
-    # 5 · Store splitter — country forecast -> store by its share of the style
+    # 6 · Store splitter — country forecast -> store by its share of the style
     with log.stage("store_split", "splitter"):
         ss = _num(store_size.copy(), ["units"])
         st_par = ss.groupby(["country", "store", "parent"])["units"].sum().reset_index()
@@ -218,11 +337,11 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         sp = st_par[st_par["store"].isin(active)].merge(fcl, on=["country", "parent"])
         sp = sp.merge(carried.assign(carries=1), on=["store", "parent"], how="left")
         sp = sp[sp["carries"].fillna(0) == 1]                       # only styles the store already ranges
-        sp["demand_cover"] = sp["weekly_p50"] * COVER_DAYS / 7 * sp["store_share"]
+        sp["demand_cover"] = sp["cover_units"] * sp["store_share"]          # next 2 weeks incl. seasonality + events
         log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · {len(active)} active stores")
         log.say("splitter", "out", f"{len(sp):,} store × style lines · {sp['demand_cover'].sum():,.0f} units of {COVER_DAYS}-day demand")
 
-    # 6 · Size curator — country size curve
+    # 7 · Size curator — country size curve
     with log.stage("size_split", "curator"):
         curve = ss.groupby(["country", "parent", "art", "size"])["units"].sum().reset_index()
         curve["size_share"] = curve["units"] / curve.groupby(["country", "parent"])["units"].transform("sum")
@@ -238,7 +357,7 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         log.say("curator", "tool", "size curve per style and country (26 weeks of size sales) · 1 facing per key size")
         log.say("curator", "out", f"{len(lines):,} store × size lines")
 
-    # 7 · Stock checker — net of ATP + in-transit
+    # 8 · Stock checker — net of ATP + in-transit
     with log.stage("stock_check", "stock"):
         lines = lines.merge(carry[["store", "art", "atp", "intransit"]], on=["store", "art"], how="left")
         lines[["atp", "intransit", "key_size"]] = lines[["atp", "intransit", "key_size"]].fillna(0)
@@ -247,7 +366,7 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         log.say("stock", "tool", "read effective_stock (ATP today) + store_intransit")
         log.say("stock", "out", f"{int((lines['need'] > 0).sum()):,} sizes need stock · {int(lines['need'].sum()):,} units short of {COVER_DAYS}-day cover")
 
-    # 8 · Allocator — DC rationing (primary pool, then shared hub globally)
+    # 9 · Allocator — DC rationing (primary pool, then shared hub globally)
     with log.stage("allocate", "allocator"):
         lines = lines.merge(stores[["store", "grade", "store_name"]], on="store", how="left")
         lines["grade_rank"] = lines["grade"].map(GRADE_RANK).fillna(6)
