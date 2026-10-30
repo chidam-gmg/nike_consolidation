@@ -209,6 +209,13 @@ def render(job_run: dict | None, metrics: dict, live: bool = False, run_id: str 
     components.html(_HTML.replace("__DATA__", data), height=height, scrolling=True)
 
 
+def render_flow(payload: dict, theme: str = "light", height: int = 984):
+    """Draw any agent flow on the same board. payload keys: agents, stages, edges, events, kpis, have_timings, has,
+    run_id, who, scope (+ optional colw, cw, lanes, human_text, human_cls, review)."""
+    p = {"live": False, "theme": theme, "now": int(time.time() * 1000), "review": {}, **payload}
+    components.html(_HTML.replace("__DATA__", json.dumps(p, default=str).replace("</", "<\\/")), height=height, scrolling=True)
+
+
 _HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Source+Code+Pro:wght@400;500;600&display=swap">
 <style>
@@ -360,7 +367,9 @@ function agentState(a, now) {
 
 /* canvas */
 const canvas = document.getElementById("canvas"), svg = document.getElementById("edges"), NS = "http://www.w3.org/2000/svg";
-const NX = c => 44 + c * 180, NY = r => 40 + r * 130;
+const COLW = D.colw || 180, CW = D.cw || 1440;
+const NX = c => 44 + c * COLW, NY = r => 40 + r * 130;
+canvas.style.width = CW + "px"; svg.style.width = CW + "px"; svg.setAttribute("viewBox", `0 0 ${CW} 480`);
 const ICON = { done: '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   running: '<svg viewBox="0 0 12 12"><path d="M6 1.5a4.5 4.5 0 1 1-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
   failed: '<svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>' };
@@ -371,8 +380,8 @@ D.agents.forEach(a => {
   el.querySelector(".glyph").textContent = a.g; el.querySelector(".nm").textContent = a.name; el.querySelector(".rl").textContent = a.role;
   canvas.appendChild(el); nodes[a.id] = el;
 });
-[["STORE ↔ STORE", NY(0) - 22], ["DC → STORE", NY(2) + 152]].forEach(([t, y]) => { const l = document.createElement("div"); l.className = "lane";
-  l.textContent = t; l.style.left = (NX(3) - 6) + "px"; l.style.top = y + "px"; canvas.appendChild(l); });
+(D.lanes || [["STORE ↔ STORE", 3, NY(0) - 22], ["DC → STORE", 3, NY(2) + 152]]).forEach(([t, c, y]) => { const l = document.createElement("div"); l.className = "lane";
+  l.textContent = t; l.style.left = (NX(c) - 6) + "px"; l.style.top = (typeof y === "number" ? y : (y === "top" ? NY(0) - 22 : NY(2) + 152)) + "px"; canvas.appendChild(l); });
 const edges = D.edges.map(e => {
   const a = A[e.f], b = A[e.t];
   const x1 = NX(a.col) + 88, y1 = NY(a.row) + 42, x2 = NX(b.col) - 4, y2 = NY(b.row) + 42, dx = Math.max(40, (x2 - x1) / 2);
@@ -391,8 +400,10 @@ const clk = ms => { const t = Math.max(0, Math.round(ms / 1000)); return t >= 60
 function runningStage(a, now) { return a.stages.find(k => stageState(k, now) === "running"); }
 const RV = D.review || {};
 function humanStatus(now) {     // approver: waits for the Auditor, then for people to decide the review items
-  const auditDone = agentState(A.audit, now) === "done";
-  if (!auditDone) return ["waiting", "waiting for Auditor"];
+  const hid = D.agents.find(a => a.human).id, ups = UP[hid] || [];
+  const pend = ups.filter(u => agentState(A[u], now) !== "done").map(u => A[u].name);
+  if (pend.length) return ["waiting", `waiting for ${pend.join(" + ")}`];
+  if (D.human_text) return [D.human_cls || "await", D.human_text];
   if (RV.total === undefined || RV.total === null) return ["waiting", "review not loaded"];
   if (!RV.total) return ["done", "nothing to review"];
   if (RV.pending > 0) return ["await", `awaiting approval · ${RV.pending.toLocaleString("en-US")} of ${RV.total.toLocaleString("en-US")}`];
@@ -448,8 +459,8 @@ function renderNow(now) {
 
 /* fit the canvas to the panel width (scale down, never up) so every node, incl. the Approver, is visible */
 const stageEl = document.querySelector(".stage");
-function fit() { const w = stageEl.clientWidth, sc = Math.min(1, (w - 2) / 1440);
-  canvas.style.transform = `scale(${sc})`; canvas.style.left = Math.max(0, (w - 1440 * sc) / 2) + "px";
+function fit() { const w = stageEl.clientWidth, sc = Math.min(1, (w - 2) / CW);
+  canvas.style.transform = `scale(${sc})`; canvas.style.left = Math.max(0, (w - CW * sc) / 2) + "px";
   stageEl.style.height = Math.ceil(480 * sc) + "px"; }
 fit(); window.addEventListener("resize", fit);
 if (!D.have_timings) document.getElementById("logbody").classList.add("nots");

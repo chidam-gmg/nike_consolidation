@@ -15,6 +15,7 @@ import streamlit as st
 
 import databricks_io as dbio
 import agent_view
+import forecast_view
 
 # DEV preview (separate Databricks app, APP_MODE=dev): read-only — no runs, no config writes, so it can sit on
 # live data without ever touching the shared config tables or triggering the production job.
@@ -69,6 +70,26 @@ def get_brands(computed_at: str, run_id=None):
 def get_agent_runs():
     """Recent job runs with task timings (short TTL: the board should follow new runs)."""
     return dbio.agent_job_runs(30)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_run():
+    return dbio.load_fc_run()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_styles():
+    return dbio.load_fc_styles()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_fc_series(country, parent):
+    return dbio.load_fc_series(country, parent)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_al_allocation():
+    return dbio.load_al_allocation()
 
 
 @st.cache_data(show_spinner=False)
@@ -649,8 +670,78 @@ elif ss.run_state == "results":
             st.warning(f"Could not refresh: {e}")
         st.rerun()
 
-    tab_agent, tab_all, tab_replen = st.tabs(
-        ["Agent lab", "Store consolidation", "Replenishment (DC → store)"])
+    tab_agent, tab_fc, tab_all, tab_replen = st.tabs(
+        ["Agent lab", "Forecast & allocation", "Store consolidation", "Replenishment (DC → store)"])
+
+    # ============ TAB: FORECAST + ALLOCATION (dev) — CORE styles: forecast -> store -> size -> DC rationing ============
+    with tab_fc:
+        try:
+            _fr = get_fc_run()
+        except Exception as e:
+            _fr = None
+            st.info(f"The forecast run is not available yet ({e}).")
+        if _fr is not None and not _fr["summary"].empty:
+            _sm = _fr["summary"].iloc[0].to_dict()
+            _ft, _at = _fr["fc_tot"].iloc[0], _fr["al_tot"].iloc[0]
+            _num = lambda v: float(pd.to_numeric(v, errors="coerce") or 0)
+            forecast_view.render(_fr["stages"], _fr["events"], _sm, _fr["leaderboard"], int(_num(_ft["series"])),
+                                 _num(_ft["next_week"]),
+                                 {"store_styles": _num(_at["store_styles"]), "size_lines": _num(_at["need_lines"]),
+                                  "need_lines": _num(_at["need_lines"]), "lines": _num(_at["lines"]), "units": _num(_at["units"])},
+                                 theme=THEME)
+
+            st.markdown("##### Model contest")
+            st.caption("Each model forecast the 4 weeks after 3 past cut-off dates and was scored against what actually sold. "
+                       "Error = units missed ÷ units sold (volume-weighted). The lowest error per demand pattern wins and is "
+                       "used for the forecast — no model is fixed up front.")
+            _lb = _fr["leaderboard"].copy()
+            _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce")
+            _lb = _lb[_lb["demand_class"] != "inactive"]
+            _pv = _lb.pivot_table(index="demand_class", columns="method", values="wape").mul(100).round(0)
+            _ch = _lb[_lb["champion"].astype(str).str.lower() == "true"].set_index("demand_class")["method"]
+            _pv.insert(0, "Winner", _ch.reindex(_pv.index))
+            _pv.index.name = "Demand pattern"
+            _pv = _pv.rename(index={"smooth": "Smooth (steady)", "erratic": "Erratic (jumpy volume)",
+                                    "intermittent": "Intermittent (occasional)", "lumpy": "Lumpy (occasional, jumpy)"},
+                             columns={"MA4": "4-wk avg %", "MA12": "12-wk avg %", "SES": "Smoothing %",
+                                      "CROSTON_SBA": "Croston %", "TSB": "TSB %"})
+            st.dataframe(_pv, use_container_width=True)
+
+            st.markdown("##### Forecast explorer")
+            try:
+                _sty = get_fc_styles()
+                _sty["label"] = (_sty["country"] + " · " + _sty["parent"] + " · " + _sty["category"].fillna("") +
+                                 " · " + _sty["demand_class"] + " · " + _sty["method"])
+                _pick = st.selectbox("Style", _sty["label"].tolist(), key="fc_pick", label_visibility="collapsed")
+                _row = _sty[_sty["label"] == _pick].iloc[0]
+                _ser = get_fc_series(_row["country"], _row["parent"])
+                for _c in ("units", "p50", "p80"):
+                    _ser[_c] = pd.to_numeric(_ser[_c], errors="coerce")
+                _ser["wk"] = pd.to_datetime(_ser["wk"])
+                st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
+                              height=260)
+                st.caption("Weekly units for the style in the country: actual for the last 30 weeks, then the 8-week forecast "
+                           "(P50 = most likely, P80 = high case).")
+            except Exception as e:
+                st.info(f"Forecast explorer unavailable: {e}")
+
+            st.markdown("##### Allocation plan")
+            st.caption("Forecast for the next 14 days → each store's share of the style → country size curve → at least 1 "
+                       "unit per key size → minus ATP and in-transit (rounded up) → DC stock rationed by grade, then demand.")
+            try:
+                _al = get_al_allocation()
+                _sel = st.multiselect("Status", sorted(_al["status"].unique()), default=["Allocated", "Part-allocated"],
+                                      key="al_status", placeholder="All statuses", label_visibility="collapsed")
+                _alv = _al[_al["status"].isin(_sel)] if _sel else _al
+                st.dataframe(_alv.rename(columns={"store_name": "Store name", "parent": "Style", "art": "Article",
+                                                  "demand_14d": "Demand (14d)", "atp": "ATP", "intransit": "In-transit",
+                                                  "need": "Need", "alloc_qty": "Allocate", "source": "Source",
+                                                  "reason": "Reason", "status": "Status"}),
+                             hide_index=True, use_container_width=True, height=360)
+                st.download_button(f"Download allocation plan ({len(_alv):,} lines)", data=dbio.to_csv_bytes(_alv),
+                                   file_name="core_allocation_plan.csv", mime="text/csv", key="al_dl")
+            except Exception as e:
+                st.info(f"Allocation plan unavailable: {e}")
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:

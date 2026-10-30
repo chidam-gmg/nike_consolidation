@@ -531,6 +531,43 @@ def ask_agents(question: str, conversation_id: str | None = None, run_id: str | 
     return out
 
 
+# ---- CORE forecast + allocation (dev) — tables written by pipeline/forecast/20_core_forecast_alloc ----
+def load_fc_run() -> dict:
+    """Everything the Forecast tab needs in a handful of small reads."""
+    out = {"summary": run_sql(f"SELECT * FROM {FQ}.fc_run_summary"),
+           "stages": run_sql(f"SELECT * FROM {FQ}.fc_run_stages"),
+           "events": run_sql(f"SELECT * FROM {FQ}.fc_run_events"),
+           "leaderboard": run_sql(f"SELECT * FROM {FQ}.fc_leaderboard"),
+           "fc_tot": run_sql(f"""SELECT COUNT(DISTINCT country || parent) series,
+                                  SUM(CASE WHEN week_start = (SELECT MIN(week_start) FROM {FQ}.fc_forecast) THEN units_p50 END) next_week
+                                  FROM {FQ}.fc_forecast"""),
+           "al_tot": run_sql(f"""SELECT COUNT(DISTINCT store || parent) store_styles, COUNT(*) need_lines,
+                                  SUM(CASE WHEN alloc_qty > 0 THEN 1 ELSE 0 END) lines, SUM(alloc_qty) units
+                                  FROM {FQ}.al_allocation""")}
+    return out
+
+
+def load_fc_styles(limit=300) -> pd.DataFrame:
+    """Top forecast series (by next-8-week units) for the explorer picker."""
+    return run_sql(f"""SELECT country, parent, MAX(category) category, MAX(demand_class) demand_class, MAX(method) method,
+                       ROUND(SUM(units_p50), 0) units_8w FROM {FQ}.fc_forecast GROUP BY country, parent
+                       ORDER BY units_8w DESC LIMIT {int(limit)}""")
+
+
+def load_fc_series(country: str, parent: str) -> pd.DataFrame:
+    c, p = str(country).replace("'", "''"), str(parent).replace("'", "''")
+    return run_sql(f"""SELECT wk, units, CAST(NULL AS DOUBLE) p50, CAST(NULL AS DOUBLE) p80 FROM {FQ}.fc_history
+                       WHERE country = '{c}' AND parent = '{p}' AND wk >= date_sub(current_date(), 7 * 30)
+                       UNION ALL SELECT week_start, NULL, units_p50, units_p80 FROM {FQ}.fc_forecast
+                       WHERE country = '{c}' AND parent = '{p}' ORDER BY 1""")
+
+
+def load_al_allocation() -> pd.DataFrame:
+    return run_sql(f"""SELECT store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d, ROUND(target, 2) target,
+                       atp, intransit, need, alloc_qty, source, reason, status FROM {FQ}.al_allocation
+                       ORDER BY status, alloc_qty DESC, store""")
+
+
 def current_user() -> str:
     """Best-effort identity of the logged-in user (for run attribution). In-app: the platform-forwarded
     email header; locally: the CLI profile user."""
