@@ -725,6 +725,21 @@ elif ss.run_state == "results":
                               "12-wk average %": round(_g[(_g["method"] == "MA12") & (_g["variant"] == "flat")]["wape"].min())})
             st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
 
+            _eb = _fr.get("bands", pd.DataFrame())
+            if not _eb.empty:
+                st.markdown("##### Error by volume")
+                st.caption("One error number mixes very different styles. A style selling one unit a month cannot be "
+                           "forecast week by week — even a perfect rate leaves the error under 'Chance alone'. Judge slow "
+                           "styles on whether the predicted chance of selling matches reality, and fast styles on the gap "
+                           "between error and chance: that gap is what better inputs (price, launches, ranging) can close. "
+                           "'High case covers' = share of weeks sales stayed at or below P80 (aim 80%).")
+                _p = lambda c: (pd.to_numeric(_eb[c], errors="coerce") * 100).round(0)
+                st.dataframe(pd.DataFrame({
+                    "Units a week (style × country)": _eb["band"], "Styles": pd.to_numeric(_eb["series"], errors="coerce"),
+                    "Share of units %": _p("unit_share"), "Error %": _p("error"), "Chance alone %": _p("chance_floor"),
+                    "Chance to sell: predicted %": _p("p_sell_predicted"), "Chance to sell: actual %": _p("p_sell_actual"),
+                    "High case covers %": _p("p80_coverage")}), hide_index=True, use_container_width=True)
+
             st.markdown("##### Forecast explorer")
             try:
                 _sty = get_fc_styles()
@@ -739,7 +754,9 @@ elif ss.run_state == "results":
                 st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
                               height=260)
                 st.caption("Weekly units for the style in the country: actual for the last 30 weeks, then the 8-week forecast "
-                           "(P50 = most likely, P80 = high case). The forecast follows the seasonality and events below.")
+                           "(P50 = most likely, P80 = high case: sales stay at or below it in 8 of 10 weeks, from a "
+                           "negative binomial fitted to how much styles of this volume swing). The forecast follows the "
+                           "seasonality and events below.")
                 _cal = get_fc_calendar(_row["country"], _row["parent"])
                 if not _cal.empty:
                     for _c in ("season_factor", "factor"):
@@ -766,15 +783,18 @@ elif ss.run_state == "results":
                 st.info(f"Events calendar unavailable: {e}")
 
             st.markdown("##### Allocation plan")
-            st.caption("Forecast for the next 14 days (with seasonality + events) → each store's share of the style → country size curve → at least 1 "
-                       "unit per key size → minus ATP and in-transit (rounded up) → DC stock rationed by grade, then demand.")
+            st.caption("Forecast for the next 14 days (with seasonality + events) → each store's share of the style → country "
+                       "size curve → stock target = units that cover 80% of likely 14-day sales at that store and size "
+                       "(most sizes sell 0 or 1, so a size with under 20% chance of selling gets nothing beyond display) → "
+                       "at least 1 unit per key size → minus ATP and in-transit → DC stock rationed by grade, then demand.")
             try:
                 _al = get_al_allocation()
                 _sel = st.multiselect("Status", sorted(_al["status"].unique()), default=["Allocated", "Part-allocated"],
                                       key="al_status", placeholder="All statuses", label_visibility="collapsed")
                 _alv = _al[_al["status"].isin(_sel)] if _sel else _al
                 st.dataframe(_alv.rename(columns={"store_name": "Store name", "parent": "Style", "art": "Article",
-                                                  "demand_14d": "Demand (14d)", "atp": "ATP", "intransit": "In-transit",
+                                                  "demand_14d": "Demand (14d)", "p_sell_pct": "Chance to sell (14d) %",
+                                                  "target": "Stock target", "atp": "ATP", "intransit": "In-transit",
                                                   "need": "Need", "alloc_qty": "Allocate", "source": "Source",
                                                   "reason": "Reason", "status": "Status"}),
                              hide_index=True, use_container_width=True, height=360)

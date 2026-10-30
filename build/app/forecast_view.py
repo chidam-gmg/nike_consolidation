@@ -53,6 +53,8 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
     kpis = [
         {"k": "Styles forecast", "v": _n(forecast_series), "at": st.get("forecast", {}).get("end")},
         {"k": "Next week (P50)", "v": _n(next_week_units), "at": st.get("forecast", {}).get("end")},
+        {"k": "Error, 3+ a week", "v": f"{float(summary['error_fast'])*100:.0f}% (chance {float(summary['floor_fast'])*100:.0f}%)",
+         "at": st.get("tournament", {}).get("end")} if summary.get("error_fast") not in (None, "", "nan") else
         {"k": "Forecast error", "v": f"{err_c*100:.0f}% (flat {float(summary.get('error_flat_best', 0))*100:.0f}%)",
          "at": st.get("tournament", {}).get("end")},
         {"k": "Units to allocate", "v": _n(alloc.get("units")), "at": end},

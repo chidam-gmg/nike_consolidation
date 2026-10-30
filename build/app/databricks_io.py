@@ -544,6 +544,10 @@ def load_fc_run() -> dict:
            "al_tot": run_sql(f"""SELECT COUNT(DISTINCT store || parent) store_styles, COUNT(*) need_lines,
                                   SUM(CASE WHEN alloc_qty > 0 THEN 1 ELSE 0 END) lines, SUM(alloc_qty) units
                                   FROM {FQ}.al_allocation""")}
+    try:
+        out["bands"] = run_sql(f"SELECT * FROM {FQ}.fc_error_bands ORDER BY band_order")
+    except Exception:                                              # runs before the volume scorecard existed
+        out["bands"] = pd.DataFrame()
     return out
 
 
@@ -579,7 +583,8 @@ def load_fc_calendar(country: str, parent: str) -> pd.DataFrame:
 
 
 def load_al_allocation() -> pd.DataFrame:
-    return run_sql(f"""SELECT store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d, ROUND(target, 2) target,
+    return run_sql(f"""SELECT store, store_name, grade, parent, art, size, ROUND(demand, 2) demand_14d,
+                       ROUND(p_sell * 100, 0) p_sell_pct, CAST(target AS INT) target,
                        atp, intransit, need, alloc_qty, source, reason, status FROM {FQ}.al_allocation
                        ORDER BY status, alloc_qty DESC, store""")
 

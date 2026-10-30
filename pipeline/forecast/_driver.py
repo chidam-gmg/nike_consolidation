@@ -28,9 +28,12 @@ save(o["allocation"], "al_allocation")
 save(o["seasonality"], "fc_seasonality")
 save(o["events"], "fc_events")
 save(o["event_uplift"], "fc_event_uplift")
+save(o["error_bands"], "fc_error_bands")
 save(pd.DataFrame(log.stages), "fc_run_stages")
 save(pd.DataFrame(log.events), "fc_run_events")
 vs = o["vs_current"]
 save(pd.DataFrame([{"run_ts": datetime.now(timezone.utc).isoformat(), "error_champion": o["error_champion"],
                     "error_baseline": o["error_baseline"], "error_flat_best": o["error_flat_best"],
-                    "error_seasonal_best": o["error_seasonal_best"], **vs}]), "fc_run_summary")
+                    "error_seasonal_best": o["error_seasonal_best"], "error_fast": o["error_fast"], "floor_fast": o["floor_fast"],
+                    "p80_coverage": o["p80_coverage"], "p80_coverage_old": o["p80_coverage_old"],
+                    "p_sell_gap_slow": o["p_sell_gap_slow"], **vs}]), "fc_run_summary")

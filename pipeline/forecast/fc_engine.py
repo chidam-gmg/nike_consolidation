@@ -6,9 +6,15 @@
 2. Model contest — 5 simple models x (flat, seasonal, seasonal on stock-out-corrected demand), 3 cut-offs, 4-week horizon,
    scored on well-stocked weeks only; error = volume-weighted (WAPE) and bias,
    scored per demand pattern; the champion per pattern is used for the forecast (no model is fixed up front).
-3. Forecast — style x country, 8 weeks ahead, P50 = champion level, P80 = Poisson-style upper band.
+   The champions are also scored per volume band (units a week) against the pure-chance floor (Poisson error with a
+   perfect rate), and the spread each band needs is fitted as a negative binomial: variance = mean + alpha x mean^2
+   (sales swing more than Poisson, and more so the bigger the style).
+3. Forecast — style x country, 8 weeks ahead, P50 = champion level, P80 = negative-binomial 80th percentile,
+   plus the chance of selling at least one unit each week.
 4. Allocation — 2 weeks of forecast -> store (store share of the style in its country) -> size (country size curve)
-   -> target = max(demand, 1 per key size the store carries) -> need net of ATP + in-transit (rounded up) ->
+   -> target = stock that covers 80% of 14-day outcomes at store x size (negative binomial; alpha carries over
+   unchanged when demand is split, so tiny store x size means behave almost like Poisson), at least 1 per key size
+   the store carries -> need net of ATP + in-transit ->
    DC rationing (exclusive primary pool, then the shared UAE hub globally per size; priority grade then demand).
 Every stage appends timestamped lines to an event log that the Agent lab view replays.
 """
@@ -17,6 +23,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime, timezone
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -27,6 +34,58 @@ BACKTEST_H = 4
 COVER_DAYS = 14
 GRADE_RANK = {"BEACON": 0, "JORDAN": 0, "A+": 1, "A": 2, "B": 3, "C": 4, "NVS": 5}
 METHODS = ("MA4", "MA12", "SES", "CROSTON_SBA", "TSB")
+SERVICE_LEVEL = 0.80              # store x size stock covers 80% of 14-day outcomes
+BAND_EDGES = (0.25, 1, 3, 10)     # forecast units a week, style x country
+BAND_NAMES = ("Under 0.25 a week", "0.25-1 a week", "1-3 a week", "3-10 a week", "10+ a week")
+
+
+def band_of(rate):
+    return np.searchsorted(BAND_EDGES, np.asarray(rate, float), side="right")
+
+
+def _nb_params(mu, alpha):
+    """Negative binomial with mean mu and variance mu + alpha x mu^2 (alpha = 0 -> Poisson)."""
+    mu = np.maximum(np.asarray(mu, float), 0)
+    v = 1 + np.maximum(np.asarray(alpha, float), 0) * mu                     # variance / mean
+    v = np.broadcast_to(v, mu.shape)
+    pois = v < 1.001
+    p = np.where(pois, 1.0, 1 / v)
+    r = np.where(pois, np.inf, mu / np.maximum(v - 1, 1e-9))
+    return mu, v, pois, p, r
+
+
+def nb_p0(mu, alpha):
+    """Chance of selling nothing."""
+    mu, v, pois, p, r = _nb_params(mu, alpha)
+    with np.errstate(invalid="ignore"):
+        return np.where(pois, np.exp(-mu), np.exp(np.where(pois, 0, r) * np.log(p)))
+
+
+def nb_quantile(mu, alpha, q):
+    """Smallest whole number of units that covers q of outcomes. Exact recurrence up to mean 60, normal beyond."""
+    mu, v, pois, p, r = _nb_params(mu, alpha)
+    small = mu <= 60
+    pm = np.where(small, nb_p0(np.where(small, mu, 0), alpha), 0.0)
+    cdf = pm.copy()
+    res = np.where(small & (cdf >= q), 0, -1)
+    k = 0
+    while ((res < 0) & small).any() and k < 400:
+        pm = np.where(pois, pm * mu / (k + 1), pm * (k + np.where(pois, 0, r)) / (k + 1) * (1 - p))
+        k += 1
+        cdf = cdf + pm
+        res = np.where((res < 0) & small & (cdf >= q), k, res)
+    z = NormalDist().inv_cdf(q)
+    big = np.ceil(mu + z * np.sqrt(v * mu))
+    return np.where(mu <= 0, 0, np.where(small & (res >= 0), res, big)).astype(int)
+
+
+def poisson_mad(lam):
+    """Expected |actual - rate| if the rate were known exactly (pure chance): 2 x rate x P(Y = floor(rate))."""
+    lam = np.asarray(lam, float)
+    fl = np.floor(lam)
+    lg = np.array([math.lgamma(x + 1) for x in fl.ravel()]).reshape(lam.shape)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(lam > 0, 2 * np.exp(-lam + (fl + 1) * np.log(np.maximum(lam, 1e-300)) - lg), 0.0)
 
 
 class RunLog:
@@ -300,11 +359,12 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
 
     # 4 · Tournament — every model scored flat and with seasonality + events, per demand pattern
     with log.stage("tournament", "tournament"):
-        rows = []
+        rows, fs_cut = [], {}
         for back in BACKTEST_CUTOFFS:
             cut = T - back
             Fc, _, _ = seasonal_factors(pool, all_weeks, cut, ev)            # factors learned only before the cut-off
             Fs = Fc[gidx]
+            fs_cut[back] = Fs
             # score only weeks where the style was well stocked (else actual sales understate demand)
             a_t = av_ratio[:, cut:cut + BACKTEST_H]
             mask = np.where(np.isnan(a_t), 1.0, (a_t >= 0.8).astype(float))
@@ -353,6 +413,89 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                                      f"{out['error_seasonal_best']*100:.0f}% · best flat {out['error_flat_best']*100:.0f}% · "
                                      f"plain 12-week average {out['error_baseline']*100:.0f}%")
 
+        # Champions scored per volume band: error vs the pure-chance floor, chance-to-sell calibration, and the spread
+        # each band needs (negative-binomial alpha, maximum likelihood) — fitted on the earlier cut-offs, checked on the latest.
+        obs = []
+        for back in BACKTEST_CUTOFFS:
+            cut, Fs = T - back, fs_cut[back]
+            fac = Fs[:, cut:cut + BACKTEST_H]
+            srcb = {"flat": y[:, :cut], "seasonal": y[:, :cut] / np.maximum(Fs[:, :cut], 1e-9),
+                    "seasonal + stock-outs": yd[:, :cut] / np.maximum(Fs[:, :cut], 1e-9)}
+            fw = np.zeros((len(y), BACKTEST_H))
+            for c in act_cls:
+                k = cls == c
+                m, v = champ.loc[c, "method"], champ.loc[c, "variant"]
+                fw[k] = level(srcb[v][k], m)[:, None] * (1.0 if v == "flat" else fac[k])
+            a_t = av_ratio[:, cut:cut + BACKTEST_H]
+            mask = np.where(np.isnan(a_t), True, a_t >= 0.8) & (cls != "inactive")[:, None]
+            obs.append((back, fw, y[:, cut:cut + BACKTEST_H], mask, band_of(fw.mean(axis=1))))
+        hold = min(BACKTEST_CUTOFFS)
+
+        lgam = np.frompyfunc(math.lgamma, 1, 1)
+        grid = np.concatenate([[0.0], np.geomspace(0.01, 20, 40)])
+
+        def _disp(sel):
+            """Maximum-likelihood alpha per band on a grid (moments would be driven by a few big misses)."""
+            alpha = np.zeros(len(BAND_NAMES))
+            for b in range(len(BAND_NAMES)):
+                ks = [(fw[k], a[k]) for back, fw, a, mask, band in obs if sel(back)
+                      for k in [mask & (band == b)[:, None] & (fw > 0)]]
+                mu = np.concatenate([x for x, _ in ks]); yv = np.concatenate([x for _, x in ks])
+                if len(mu) == 0:
+                    continue
+                lg_y1 = lgam(yv + 1).astype(float)
+                ll = []
+                for g in grid:
+                    if g == 0:
+                        ll.append((yv * np.log(mu) - mu - lg_y1).sum())
+                    else:
+                        r = 1 / g
+                        ll.append((lgam(yv + r).astype(float) - math.lgamma(r) - lg_y1
+                                   + r * np.log(r / (r + mu)) + yv * np.log(mu / (r + mu))).sum())
+                alpha[b] = grid[int(np.argmax(ll))]
+            return alpha
+        v_fit, disp = _disp(lambda b: b != hold), _disp(lambda b: True)
+        cat = lambda xs: np.concatenate(xs) if xs else np.array([])
+        mean = lambda xs: float(cat(xs).mean()) if len(cat(xs)) else np.nan
+        brow = []
+        for b, name in enumerate(BAND_NAMES):
+            F4 = A4 = err = floor = 0.0
+            nser, ps_pred, ps_act, cov_nb, cov_old = 0, [], [], [], []
+            for back, fw, a, mask, band in obs:
+                k = band == b
+                f4, a4 = (fw * mask)[k].sum(axis=1), (a * mask)[k].sum(axis=1)     # 4-week totals, as the contest scores
+                F4 += f4.sum(); A4 += a4.sum(); err += np.abs(f4 - a4).sum(); floor += poisson_mad(f4).sum()
+                kk = mask & k[:, None]                                            # weekly, for chance-to-sell + P80
+                ps_pred.append(1 - nb_p0(fw[kk], disp[b])); ps_act.append(a[kk] >= 1)
+                if back == hold:
+                    nser = int(k.sum())
+                    cov_nb.append(a[kk] <= nb_quantile(fw[kk], v_fit[b], 0.8))
+                    cov_old.append(a[kk] <= fw[kk] + 0.84 * np.sqrt(fw[kk]))
+            brow.append({"band": name, "band_order": b, "series": nser, "actual_units": float(A4),
+                         "error": err / A4 if A4 else np.nan, "chance_floor": floor / F4 if F4 else np.nan,
+                         "bias": F4 / A4 - 1 if A4 else np.nan, "nb_alpha": round(float(disp[b]), 3),
+                         "p_sell_predicted": mean(ps_pred), "p_sell_actual": mean(ps_act),
+                         "p80_coverage": mean(cov_nb), "p80_coverage_old": mean(cov_old)})
+        eb = pd.DataFrame(brow)
+        eb["unit_share"] = eb["actual_units"] / eb["actual_units"].sum()
+        out["error_bands"] = eb
+        fast = eb[eb["band_order"] >= 3]
+        out["error_fast"] = float((fast["error"] * fast["actual_units"]).sum() / fast["actual_units"].sum())
+        out["floor_fast"] = float((fast["chance_floor"] * fast["actual_units"]).sum() / fast["actual_units"].sum())
+        slow = eb[eb["band_order"] <= 1]
+        out["p_sell_gap_slow"] = float(((slow["p_sell_predicted"] - slow["p_sell_actual"]).abs() * slow["actual_units"]).sum()
+                                       / slow["actual_units"].sum())
+        w_cov = lambda c: float((eb[c] * eb["actual_units"]).sum() / eb["actual_units"].sum())
+        out["p80_coverage"], out["p80_coverage_old"] = w_cov("p80_coverage"), w_cov("p80_coverage_old")
+        log.say("tournament", "out", "by volume: " + " · ".join(
+            f"{r['band']} {r['error']*100:.0f}% (chance alone {r['chance_floor']*100:.0f}%)" for _, r in eb.iterrows()))
+        log.say("tournament", "hold", f"styles selling 3+ a week ({fast['unit_share'].sum()*100:.0f}% of units): error "
+                                      f"{out['error_fast']*100:.0f}% vs {out['floor_fast']*100:.0f}% from chance — the gap is "
+                                      f"price, launches and ranging the model does not see yet")
+        log.say("tournament", "out", f"high case (P80) covers {out['p80_coverage']*100:.0f}% of weeks on the latest cut-off "
+                                     f"(was {out['p80_coverage_old']*100:.0f}%) · negative-binomial alpha per band " +
+                                     " / ".join(f"{x:.2f}" for x in disp))
+
     # 5 · Forecaster — level from the winner, then seasonality + events put back week by week
     with log.stage("forecast", "forecaster"):
         Fser = F_full[gidx]
@@ -364,22 +507,26 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             k = cls == c
             lv[k] = level(src[v][k], m); meth[k] = m; var[k] = v
         fut = np.where((var == "flat")[:, None], 1.0, Fser[:, T:]) * lv[:, None]
-        p80 = fut + 0.84 * np.sqrt(np.maximum(fut, 0))
+        a_ser = disp[band_of(fut.mean(axis=1))][:, None] * np.ones_like(fut)
+        p80 = nb_quantile(fut, a_ser, 0.8)
+        p_sell = 1 - nb_p0(fut, a_ser)
         fc_rows = []
         for i, (country, parent) in enumerate(piv.index):
             if lv[i] <= 0:
                 continue
             for h in range(HORIZON_WEEKS):
-                fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3), round(float(p80[i, h]), 3),
-                                meth[i], var[i], cls[i]))
-        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_p80", "method", "variant", "demand_class"])
+                fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3), float(p80[i, h]),
+                                round(float(p_sell[i, h]), 3), meth[i], var[i], cls[i], BAND_NAMES[band_of(fut[i].mean())]))
+        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_p80", "p_sell", "method",
+                                            "variant", "demand_class", "volume_band"])
         fc = fc.merge(meta.reset_index(), on=["country", "parent"], how="left")
         out["forecast"], out["history"] = fc, weekly
         wk_tot = fc.groupby("week_start")["units_p50"].sum()
         log.say("forecaster", "out", f"{fc[['country','parent']].drop_duplicates().shape[0]:,} series · {HORIZON_WEEKS} weeks · "
                                      f"weekly total {wk_tot.min():,.0f}–{wk_tot.max():,.0f} units (peak week of {pd.Timestamp(wk_tot.idxmax()):%d %b})")
         cover_w = max(1, round(COVER_DAYS / 7))
-        fcl = pd.DataFrame({"cover_units": fut[:, :cover_w].sum(axis=1)}, index=piv.index).reset_index()
+        fcl = pd.DataFrame({"cover_units": fut[:, :cover_w].sum(axis=1), "nb_alpha": disp[band_of(fut.mean(axis=1))]},
+                           index=piv.index).reset_index()
 
     # 6 · Store splitter — country forecast -> store by its share of the style
     with log.stage("store_split", "splitter"):
@@ -407,7 +554,8 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         key_rows = sp[["country", "store", "parent"]].merge(ks[ks["key_size"] == 1][["parent", "art", "size"]], on="parent")
         lines = lines.merge(key_rows.assign(_k=1), on=["country", "store", "parent", "art", "size"], how="outer")
         lines["size_share"] = lines["size_share"].fillna(0)
-        lines["demand_cover"] = lines.groupby(["store", "parent"])["demand_cover"].transform("max").fillna(0)
+        for c in ("demand_cover", "nb_alpha"):
+            lines[c] = lines.groupby(["store", "parent"])[c].transform("max").fillna(0)
         lines["demand"] = lines["demand_cover"] * lines["size_share"]
         lines = lines.merge(ks[["art", "key_size"]], on="art", how="left")
         log.say("curator", "tool", "size curve per style and country (26 weeks of size sales) · 1 facing per key size")
@@ -417,9 +565,22 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
     with log.stage("stock_check", "stock"):
         lines = lines.merge(carry[["store", "art", "atp", "intransit"]], on=["store", "art"], how="left")
         lines[["atp", "intransit", "key_size"]] = lines[["atp", "intransit", "key_size"]].fillna(0)
-        lines["target"] = np.maximum(lines["demand"], np.where(lines["key_size"] == 1, 1.0, 0.0))
-        lines["need"] = np.ceil(np.maximum(0, lines["target"] - lines["atp"] - lines["intransit"]) - 1e-9).astype(int)
+        # Demand at one store x size is mostly 0 or 1: stock to cover 80% of 14-day outcomes, not a rounded average.
+        # Splitting a negative binomial by a share keeps the same alpha, so the style's band alpha applies here too.
+        mu, al = lines["demand"].to_numpy(), lines["nb_alpha"].to_numpy()
+        lines["p_sell"] = 1 - nb_p0(mu, al)
+        lines["cover_qty"] = nb_quantile(mu, al, SERVICE_LEVEL)
+        key = np.where(lines["key_size"] == 1, 1, 0)
+        lines["target"] = np.maximum(lines["cover_qty"], key)
+        have = (lines["atp"].clip(lower=0) + lines["intransit"].clip(lower=0))
+        lines["need"] = np.maximum(0, np.ceil(lines["target"] - have - 1e-9)).astype(int)
+        old_need = np.ceil(np.maximum(0, np.maximum(lines["demand"], key) - have) - 1e-9)
+        dropped = (old_need > 0) & (lines["need"] == 0)
         log.say("stock", "tool", "read effective_stock (ATP today) + store_intransit")
+        log.say("stock", "tool", f"stock per size = units covering {SERVICE_LEVEL:.0%} of 14-day outcomes (negative binomial) · "
+                                 "at least 1 per key size")
+        log.say("stock", "hold", f"{int(dropped.sum()):,} sizes a rounded-up average would have filled have under "
+                                 f"{1 - SERVICE_LEVEL:.0%} chance of selling in 14 days — not sent")
         log.say("stock", "out", f"{int((lines['need'] > 0).sum()):,} sizes need stock · {int(lines['need'].sum()):,} units short of {COVER_DAYS}-day cover")
 
     # 9 · Allocator — DC rationing (primary pool, then shared hub globally)
@@ -442,10 +603,11 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                     break
             alloc.append(q); src.append(" + ".join(s))
         need["alloc_qty"], need["source"] = alloc, src
-        need["reason"] = np.where(need["demand"] >= need["target"] - 1e-9, "Forecast demand", "Display: 1 per key size")
+        need["reason"] = np.where(need["cover_qty"] >= need["target"], f"Forecast demand ({SERVICE_LEVEL:.0%} cover)",
+                                  "Display: 1 per key size")
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
                                   np.where(need["alloc_qty"] > 0, "Part-allocated", "No DC stock"))
-        out["allocation"] = need[["country", "store", "store_name", "grade", "parent", "art", "size", "key_size", "demand", "target",
+        out["allocation"] = need[["country", "store", "store_name", "grade", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
         log.say("allocator", "tool", "DC pools: primary first (KSA / BAH), then the shared UAE hub · priority grade, then demand")
