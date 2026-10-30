@@ -8,7 +8,7 @@ import agent_view
 
 # forecast lane on top, allocation lane below; one human Approver at the end
 AGENTS = [
-    dict(id="scout", g="SC", name="Scout", role="Sales history", stages=["history"], col=0, row=1),
+    dict(id="scout", g="SC", name="Scout", role="Sales + stock history", stages=["history"], col=0, row=1),
     dict(id="profiler", g="PR", name="Profiler", role="Demand patterns", stages=["profile"], col=1, row=0),
     dict(id="calendar", g="CA", name="Calendar", role="Events + seasonality", stages=["calendar"], col=2, row=0),
     dict(id="tournament", g="MC", name="Model contest", role="Flat vs seasonal", stages=["tournament"], col=3, row=0),

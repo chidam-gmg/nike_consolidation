@@ -12,13 +12,13 @@ _CORE = f"""core AS (SELECT p.MATERIAL art, MAX(p.RT_CONFMAT) parent, MAX(TRIM(p
 nike AS (SELECT PLANT store, MAX(COUNTRY) country FROM {SM} WHERE PLANTCAT = 'A' AND `/BIC/ZBU` = 'NIKE' GROUP BY PLANT),
 bounds AS (SELECT date_sub(date_trunc('week', current_date()), 1) AS last_day)"""
 
-# weekly style x country history, 78 full weeks ending last Sunday (retail + ecom)
+# weekly style x country history: all CORE history (from 4 Mar 2024) to last Sunday (retail + ecom)
 WEEKLY = f"""WITH {_CORE}
 SELECT n.country, c.parent, MAX(c.division) division, MAX(c.gender) gender, MAX(c.category) category,
        CAST(date_trunc('week', s.txn_date) AS DATE) wk, SUM(GREATEST(s.txn_qty, 0)) units
 FROM {SALES} s JOIN core c ON c.art = s.variant_article_code JOIN nike n ON n.store = s.site_code
 WHERE s.distr_channel IN ('10', '20')
-  AND s.txn_date > date_sub((SELECT last_day FROM bounds), 7 * 78) AND s.txn_date <= (SELECT last_day FROM bounds)
+  AND s.txn_date >= DATE'2024-03-04' AND s.txn_date <= (SELECT last_day FROM bounds)
 GROUP BY n.country, c.parent, CAST(date_trunc('week', s.txn_date) AS DATE)"""
 
 # store x size sales, last 26 full weeks — store share of style and size curve
@@ -50,3 +50,12 @@ DC_MAP = f"""SELECT country, MAX(CASE WHEN tier = 1 AND pool_id <> 'HUB' THEN po
 # today's engine DC replen for CORE articles (comparison with the forecast-based plan)
 CURRENT_REPLEN = f"""WITH {_CORE}
 SELECT r.receiver_store store, r.article art, r.recommended_qty qty FROM {FQ}.replen_recommendations r JOIN core c ON c.art = r.article"""
+
+# weekly availability per style x country: number of Nike stores holding any stock of the style on the
+# Wednesday snapshot (ATP history starts 2025-01-20). Used to gross up sales in weeks with stock-outs.
+AVAIL = f"""WITH {_CORE}
+SELECT n.country, c.parent, CAST(date_trunc('week', a.c_file_date) AS DATE) wk, COUNT(DISTINCT a.site_code) stores_in_stock
+FROM sap_gmg_datalake.bronze.atp_detail a JOIN core c ON c.art = a.article_code JOIN nike n ON n.store = a.site_code
+WHERE a.storage_location = 'SL01' AND dayofweek(a.c_file_date) = 4 AND a.atp_qty > 0
+  AND a.c_file_date >= DATE'2025-01-20' AND a.c_file_date <= (SELECT last_day FROM bounds)
+GROUP BY 1, 2, 3"""

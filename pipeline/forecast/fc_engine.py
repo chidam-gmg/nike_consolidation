@@ -3,7 +3,8 @@
 1. Weekly style x country history (zero-filled) -> demand pattern per series; events calendar + month / week-of-year
    seasonality per country x division (models forecast the de-seasonalised level, the pattern is put back) (ADI / CV2: smooth, erratic,
    intermittent, lumpy).
-2. Model contest — 5 simple models, 3 backtest cut-offs, 4-week horizon; error = volume-weighted (WAPE) and bias,
+2. Model contest — 5 simple models x (flat, seasonal, seasonal on stock-out-corrected demand), 3 cut-offs, 4-week horizon,
+   scored on well-stocked weeks only; error = volume-weighted (WAPE) and bias,
    scored per demand pattern; the champion per pattern is used for the forecast (no model is fixed up front).
 3. Forecast — style x country, 8 weeks ahead, P50 = champion level, P80 = Poisson-style upper band.
 4. Allocation — 2 weeks of forecast -> store (store share of the style in its country) -> size (country size curve)
@@ -122,6 +123,11 @@ def classify(y):
 # GCC retail calendar. Islamic dates follow the moon sighting (±1 day) and DSF dates are announced yearly —
 # business should confirm these each year (the table fc_events is what the forecast used).
 EVENTS = [
+    ("Ramadan", "2024-03-11", "2024-04-09"), ("Eid al-Fitr", "2024-04-10", "2024-04-13"),
+    ("Eid al-Adha", "2024-06-15", "2024-06-19"), ("Back to school", "2024-08-19", "2024-09-01"),
+    ("11.11", "2024-11-10", "2024-11-12"), ("White Friday", "2024-11-25", "2024-12-02"),
+    ("UAE National Day", "2024-12-01", "2024-12-03"), ("Dubai Shopping Festival", "2024-12-06", "2025-01-12"),
+    ("Ramadan", "2025-03-01", "2025-03-29"), ("Eid al-Fitr", "2025-03-30", "2025-04-02"),
     ("Eid al-Adha", "2025-06-05", "2025-06-09"), ("Back to school", "2025-08-18", "2025-08-31"),
     ("11.11", "2025-11-10", "2025-11-12"), ("White Friday", "2025-11-24", "2025-12-01"),
     ("UAE National Day", "2025-12-01", "2025-12-03"), ("Dubai Shopping Festival", "2025-12-05", "2026-01-11"),
@@ -189,8 +195,33 @@ def seasonal_factors(pool, weeks, upto, ev):
         F[g] = S[g] * e
     return F, S, U
 
+
+def demand_from_sales(y, stores, weeks_known):
+    """Gross sales up for stock-outs. stores = stores holding the style each week (NaN = no stock history).
+    availability = stores in stock / most stores holding it in the last 13 weeks. Partial (< 70%): sales / sqrt(availability)
+    (square root: the stores that keep stock also catch some of the lost sales; backtest beat a full gross-up). Floored at 0.3.
+    Fully out while ranged: no usable signal -> filled from the recent demand level."""
+    n, T = y.shape
+    roll = np.full((n, T), np.nan)
+    for t in range(T):
+        win = stores[:, max(0, t - 12):t + 1]
+        roll[:, t] = np.where(np.isnan(win).all(axis=1), np.nan, np.nanmax(np.where(np.isnan(win), -1, win), axis=1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        avail = np.where(np.isnan(stores) | (roll <= 0), np.nan, stores / np.maximum(roll, 1e-9))
+    d = y.astype(float).copy()
+    part = ~np.isnan(avail) & (avail > 0) & (avail < 0.7)
+    d[part] = y[part] / np.sqrt(np.clip(avail[part], 0.3, 1))
+    out = ~np.isnan(avail) & (avail == 0)
+    for t in range(T):                                   # fully out of stock: carry the recent demand level
+        k = out[:, t]
+        if k.any():
+            prev = d[k, max(0, t - 8):t]
+            good = ~out[k, max(0, t - 8):t]
+            d[k, t] = np.where(good.sum(axis=1) > 0, (prev * good).sum(axis=1) / np.maximum(good.sum(axis=1), 1), y[k, t])
+    return d, avail
+
 # ---------------- pipeline ----------------
-def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen, log: RunLog | None = None):
+def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen, avail=None, log: RunLog | None = None):
     log = log or RunLog()
     out = {}
 
@@ -203,9 +234,24 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         meta = weekly.groupby(["country", "parent"])[["division", "gender", "category"]].max()
         y = piv.to_numpy(float)
         last_week = weeks[-1]
+        if avail is not None and len(avail):
+            av = _num(avail.copy(), ["stores_in_stock"]); av["wk"] = pd.to_datetime(av["wk"])
+            st_mat = (av.pivot_table(index=["country", "parent"], columns="wk", values="stores_in_stock", aggfunc="sum")
+                      .reindex(index=piv.index, columns=weeks))
+            known = np.array([w >= av["wk"].min() for w in weeks])
+            st_arr = st_mat.to_numpy(float, copy=True)
+            st_arr[:, known] = np.nan_to_num(st_arr[:, known], nan=0.0)      # in the stock-history window: missing = no store had stock
+        else:
+            st_arr, known = np.full(y.shape, np.nan), np.zeros(len(weeks), bool)
+        yd, av_ratio = demand_from_sales(y, st_arr, known)
+        out["availability"] = av_ratio
         log.say("scout", "tool", "read fct_sap_sales_detail_v · CORE / YEAR Nike articles · retail + e-commerce · Nike stores")
-        log.say("scout", "out", f"{len(piv):,} style × country series · {len(weeks)} weeks up to the week of {last_week:%d %b %Y} · "
-                                 f"{int(y.sum()):,} units")
+        log.say("scout", "tool", "read atp_detail Wednesday snapshots (from 20 Jan 2025) · stores holding each style each week")
+        log.say("scout", "out", f"{len(piv):,} style × country series · {len(weeks)} weeks (from {weeks[0]:%d %b %Y}) up to the week of "
+                                 f"{last_week:%d %b %Y} · {int(y.sum()):,} units sold")
+        part = np.nansum((av_ratio > 0) & (av_ratio < 0.7)); full = np.nansum(av_ratio == 0)
+        log.say("scout", "hold", f"stock-outs since Jan 2025: {int(part):,} series-weeks partly out, {int(full):,} fully out · "
+                                 f"demand grossed up by {int(yd.sum() - y.sum()):,} units ({(yd.sum() / max(y.sum(), 1) - 1) * 100:.1f}%)")
 
     # 2 · Profiler — demand pattern per series
     with log.stage("profile", "profiler"):
@@ -229,7 +275,7 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         gidx = grp.map({g: i for i, g in enumerate(groups)}).to_numpy()
         pool = np.zeros((len(groups), len(all_weeks)))
         for gi in range(len(groups)):
-            pool[gi, :T] = y[gidx == gi].sum(axis=0)
+            pool[gi, :T] = yd[gidx == gi].sum(axis=0)
         F_full, S_full, U_full = seasonal_factors(pool, all_weeks, T, ev)
         cal = []
         for gi, (country, division) in enumerate(groups):
@@ -259,12 +305,17 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             cut = T - back
             Fc, _, _ = seasonal_factors(pool, all_weeks, cut, ev)            # factors learned only before the cut-off
             Fs = Fc[gidx]
-            hist, act = y[:, :cut], y[:, cut:cut + BACKTEST_H].sum(axis=1)
-            adj = hist / np.maximum(Fs[:, :cut], 1e-9)
+            # score only weeks where the style was well stocked (else actual sales understate demand)
+            a_t = av_ratio[:, cut:cut + BACKTEST_H]
+            mask = np.where(np.isnan(a_t), 1.0, (a_t >= 0.8).astype(float))
+            act = (y[:, cut:cut + BACKTEST_H] * mask).sum(axis=1)
+            fac = Fs[:, cut:cut + BACKTEST_H]
             for m in METHODS:
-                variants = {"flat": level(hist, m) * BACKTEST_H,
-                            "seasonal": level(adj, m) * Fs[:, cut:cut + BACKTEST_H].sum(axis=1)}
-                for var, f in variants.items():
+                variants = {"flat": level(y[:, :cut], m)[:, None] * np.ones_like(fac),
+                            "seasonal": level(y[:, :cut] / np.maximum(Fs[:, :cut], 1e-9), m)[:, None] * fac,
+                            "seasonal + stock-outs": level(yd[:, :cut] / np.maximum(Fs[:, :cut], 1e-9), m)[:, None] * fac}
+                for var, fw in variants.items():
+                    f = (fw * mask).sum(axis=1)
                     for c in np.unique(cls):
                         k = cls == c
                         a_sum = act[k].sum()
@@ -279,11 +330,13 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                  .groupby("demand_class").head(1).set_index("demand_class"))
         base = board[(board["method"] == "MA12") & (board["variant"] == "flat")].set_index("demand_class")
         flat_best = board[board["variant"] == "flat"].sort_values("wape").groupby("demand_class").head(1).set_index("demand_class")
+        seas_best = board[board["variant"] == "seasonal"].sort_values("wape").groupby("demand_class").head(1).set_index("demand_class")
         out["backtest"] = bt
         out["leaderboard"] = board.assign(champion=board.apply(
             lambda r: r["demand_class"] in champ.index and champ.loc[r["demand_class"], "method"] == r["method"]
             and champ.loc[r["demand_class"], "variant"] == r["variant"], axis=1))
-        log.say("tournament", "tool", f"{len(METHODS)} models × flat / seasonal × {len(BACKTEST_CUTOFFS)} cut-offs × {BACKTEST_H}-week horizon")
+        log.say("tournament", "tool", f"{len(METHODS)} models × (flat · seasonal · seasonal + stock-outs) × {len(BACKTEST_CUTOFFS)} cut-offs × "
+                                      f"{BACKTEST_H}-week horizon · scored on well-stocked weeks")
         for c, r in champ.iterrows():
             if c == "inactive":
                 continue
@@ -295,19 +348,22 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         act_cls = [c for c in champ.index if c != "inactive"]
         out["error_champion"], out["error_baseline"] = wtd(champ.loc[act_cls]), wtd(base.loc[[c for c in act_cls if c in base.index]])
         out["error_flat_best"] = wtd(flat_best.loc[[c for c in act_cls if c in flat_best.index]])
-        log.say("tournament", "out", f"overall error {out['error_champion']*100:.0f}% · best flat {out['error_flat_best']*100:.0f}% · "
+        out["error_seasonal_best"] = wtd(seas_best.loc[[c for c in act_cls if c in seas_best.index]])
+        log.say("tournament", "out", f"overall error {out['error_champion']*100:.0f}% · best seasonal on raw sales "
+                                     f"{out['error_seasonal_best']*100:.0f}% · best flat {out['error_flat_best']*100:.0f}% · "
                                      f"plain 12-week average {out['error_baseline']*100:.0f}%")
 
     # 5 · Forecaster — level from the winner, then seasonality + events put back week by week
     with log.stage("forecast", "forecaster"):
         Fser = F_full[gidx]
-        adj_full = y / np.maximum(Fser[:, :T], 1e-9)
+        src = {"flat": y, "seasonal": y / np.maximum(Fser[:, :T], 1e-9),
+               "seasonal + stock-outs": yd / np.maximum(Fser[:, :T], 1e-9)}
         lv = np.zeros(len(piv)); meth = np.array(["MA12"] * len(piv), dtype=object); var = np.array(["flat"] * len(piv), dtype=object)
         for c in np.unique(cls):
             m, v = (champ.loc[c, "method"], champ.loc[c, "variant"]) if c in champ.index else ("MA12", "flat")
             k = cls == c
-            lv[k] = level(adj_full[k] if v == "seasonal" else y[k], m); meth[k] = m; var[k] = v
-        fut = np.where((var == "seasonal")[:, None], Fser[:, T:], 1.0) * lv[:, None]
+            lv[k] = level(src[v][k], m); meth[k] = m; var[k] = v
+        fut = np.where((var == "flat")[:, None], 1.0, Fser[:, T:]) * lv[:, None]
         p80 = fut + 0.84 * np.sqrt(np.maximum(fut, 0))
         fc_rows = []
         for i, (country, parent) in enumerate(piv.index):

@@ -701,9 +701,11 @@ elif ss.run_state == "results":
                                  theme=THEME)
 
             st.markdown("##### Model contest")
-            st.caption("Each model forecast the 4 weeks after 3 past cut-off dates, once flat and once with seasonality + "
-                       "events, and was scored against what actually sold (error = units missed ÷ units sold). The lowest "
-                       "error per demand pattern wins and is used for the forecast — no model is fixed up front.")
+            st.caption("Each model learned from all sales since March 2024, then forecast the 4 weeks after 3 past cut-off "
+                       "dates three ways: flat, with seasonality + events, and with seasonality + events on demand corrected "
+                       "for stock-outs (weeks where stores ran out are lifted, weeks with no stock anywhere are filled from "
+                       "recent demand). Scored only on weeks the style was well stocked, against what actually sold (error = "
+                       "units missed ÷ units sold). The lowest error per demand pattern wins — no model is fixed up front.")
             _lb = _fr["leaderboard"].copy()
             _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce") * 100
             _lb = _lb[_lb["demand_class"] != "inactive"]
@@ -717,6 +719,7 @@ elif ss.run_state == "results":
                                                  "lumpy": "Lumpy (occasional, jumpy)"}.get(_c, _c),
                               "Winner": f"{_MN.get(_w['method'], _w['method'])} · {_w['variant']}",
                               "Winner error %": round(_w["wape"]),
+                              "Best stock-out corrected %": round(_g[_g["variant"] == "seasonal + stock-outs"]["wape"].min()),
                               "Best seasonal %": round(_g[_g["variant"] == "seasonal"]["wape"].min()),
                               "Best flat %": round(_g[_g["variant"] == "flat"]["wape"].min()),
                               "12-wk average %": round(_g[(_g["method"] == "MA12") & (_g["variant"] == "flat")]["wape"].min())})
