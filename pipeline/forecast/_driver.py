@@ -30,6 +30,7 @@ save(o["events"], "fc_events")
 save(o["event_uplift"], "fc_event_uplift")
 save(o["error_bands"], "fc_error_bands")
 save(o["calibration"], "fc_calibration")
+save(o["size_curve"], "fc_size_curve")
 save(pd.DataFrame(log.stages), "fc_run_stages")
 save(pd.DataFrame(log.events), "fc_run_events")
 vs = o["vs_current"]

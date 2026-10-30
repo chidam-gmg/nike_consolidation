@@ -792,7 +792,7 @@ elif ss.run_state == "results":
                 _h = get_fc_hierarchy()
                 _h["units_8w"] = pd.to_numeric(_h["units_8w"], errors="coerce").fillna(0)
                 _xc = st.columns([1.1, 1.3, 2.6])
-                _lvl = _xc[0].selectbox("Level", ["Division (AH1)", "Category (AH2)"], index=1, key="fc_lvl",
+                _lvl = _xc[0].selectbox("Level", ["Division", "Category (AH2)"], index=1, key="fc_lvl",
                                         label_visibility="collapsed")
                 _ctry = _xc[1].selectbox("Country", ["All countries"] + sorted(_h["country"].dropna().unique()),
                                          key="fc_ctry", label_visibility="collapsed")
@@ -841,8 +841,10 @@ elif ss.run_state == "results":
                 st.info(f"Events calendar unavailable: {e}")
 
             st.markdown("##### Allocation plan")
-            st.caption("Forecast for the next 14 days (with seasonality + events) → each store's share of the style → country "
-                       "size curve → stock target = units that cover 80% of likely 14-day sales at that store and size "
+            st.caption("Forecast for the next 14 days (with seasonality + events) → split to stores and sizes by product "
+                       "cluster (division × gender × sport, e.g. Apparel · Mens · Running): the store's share of that cluster "
+                       "in its country, and the country's size curve for it (small countries lean on the GCC curve) — a single "
+                       "style's own history is too thin to split reliably → stock target = units that cover 80% of likely 14-day sales at that store and size "
                        "(most sizes sell 0 or 1, so a size with under 20% chance of selling gets nothing beyond display) → "
                        "at least 1 unit per key size → minus ATP and in-transit → DC stock rationed by grade, then demand. "
                        "All Nike stores in the store master; grade from the uploaded store list, else the store master.")
@@ -880,7 +882,8 @@ elif ss.run_state == "results":
                     "Qty to send": pd.to_numeric(_v["final_qty"], errors="coerce").fillna(_v["alloc_qty"]).astype(int),
                     "Reason": _v["so_reason"].fillna("—"), "Comment": _v["so_comment"].fillna(""),
                     "Sign-off": _v["Sign-off"].where(_v["alloc_qty"] > 0, _v["status"]),
-                    "Country": _v["country"], "Store name": _v["store_name"], "Grade": _v["grade"], "Style": _v["parent"],
+                    "Country": _v["country"], "Store name": _v["store_name"], "Grade": _v["grade"],
+                    "Cluster": _v.get("cluster", pd.Series(index=_v.index, dtype=object)), "Style": _v["parent"],
                     "Article": _v["art"], "Size": _v["size"], "Chance to sell (14d) %": _v["p_sell_pct"],
                     "Stock target": _v["target"], "ATP": _v["atp"], "In-transit": _v["intransit"],
                     "Recommended": _v["alloc_qty"], "Source": _v["source"]})

@@ -5,7 +5,7 @@ SM = "prod_mena.gold.mena_sports_store_master_view"
 SALES = "sap_gmg_datalake.silver.fct_sap_sales_detail_v"
 
 _CORE = f"""core AS (SELECT p.MATERIAL art, MAX(p.RT_CONFMAT) parent, MAX(TRIM(p.`/BIC/ZRWGH2_T`)) division,
-                       MAX(TRIM(p.`/BIC/ZCHWGH5`)) gender, MAX(TRIM(p.CM_CDT3_TXTMD)) category,
+                       MAX(TRIM(p.`/BIC/ZCHWGH5`)) gender, MAX(TRIM(p.CM_CDT3_TXTMD)) category, MAX(TRIM(p.`/BIC/ZRWGH3_T`)) sport,
                        MAX(CASE WHEN TRIM(p.RT_SIZE) = '-' THEN '0.5' ELSE TRIM(p.RT_SIZE) END) size
               FROM {PM} p WHERE p.MATL_CAT = '02' AND UPPER(TRIM(p.RF_SEASON)) IN ('CORE', 'YEAR')
                 AND p.MATERIAL LIKE 'NK%' GROUP BY p.MATERIAL),
@@ -61,7 +61,9 @@ FROM {SM} sm LEFT JOIN {FQ}.cfg_store_grade csg ON csg.store_code = sm.PLANT
 WHERE sm.PLANTCAT = 'A' AND sm.`/BIC/ZBU` = 'NIKE' AND sm.COUNTRY <> ''
 GROUP BY sm.COUNTRY, sm.PLANT"""
 
-KEY_SIZES = f"""WITH {_CORE} SELECT c.parent, c.art, c.size, MAX(COALESCE(ak.is_key_size, 0)) key_size
+# every CORE article with its size, key-size flag and the product attributes the store / size clusters are built from
+KEY_SIZES = f"""WITH {_CORE} SELECT c.parent, c.art, c.size, MAX(c.division) division, MAX(c.gender) gender,
+       MAX(c.sport) sport, MAX(c.category) category, MAX(COALESCE(ak.is_key_size, 0)) key_size
 FROM core c LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = c.art GROUP BY 1, 2, 3"""
 
 DC = f"""SELECT d.pool_id, d.article_code art, d.pool_atp FROM {FQ}.dc_pool_stock d WHERE d.pool_atp > 0 AND d.article_code LIKE 'NK%'"""

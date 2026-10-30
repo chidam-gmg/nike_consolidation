@@ -15,7 +15,11 @@
    only on the earlier ones.
 3. Forecast — style x country, 8 weeks ahead, P50 = champion level, P80 = negative-binomial 80th percentile,
    plus the chance of selling at least one unit each week.
-4. Allocation — 2 weeks of forecast -> store (store share of the style in its country) -> size (country size curve)
+4. Allocation — 2 weeks of forecast -> store -> size, both split at product-cluster level (division x gender x sport):
+   a style's own store / size history is too thin (78% of style-countries sell < 30 units a quarter) and lost to the
+   cluster in a back-test at every volume. Store = the store's share of the cluster in its country, over the stores
+   carrying the style; size = the country x cluster size curve, leaning on the GCC curve when the country is thin,
+   kept to the sizes the style comes in
    -> target = stock that covers 80% of 14-day outcomes at store x size (negative binomial; alpha carries over
    unchanged when demand is split, so tiny store x size means behave almost like Poisson), at least 1 per key size
    the store carries -> need net of ATP + in-transit ->
@@ -38,6 +42,10 @@ BACKTEST_H = 4
 COVER_DAYS = 14
 GRADE_RANK = {"BEACON": 0, "JORDAN": 0, "A+": 1, "A": 2, "B": 3, "C": 4, "NVS": 5}
 METHODS = ("MA4", "MA12", "SES", "CROSTON_SBA", "TSB")
+CLUSTER = ("division", "gender", "sport")   # product cluster for store + size splits (back-test 2026-10-30: best combined
+                                            # store x size error of the single-cluster options, few thin clusters)
+CLUSTER_K = 200                   # units a country x cluster needs before its own size curve outweighs the GCC one
+THIN_UNITS = 300                  # country x cluster with fewer units in 26 weeks is reported as thin
 SERVICE_LEVEL = 0.80              # store x size stock covers 80% of 14-day outcomes
 BAND_EDGES = (0.25, 1, 3, 10)     # forecast units a week, style x country
 CAL_FADE = (0.25, 0.5)            # calibration applies in full below 0.25 a week, fades out by 0.5 a week: the
@@ -583,39 +591,65 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         fcl = pd.DataFrame({"cover_units": fut[:, :cover_w].sum(axis=1), "nb_alpha": disp[band_of(fut.mean(axis=1))]},
                            index=piv.index).reset_index()
 
-    # 6 · Store splitter — country forecast -> store by its share of the style
+    # 6 · Store splitter — country forecast -> store by the store's share of the style's product cluster
     with log.stage("store_split", "splitter"):
-        ss = _num(store_size.copy(), ["units"])
-        st_par = ss.groupby(["country", "store", "parent"])["units"].sum().reset_index()
-        st_par["store_share"] = st_par["units"] / st_par.groupby(["country", "parent"])["units"].transform("sum")
+        ks = _num(key_sizes.copy(), ["key_size"])
+        pattr = ks.groupby("parent")[list(CLUSTER)].max().fillna("NA").astype(str)
+        pattr["cluster"] = pattr[list(CLUSTER)].agg(" · ".join, axis=1)
+        pcl = pattr["cluster"].reset_index()
+        ss = _num(store_size.copy(), ["units"]).merge(pcl, on="parent", how="left").fillna({"cluster": "NA"})
         stores = stores.copy()
         active = set(stores["store"])
         carry = _num(stock.copy(), ["atp", "intransit", "key_size"])
-        carried = carry[carry["atp"] + carry["intransit"] > 0][["store", "parent"]].drop_duplicates()
-        sp = st_par[st_par["store"].isin(active)].merge(fcl, on=["country", "parent"])
-        sp = sp.merge(carried.assign(carries=1), on=["store", "parent"], how="left")
-        sp = sp[sp["carries"].fillna(0) == 1]                       # only styles the store already ranges
+        carried = carry[(carry["atp"] + carry["intransit"] > 0) & carry["store"].isin(active)][["country", "store", "parent"]].drop_duplicates()
+        sc = ss.groupby(["country", "cluster", "store"])["units"].sum().rename("cluster_units").reset_index()
+        sold = ss.groupby(["country", "store", "parent"])["units"].sum().reset_index()
+        sold = sold[sold["units"] > 0][["country", "store", "parent"]]
+        # eligible: the store ranges the style (stock or in-transit) and sold it in the last 26 weeks — the split itself
+        # is by the cluster, eligibility is unchanged (ranging new stores is a separate decision)
+        sp = carried.merge(sold, on=["country", "store", "parent"]).merge(fcl, on=["country", "parent"]) \
+                    .merge(pcl, on="parent", how="left").fillna({"cluster": "NA"})
+        sp = sp.merge(sc, on=["country", "cluster", "store"], how="left").fillna({"cluster_units": 0})
+        g = sp.groupby(["country", "parent"])
+        tot, n = g["cluster_units"].transform("sum"), g["store"].transform("count")
+        sp["store_share"] = np.where(tot > 0, sp["cluster_units"] / tot.replace(0, 1), 1 / n)
         sp["demand_cover"] = sp["cover_units"] * sp["store_share"]          # next 2 weeks incl. seasonality + events
         out["scope"] = {"countries": int(sp["country"].nunique()), "stores": int(sp["store"].nunique())}
-        log.say("splitter", "tool", f"store share of each style in its country (26 weeks) · all Nike stores in the store "
-                                    f"master · {out['scope']['stores']} stores selling CORE in {out['scope']['countries']} countries")
-        log.say("splitter", "out", f"{len(sp):,} store × style lines · {sp['demand_cover'].sum():,.0f} units of {COVER_DAYS}-day demand")
+        vol = ss.groupby(["country", "cluster"])["units"].sum()
+        thin = vol[vol < THIN_UNITS]
+        log.say("splitter", "tool", f"product cluster = {' × '.join(CLUSTER)} ({pattr['cluster'].nunique()} clusters) · store share of the "
+                                    f"cluster in its country (26 weeks) · all Nike stores in the store master")
+        log.say("splitter", "out", f"{len(sp):,} store × style lines in {out['scope']['stores']} stores, {out['scope']['countries']} countries · "
+                                   f"{sp['demand_cover'].sum():,.0f} units of {COVER_DAYS}-day demand")
 
-    # 7 · Size curator — country size curve
+    # 7 · Size curator — country x cluster size curve, leaning on the GCC curve where the country is thin
     with log.stage("size_split", "curator"):
-        curve = ss.groupby(["country", "parent", "art", "size"])["units"].sum().reset_index()
-        curve["size_share"] = curve["units"] / curve.groupby(["country", "parent"])["units"].transform("sum")
-        ks = _num(key_sizes.copy(), ["key_size"])
-        lines = sp.merge(curve[["country", "parent", "art", "size", "size_share"]], on=["country", "parent"])
-        # every key size the store should display, even if the curve has no sales for it yet
-        key_rows = sp[["country", "store", "parent"]].merge(ks[ks["key_size"] == 1][["parent", "art", "size"]], on="parent")
-        lines = lines.merge(key_rows.assign(_k=1), on=["country", "store", "parent", "art", "size"], how="outer")
-        lines["size_share"] = lines["size_share"].fillna(0)
-        for c in ("demand_cover", "nb_alpha"):
-            lines[c] = lines.groupby(["store", "parent"])[c].transform("max").fillna(0)
+        cc = ss.groupby(["country", "cluster", "size"])["units"].sum().rename("ucc").reset_index()
+        cg = ss.groupby(["cluster", "size"])["units"].sum().rename("ucg").reset_index()
+        cg["p_gcc"] = cg["ucg"] / cg.groupby("cluster")["ucg"].transform("sum")
+        live = (set(carry.loc[carry["atp"] + carry["intransit"] > 0, "art"]) | set(dc["art"]) | set(ss["art"]))
+        offer = ks[ks["art"].isin(live) | (ks["key_size"] == 1)][["parent", "art", "size", "key_size"]]   # sizes the style comes in
+        sty = sp[["country", "parent", "cluster"]].drop_duplicates().merge(offer, on="parent")
+        sty = sty.merge(cc, on=["country", "cluster", "size"], how="left").merge(cg[["cluster", "size", "p_gcc"]],
+                                                                                   on=["cluster", "size"], how="left")
+        sty[["ucc", "p_gcc"]] = sty[["ucc", "p_gcc"]].fillna(0)
+        g = sty.groupby(["country", "parent"])
+        ncc = sty.merge(vol.rename("ncc").reset_index(), on=["country", "cluster"], how="left")["ncc"].fillna(0).to_numpy()
+        p_g = (sty["p_gcc"] / g["p_gcc"].transform("sum").replace(0, np.nan)).fillna(1 / g["size"].transform("count"))
+        p_c = (sty["ucc"] / g["ucc"].transform("sum").replace(0, np.nan)).fillna(p_g)
+        w = ncc / (ncc + CLUSTER_K)
+        sty["size_share"] = w * p_c + (1 - w) * p_g
+        sty["size_share"] = sty["size_share"] / sty.groupby(["country", "parent"])["size_share"].transform("sum")
+        lines = sp.merge(sty[["country", "parent", "art", "size", "size_share", "key_size"]], on=["country", "parent"])
         lines["demand"] = lines["demand_cover"] * lines["size_share"]
-        lines = lines.merge(ks[["art", "key_size"]], on="art", how="left")
-        log.say("curator", "tool", "size curve per style and country (26 weeks of size sales) · 1 facing per key size")
+        crv = cc.merge(vol.rename("ncc").reset_index(), on=["country", "cluster"]).merge(cg[["cluster", "size", "p_gcc"]], on=["cluster", "size"])
+        wc = crv["ncc"] / (crv["ncc"] + CLUSTER_K)
+        crv["share"] = wc * crv["ucc"] / crv["ncc"] + (1 - wc) * crv["p_gcc"]
+        out["size_curve"] = crv[["country", "cluster", "size", "ucc", "share"]].rename(columns={"ucc": "units_26w"})
+        log.say("curator", "tool", f"size curve per country × cluster (26 weeks of size sales), leaning on the GCC curve "
+                                   f"below {CLUSTER_K} units · kept to the sizes each style comes in · 1 facing per key size")
+        log.say("curator", "hold", f"{len(thin)} thin country × clusters (< {THIN_UNITS} units in 26 weeks, "
+                                   f"{thin.sum() / max(vol.sum(), 1) * 100:.1f}% of units) borrow the GCC size curve")
         log.say("curator", "out", f"{len(lines):,} store × size lines")
 
     # 8 · Stock checker — net of ATP + in-transit
@@ -633,7 +667,7 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         lines["need"] = np.maximum(0, np.ceil(lines["target"] - have - 1e-9)).astype(int)
         old_need = np.ceil(np.maximum(0, np.maximum(lines["demand"], key) - have) - 1e-9)
         dropped = (old_need > 0) & (lines["need"] == 0)
-        log.say("stock", "tool", "read effective_stock (ATP today) + store_intransit")
+        log.say("stock", "tool", "read ATP (latest snapshot) + in-transit for every Nike store")
         log.say("stock", "tool", f"stock per size = units covering {SERVICE_LEVEL:.0%} of 14-day outcomes (negative binomial) · "
                                  "at least 1 per key size")
         log.say("stock", "hold", f"{int(dropped.sum()):,} sizes a rounded-up average would have filled have under "
@@ -665,7 +699,7 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
                                   np.where(need["alloc_qty"] > 0, "Part-allocated",
                                            np.where(need["country"].isin(list(dmap)), "No DC stock", "No DC for country")))
-        out["allocation"] = need[["country", "store", "store_name", "grade", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
+        out["allocation"] = need[["country", "store", "store_name", "grade", "cluster", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
         log.say("allocator", "tool", "DC pools: primary first (KSA / BAH), then the shared UAE hub · priority grade, then demand")
