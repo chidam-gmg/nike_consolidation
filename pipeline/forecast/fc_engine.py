@@ -9,6 +9,10 @@
    The champions are also scored per volume band (units a week) against the pure-chance floor (Poisson error with a
    perfect rate), and the spread each band needs is fitted as a negative binomial: variance = mean + alpha x mean^2
    (sales swing more than Poisson, and more so the bigger the style).
+   Calibration — the contest scores units missed, which rewards forecasting ~0 for styles that sell now and then, so
+   a monotone (isotonic) map from forecast to what such forecasts actually sold is learned on the backtest weeks and
+   applied to slow forecasts (under 0.25 a week, faded out by 0.5); checked on the latest cut-off with the map fitted
+   only on the earlier ones.
 3. Forecast — style x country, 8 weeks ahead, P50 = champion level, P80 = negative-binomial 80th percentile,
    plus the chance of selling at least one unit each week.
 4. Allocation — 2 weeks of forecast -> store (store share of the style in its country) -> size (country size curve)
@@ -36,6 +40,9 @@ GRADE_RANK = {"BEACON": 0, "JORDAN": 0, "A+": 1, "A": 2, "B": 3, "C": 4, "NVS": 
 METHODS = ("MA4", "MA12", "SES", "CROSTON_SBA", "TSB")
 SERVICE_LEVEL = 0.80              # store x size stock covers 80% of 14-day outcomes
 BAND_EDGES = (0.25, 1, 3, 10)     # forecast units a week, style x country
+CAL_FADE = (0.25, 0.5)            # calibration applies in full below 0.25 a week, fades out by 0.5 a week: the
+                                  # under-forecast of slow styles is the same at every cut-off; above it the sign flips
+                                  # cut-off to cut-off (timing, not a pattern), so the forecast is left alone
 BAND_NAMES = ("Under 0.25 a week", "0.25-1 a week", "1-3 a week", "3-10 a week", "10+ a week")
 
 
@@ -77,6 +84,35 @@ def nb_quantile(mu, alpha, q):
     z = NormalDist().inv_cdf(q)
     big = np.ceil(mu + z * np.sqrt(v * mu))
     return np.where(mu <= 0, 0, np.where(small & (res >= 0), res, big)).astype(int)
+
+
+def fit_calibration(pairs, bins=60):
+    """Monotone map forecast -> mean actual, learned from backtest weeks (isotonic regression on forecast bins).
+    The contest picks winners on units missed, which rewards forecasting ~0 for styles that sell now and then;
+    this puts the level back to what such forecasts actually went on to sell."""
+    f = np.concatenate([x for x, _ in pairs]); a = np.concatenate([x for _, x in pairs])
+    order = np.argsort(f); f, a = f[order], a[order]
+    idx = np.minimum(np.arange(len(f)) * bins // max(len(f), 1), bins - 1)    # equal-count bins
+    blocks = []                                                                # [weight, sum actual, sum forecast]
+    for i in range(bins):
+        k = idx == i
+        if k.any():
+            blocks.append([float(k.sum()), float(a[k].sum()), float(f[k].sum())])
+            while len(blocks) > 1 and blocks[-2][1] / blocks[-2][0] > blocks[-1][1] / blocks[-1][0]:
+                last = blocks.pop()
+                blocks[-1] = [x + y for x, y in zip(blocks[-1], last)]
+    return np.array([b[2] / b[0] for b in blocks]), np.array([b[1] / b[0] for b in blocks])
+
+
+def apply_calibration(f, cal):
+    """Piecewise-linear between knots, proportional below the first; faded to the raw forecast over CAL_FADE;
+    zero stays zero."""
+    xs, ys = cal
+    f = np.asarray(f, float)
+    g = np.interp(f, xs, ys)
+    g = np.where(f < xs[0], f * ys[0] / max(xs[0], 1e-9), g)
+    w = np.clip((f - CAL_FADE[0]) / (CAL_FADE[1] - CAL_FADE[0]), 0, 1)
+    return np.where(f > 0, (1 - w) * g + w * f, 0.0)
 
 
 def poisson_mad(lam):
@@ -430,15 +466,19 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             mask = np.where(np.isnan(a_t), True, a_t >= 0.8) & (cls != "inactive")[:, None]
             obs.append((back, fw, y[:, cut:cut + BACKTEST_H], mask, band_of(fw.mean(axis=1))))
         hold = min(BACKTEST_CUTOFFS)
-
+        pairs = lambda sel: [(fw[k], a[k]) for back, fw, a, mask, _ in obs if sel(back) for k in [mask & (fw > 0)]]
+        cal_fit, cal = fit_calibration(pairs(lambda bk: bk != hold)), fit_calibration(pairs(lambda bk: True))
+        view = lambda c: [(back, fw2, a, mask, band_of(fw2.mean(axis=1)))
+                          for back, fw, a, mask, _ in obs for fw2 in [apply_calibration(fw, c)]]
+        obs_fit, obs_all = view(cal_fit), view(cal)
         lgam = np.frompyfunc(math.lgamma, 1, 1)
         grid = np.concatenate([[0.0], np.geomspace(0.01, 20, 40)])
 
-        def _disp(sel):
+        def _disp(data, sel):
             """Maximum-likelihood alpha per band on a grid (moments would be driven by a few big misses)."""
             alpha = np.zeros(len(BAND_NAMES))
             for b in range(len(BAND_NAMES)):
-                ks = [(fw[k], a[k]) for back, fw, a, mask, band in obs if sel(back)
+                ks = [(fw[k], a[k]) for back, fw, a, mask, band in data if sel(back)
                       for k in [mask & (band == b)[:, None] & (fw > 0)]]
                 mu = np.concatenate([x for x, _ in ks]); yv = np.concatenate([x for _, x in ks])
                 if len(mu) == 0:
@@ -454,28 +494,36 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                                    + r * np.log(r / (r + mu)) + yv * np.log(mu / (r + mu))).sum())
                 alpha[b] = grid[int(np.argmax(ll))]
             return alpha
-        v_fit, disp = _disp(lambda b: b != hold), _disp(lambda b: True)
+        v_fit, disp = _disp(obs_fit, lambda bk: bk != hold), _disp(obs_all, lambda bk: True)
+
+        # Scorecard: error + chance floor over all cut-offs (final, calibrated forecasts); bias, chance-to-sell and P80
+        # coverage on the latest cut-off with calibration + alpha fitted only on the earlier ones (out of sample).
         cat = lambda xs: np.concatenate(xs) if xs else np.array([])
         mean = lambda xs: float(cat(xs).mean()) if len(cat(xs)) else np.nan
+        raw_hold = next(fw for back, fw, _, _, _ in obs if back == hold)
+        _, fwh, ah, mh, bh = next(o for o in obs_fit if o[0] == hold)
         brow = []
         for b, name in enumerate(BAND_NAMES):
             F4 = A4 = err = floor = 0.0
-            nser, ps_pred, ps_act, cov_nb, cov_old = 0, [], [], [], []
-            for back, fw, a, mask, band in obs:
+            for back, fw, a, mask, band in obs_all:
                 k = band == b
                 f4, a4 = (fw * mask)[k].sum(axis=1), (a * mask)[k].sum(axis=1)     # 4-week totals, as the contest scores
                 F4 += f4.sum(); A4 += a4.sum(); err += np.abs(f4 - a4).sum(); floor += poisson_mad(f4).sum()
-                kk = mask & k[:, None]                                            # weekly, for chance-to-sell + P80
-                ps_pred.append(1 - nb_p0(fw[kk], disp[b])); ps_act.append(a[kk] >= 1)
-                if back == hold:
-                    nser = int(k.sum())
-                    cov_nb.append(a[kk] <= nb_quantile(fw[kk], v_fit[b], 0.8))
-                    cov_old.append(a[kk] <= fw[kk] + 0.84 * np.sqrt(fw[kk]))
-            brow.append({"band": name, "band_order": b, "series": nser, "actual_units": float(A4),
+            k = bh == b
+            kk = mh & k[:, None]                                                  # weekly, latest cut-off
+            ah_k = (ah * mh)[k].sum()
+            brow.append({"band": name, "band_order": b, "series": int(k.sum()), "actual_units": float(A4),
                          "error": err / A4 if A4 else np.nan, "chance_floor": floor / F4 if F4 else np.nan,
                          "bias": F4 / A4 - 1 if A4 else np.nan, "nb_alpha": round(float(disp[b]), 3),
-                         "p_sell_predicted": mean(ps_pred), "p_sell_actual": mean(ps_act),
-                         "p80_coverage": mean(cov_nb), "p80_coverage_old": mean(cov_old)})
+                         "bias_before": (raw_hold * mh)[k].sum() / ah_k - 1 if ah_k else np.nan,
+                         "bias_after": (fwh * mh)[k].sum() / ah_k - 1 if ah_k else np.nan,
+                         "p_sell_before": float((1 - nb_p0(raw_hold[kk], v_fit[b])).mean()) if kk.any() else np.nan,
+                         "p_sell_predicted": float((1 - nb_p0(fwh[kk], v_fit[b])).mean()) if kk.any() else np.nan,
+                         "p_sell_actual": float((ah[kk] >= 1).mean()) if kk.any() else np.nan,
+                         "p80_coverage": float((ah[kk] <= nb_quantile(fwh[kk], v_fit[b], 0.8)).mean()) if kk.any() else np.nan,
+                         "p80_coverage_old": float((ah[kk] <= raw_hold[kk] + 0.84 * np.sqrt(raw_hold[kk])).mean())
+                         if kk.any() else np.nan})
+        out["calibration"] = pd.DataFrame({"forecast": cal[0], "calibrated": cal[1]})
         eb = pd.DataFrame(brow)
         eb["unit_share"] = eb["actual_units"] / eb["actual_units"].sum()
         out["error_bands"] = eb
@@ -487,6 +535,10 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                                        / slow["actual_units"].sum())
         w_cov = lambda c: float((eb[c] * eb["actual_units"]).sum() / eb["actual_units"].sum())
         out["p80_coverage"], out["p80_coverage_old"] = w_cov("p80_coverage"), w_cov("p80_coverage_old")
+        log.say("tournament", "tool", f"calibration: forecast → what such forecasts sold (isotonic, {len(cal[0])} knots), "
+                                      f"applied under {CAL_FADE[0]} a week, faded out by {CAL_FADE[1]} · bias on the latest "
+                                      f"cut-off (map fitted without it): " + " · ".join(
+            f"{r['band']} {r['bias_before']*100:+.0f}% → {r['bias_after']*100:+.0f}%" for _, r in eb.iterrows()))
         log.say("tournament", "out", "by volume: " + " · ".join(
             f"{r['band']} {r['error']*100:.0f}% (chance alone {r['chance_floor']*100:.0f}%)" for _, r in eb.iterrows()))
         log.say("tournament", "hold", f"styles selling 3+ a week ({fast['unit_share'].sum()*100:.0f}% of units): error "
@@ -506,7 +558,8 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             m, v = (champ.loc[c, "method"], champ.loc[c, "variant"]) if c in champ.index else ("MA12", "flat")
             k = cls == c
             lv[k] = level(src[v][k], m); meth[k] = m; var[k] = v
-        fut = np.where((var == "flat")[:, None], 1.0, Fser[:, T:]) * lv[:, None]
+        fut_raw = np.where((var == "flat")[:, None], 1.0, Fser[:, T:]) * lv[:, None]
+        fut = apply_calibration(fut_raw, cal)                                   # back to what such forecasts actually sold
         a_ser = disp[band_of(fut.mean(axis=1))][:, None] * np.ones_like(fut)
         p80 = nb_quantile(fut, a_ser, 0.8)
         p_sell = 1 - nb_p0(fut, a_ser)
@@ -515,9 +568,10 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
             if lv[i] <= 0:
                 continue
             for h in range(HORIZON_WEEKS):
-                fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3), float(p80[i, h]),
+                fc_rows.append((country, parent, all_weeks[T + h].date(), round(float(fut[i, h]), 3),
+                                round(float(fut_raw[i, h]), 3), float(p80[i, h]),
                                 round(float(p_sell[i, h]), 3), meth[i], var[i], cls[i], BAND_NAMES[band_of(fut[i].mean())]))
-        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_p80", "p_sell", "method",
+        fc = pd.DataFrame(fc_rows, columns=["country", "parent", "week_start", "units_p50", "units_model", "units_p80", "p_sell", "method",
                                             "variant", "demand_class", "volume_band"])
         fc = fc.merge(meta.reset_index(), on=["country", "parent"], how="left")
         out["forecast"], out["history"] = fc, weekly

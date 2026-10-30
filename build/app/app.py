@@ -732,11 +732,16 @@ elif ss.run_state == "results":
                            "forecast week by week — even a perfect rate leaves the error under 'Chance alone'. Judge slow "
                            "styles on whether the predicted chance of selling matches reality, and fast styles on the gap "
                            "between error and chance: that gap is what better inputs (price, launches, ranging) can close. "
-                           "'High case covers' = share of weeks sales stayed at or below P80 (aim 80%).")
+                           "Slow styles were forecast too low at every cut-off (the contest rewards forecasting ~0 for "
+                           "styles that sell now and then), so forecasts under 0.25 a week are corrected to what such "
+                           "forecasts actually sold. Bias, chance to sell and high-case cover are checked on the latest "
+                           "cut-off with the correction learned only from earlier ones. 'High case covers' = share of "
+                           "weeks sales stayed at or below P80 (aim 80%).")
                 _p = lambda c: (pd.to_numeric(_eb[c], errors="coerce") * 100).round(0)
                 st.dataframe(pd.DataFrame({
                     "Units a week (style × country)": _eb["band"], "Styles": pd.to_numeric(_eb["series"], errors="coerce"),
                     "Share of units %": _p("unit_share"), "Error %": _p("error"), "Chance alone %": _p("chance_floor"),
+                    **({"Bias before %": _p("bias_before"), "Bias after %": _p("bias_after")} if "bias_after" in _eb else {}),
                     "Chance to sell: predicted %": _p("p_sell_predicted"), "Chance to sell: actual %": _p("p_sell_actual"),
                     "High case covers %": _p("p80_coverage")}), hide_index=True, use_container_width=True)
 
