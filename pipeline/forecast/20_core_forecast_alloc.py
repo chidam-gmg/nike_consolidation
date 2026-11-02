@@ -143,6 +143,7 @@ BACKTEST_H = 4
 COVER_DAYS = 14
 GRADE_RANK = {"BEACON": 0, "JORDAN": 0, "A+": 1, "A": 2, "B": 3, "C": 4, "NVS": 5}
 METHODS = ("MA4", "MA12", "SES", "CROSTON_SBA", "TSB")
+SEASONAL_MARGIN = 0.01            # flat must beat the best seasonal variant by > 1 pt of error to be chosen
 CLUSTER = ("division", "category", "gender")   # product cluster (AH2 = category): size curves are learned here
 STORE_CLUSTER = ("division", "gender")          # the same cluster one level up: store shares are learned here
                                                 # (back-test 2026-10-30: 35.8% store x size error vs 42.3% style-level)
@@ -532,8 +533,19 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         bt = pd.DataFrame(rows)
         board = bt.groupby(["demand_class", "method", "variant"]).agg(wape=("wape", "mean"), bias=("bias", "mean"),
                                                                       actual_units=("actual_units", "sum")).reset_index()
-        champ = (board.dropna(subset=["wape"]).sort_values(["demand_class", "wape"])
-                 .groupby("demand_class").head(1).set_index("demand_class"))
+        # Seasonal is kept unless flat wins by more than SEASONAL_MARGIN: the back-test weeks hold no major event, so
+        # the contest cannot reward event / season handling, and a near-tie would otherwise flatten the forecast.
+        picks = []
+        for c, g in board.dropna(subset=["wape"]).sort_values("wape").groupby("demand_class"):
+            top = g.iloc[0]
+            seas = g[g["variant"] != "flat"]
+            if top["variant"] == "flat" and len(seas) and seas.iloc[0]["wape"] - top["wape"] <= SEASONAL_MARGIN:
+                log.say("tournament", "hold", f"{c}: flat leads by only {(seas.iloc[0]['wape'] - top['wape'])*100:.1f} pt — "
+                                              "seasonal kept (test weeks hold no major event)")
+                top = seas.iloc[0]
+            picks.append(top.rename(c))
+        champ = pd.DataFrame(picks).drop(columns="demand_class")
+        champ.index.name = "demand_class"
         base = board[(board["method"] == "MA12") & (board["variant"] == "flat")].set_index("demand_class")
         flat_best = board[board["variant"] == "flat"].sort_values("wape").groupby("demand_class").head(1).set_index("demand_class")
         seas_best = board[board["variant"] == "seasonal"].sort_values("wape").groupby("demand_class").head(1).set_index("demand_class")
@@ -809,6 +821,17 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
                                   "cover_units", "store_share", "size_share", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
+        # full size run (every size, including ones already covered or not needed) for each store x style with a line,
+        # so a store's whole pack can be shown: what it should hold, what it has, what is sent
+        keys = need[["store", "parent"]].drop_duplicates()
+        sr = lines.merge(keys, on=["store", "parent"]).merge(need[["store", "art", "alloc_qty", "source", "status"]],
+                                                             on=["store", "art"], how="left")
+        sr["alloc_qty"] = sr["alloc_qty"].fillna(0).astype(int)
+        sr["status"] = sr["status"].fillna(pd.Series(np.where(sr["target"] > 0, "Covered", "Not needed (low chance)"), index=sr.index))
+        sr = sr.merge(need[["parent", "style_name"]].drop_duplicates("parent"), on="parent", how="left")
+        out["size_run"] = sr[["country", "store", "store_name", "grade", "cluster", "parent", "style_name", "art", "size",
+                              "key_size", "cover_units", "store_share", "size_share", "demand", "p_sell", "target", "atp",
+                              "intransit", "need", "alloc_qty", "source", "status"]]
         log.say("allocator", "tool", "DC pools: primary first (KSA / BAH), then the shared UAE hub · priority grade, then demand")
         log.say("allocator", "out", f"{int((a['alloc_qty'] > 0).sum()):,} lines · {int(a['alloc_qty'].sum()):,} units allocated · "
                                     f"{int((a['status'] == 'No DC stock').sum()):,} sizes with no DC stock")
@@ -855,6 +878,7 @@ save(hist, "fc_history")
 save(o["backtest"], "fc_backtest")
 save(o["leaderboard"], "fc_leaderboard")
 save(o["allocation"], "al_allocation")
+save(o["size_run"], "al_size_run")
 save(o["seasonality"], "fc_seasonality")
 save(o["events"], "fc_events")
 save(o["event_uplift"], "fc_event_uplift")

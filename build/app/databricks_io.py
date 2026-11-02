@@ -610,6 +610,19 @@ def load_fc_calendar_div(division: str, country: str | None) -> pd.DataFrame:
                        GROUP BY week_start ORDER BY week_start""")
 
 
+def load_story_options() -> pd.DataFrame:
+    """Store x style pairs in the plan, with units to send and units wanted but not in any DC."""
+    return run_sql(f"""SELECT country, store, MAX(store_name) store_name, parent, MAX(style_name) style_name,
+                       MAX(cluster) cluster, CAST(SUM(alloc_qty) AS INT) send,
+                       CAST(SUM(GREATEST(need - alloc_qty, 0)) AS INT) short FROM {FQ}.al_size_run
+                       GROUP BY country, store, parent ORDER BY send DESC""")
+
+
+def load_size_run(store: str, parent: str) -> pd.DataFrame:
+    s, p = str(store).replace("'", "''"), str(parent).replace("'", "''")
+    return run_sql(f"SELECT * FROM {FQ}.al_size_run WHERE store = '{s}' AND parent = '{p}'")
+
+
 def load_al_allocation() -> pd.DataFrame:
     return run_sql(f"""SELECT run_id, country, store, store_name, grade, cluster, parent, style_name, art, size,
                        ROUND(cover_units, 1) style_fc_14d, ROUND(store_share * 100, 1) store_share_pct,

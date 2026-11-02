@@ -16,6 +16,7 @@ import streamlit as st
 import databricks_io as dbio
 import agent_view
 import forecast_view
+import story_view
 
 # DEV preview (separate Databricks app, APP_MODE=dev): read-only — no runs, no config writes, so it can sit on
 # live data without ever touching the shared config tables or triggering the production job.
@@ -115,6 +116,16 @@ def get_fc_agg(level, value, country):
 @st.cache_data(show_spinner=False, ttl=300)
 def get_fc_calendar_div(division, country):
     return dbio.load_fc_calendar_div(division, country)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_story_options():
+    return dbio.load_story_options()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_size_run(store, parent):
+    return dbio.load_size_run(store, parent)
 
 
 @st.cache_data(show_spinner=False)
@@ -741,6 +752,36 @@ elif ss.run_state == "results":
                                  {"store_styles": _num(_at["store_styles"]), "size_lines": _num(_at["need_lines"]),
                                   "need_lines": _num(_at["need_lines"]), "lines": _num(_at["lines"]), "units": _num(_at["units"])},
                                  signoff=_so, theme=THEME)
+
+            st.markdown("##### Store walkthrough")
+            st.caption("One store and style, start to finish: the forecast, the pack the store should hold, what it has, "
+                       "and what to send.")
+            try:
+                _so_opt = get_story_options()
+                _so_opt["send"] = pd.to_numeric(_so_opt["send"], errors="coerce").fillna(0).astype(int)
+                _so_opt["short"] = pd.to_numeric(_so_opt["short"], errors="coerce").fillna(0).astype(int)
+                _st_tot = (_so_opt.groupby(["store", "store_name", "country"])["send"].sum()
+                           .reset_index().sort_values("send", ascending=False))
+                _st_lbl = [f"{r.store_name.title()} · {r.country} · {r.send:,} to send" for r in _st_tot.itertuples()]
+                _wc = st.columns([1, 1.4])
+                _st_def = next((i for i, r in enumerate(_st_tot.itertuples()) if r.store == "1172"), 0)
+                _st_pick = _st_tot.iloc[_st_lbl.index(_wc[0].selectbox("Store", _st_lbl, index=_st_def, key="wk_store",
+                                                                        label_visibility="collapsed"))]
+                _sty_o = _so_opt[_so_opt["store"] == _st_pick["store"]].sort_values(["send", "short"], ascending=False)
+                _sty_lbl = [f"{(r.style_name or r.parent).title()} · {r.parent} · " +
+                            (f"send {r.send}" if r.send else f"{r.short} wanted, DC empty") for r in _sty_o.itertuples()]
+                _sty_def = next((i for i, r in enumerate(_sty_o.itertuples()) if r.parent == "NKCW2288-111"), 0)
+                _sty_pick = _sty_o.iloc[_sty_lbl.index(_wc[1].selectbox("Style", _sty_lbl, index=_sty_def, key="wk_style",
+                                                                         label_visibility="collapsed"))]
+                _sr = get_size_run(_st_pick["store"], _sty_pick["parent"])
+                _ser = get_fc_series(_st_pick["country"], _sty_pick["parent"])
+                _calw = get_fc_calendar(_st_pick["country"], _sty_pick["parent"])
+                _evs = ({str(pd.Timestamp(k).date()): v for k, v in zip(_calw["week_start"], _calw["events"].fillna(""))}
+                        if not _calw.empty else {})
+                story_view.render(_sr, _ser, _evs, theme=THEME)
+            except Exception as e:
+                st.info(f"Store walkthrough unavailable: {e}")
+
 
             st.markdown("##### Model contest")
             st.caption("Each model learned from all sales since March 2024, then forecast the 4 weeks after 3 past cut-off "
