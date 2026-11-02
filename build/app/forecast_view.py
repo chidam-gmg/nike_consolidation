@@ -31,6 +31,14 @@ def _n(v):
         return "—"
 
 
+def _run_label(summary: dict) -> str:
+    try:
+        t = pd.Timestamp(summary.get("run_ts")).tz_convert("Asia/Dubai")
+        return f"{t.day} {t:%b %Y}, {t:%H:%M} GST"
+    except Exception:
+        return ""
+
+
 def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboard: pd.DataFrame,
             forecast_series: int, next_week_units: float, alloc: dict, signoff: dict | None = None) -> dict:
     st = {}
@@ -50,9 +58,16 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
     ev.sort(key=lambda e: e["ts"])
     err_c, err_b = float(summary.get("error_champion", 0)), float(summary.get("error_baseline", 0))
     end = max([v["end"] for v in st.values()] or [0])
+    fc_end = st.get("forecast", {}).get("end")
     kpis = [
-        {"k": "Styles forecast", "v": _n(forecast_series), "at": st.get("forecast", {}).get("end")},
-        {"k": "Next week (P50)", "v": _n(next_week_units), "at": st.get("forecast", {}).get("end")},
+        {"k": "Demand · next 2 weeks", "v": _n(alloc.get("next_2w", next_week_units)), "at": fc_end},
+        {"k": "Units to send", "v": _n(alloc.get("units")), "at": end},
+        {"k": "Stores served", "v": f"{_n(alloc.get('stores_sent'))} of {_n(summary.get('scope_stores'))}", "at": end},
+        {"k": "Wanted · no DC stock", "v": _n(alloc.get("short_units")), "at": end},
+        {"k": "Lines to decide", "v": _n(signoff["to_decide"] if signoff else alloc.get("lines")), "at": end, "accent": True},
+    ] if alloc.get("short_units") is not None else [
+        {"k": "Styles forecast", "v": _n(forecast_series), "at": fc_end},
+        {"k": "Next week (P50)", "v": _n(next_week_units), "at": fc_end},
         {"k": "Error, 3+ a week", "v": f"{float(summary['error_fast'])*100:.0f}% (chance {float(summary['floor_fast'])*100:.0f}%)",
          "at": st.get("tournament", {}).get("end")} if summary.get("error_fast") not in (None, "", "nan") else
         {"k": "Forecast error", "v": f"{err_c*100:.0f}% (flat {float(summary.get('error_flat_best', 0))*100:.0f}%)",
@@ -61,7 +76,7 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
         {"k": "Lines to decide", "v": _n(signoff["to_decide"] if signoff else alloc.get("lines")), "at": end, "accent": True},
     ]
     return {"agents": AGENTS, "stages": st, "edges": edges, "events": ev, "kpis": kpis, "have_timings": bool(st),
-            "has": True, "run_id": summary.get("run_id", ""), "who": "forecast job",
+            "has": True, "run_id": summary.get("run_id", ""), "who": "forecast job", "run_label": _run_label(summary),
             "scope": (f"CORE · {_n(summary.get('scope_countries'))} countries · {_n(summary.get('scope_stores'))} stores"
                       if summary.get("scope_stores") not in (None, "", "nan") else "CORE · all countries"),
             "colw": 150, "cw": 1520,
@@ -71,5 +86,7 @@ def payload(stages: pd.DataFrame, events: pd.DataFrame, summary: dict, leaderboa
             "human_cls": "done" if signoff and not signoff["to_decide"] and not signoff["with_manager"] else "await"}
 
 
-def render(*args, theme="light", **kw):
-    agent_view.render_flow(payload(*args, **kw), theme=theme, height=984)
+def render(*args, theme="light", show_log=True, **kw):
+    p = payload(*args, **kw)
+    p["show_log"] = show_log
+    agent_view.render_flow(p, theme=theme, height=984 if show_log else 626)

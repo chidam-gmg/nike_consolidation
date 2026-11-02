@@ -539,10 +539,14 @@ def load_fc_run() -> dict:
            "events": run_sql(f"SELECT * FROM {FQ}.fc_run_events"),
            "leaderboard": run_sql(f"SELECT * FROM {FQ}.fc_leaderboard"),
            "fc_tot": run_sql(f"""SELECT COUNT(DISTINCT country || parent) series,
-                                  SUM(CASE WHEN week_start = (SELECT MIN(week_start) FROM {FQ}.fc_forecast) THEN units_p50 END) next_week
+                                  SUM(CASE WHEN week_start = (SELECT MIN(week_start) FROM {FQ}.fc_forecast) THEN units_p50 END) next_week,
+                                  SUM(CASE WHEN week_start <= date_add((SELECT MIN(week_start) FROM {FQ}.fc_forecast), 7)
+                                           THEN units_p50 END) next_2w
                                   FROM {FQ}.fc_forecast"""),
            "al_tot": run_sql(f"""SELECT COUNT(DISTINCT store || parent) store_styles, COUNT(*) need_lines,
-                                  SUM(CASE WHEN alloc_qty > 0 THEN 1 ELSE 0 END) lines, SUM(alloc_qty) units
+                                  SUM(CASE WHEN alloc_qty > 0 THEN 1 ELSE 0 END) lines, SUM(alloc_qty) units,
+                                  SUM(GREATEST(need - alloc_qty, 0)) short_units,
+                                  COUNT(DISTINCT CASE WHEN alloc_qty > 0 THEN store END) stores_sent
                                   FROM {FQ}.al_allocation""")}
     try:
         out["bands"] = run_sql(f"SELECT * FROM {FQ}.fc_error_bands ORDER BY band_order")

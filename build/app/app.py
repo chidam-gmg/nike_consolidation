@@ -747,11 +747,16 @@ elif ss.run_state == "results":
                 _so = {k: int((_rec_all["Sign-off"] == v).sum()) for k, v in
                        [("to_decide", "To decide"), ("approved", "Approved"), ("with_manager", "Awaiting line manager"),
                         ("change_approved", "Change approved"), ("change_declined", "Change declined")]}
+            _bh = st.columns([5, 1.3], vertical_alignment="center")
+            _bh[0].markdown("##### Forecast and allocation agents")
+            _show_log = _bh[1].toggle("Show run log", key="fc_log", help="The step-by-step log each agent wrote during the run")
             forecast_view.render(_fr["stages"], _fr["events"], _sm, _fr["leaderboard"], int(_num(_ft["series"])),
                                  _num(_ft["next_week"]),
                                  {"store_styles": _num(_at["store_styles"]), "size_lines": _num(_at["need_lines"]),
-                                  "need_lines": _num(_at["need_lines"]), "lines": _num(_at["lines"]), "units": _num(_at["units"])},
-                                 signoff=_so, theme=THEME)
+                                  "need_lines": _num(_at["need_lines"]), "lines": _num(_at["lines"]), "units": _num(_at["units"]),
+                                  "next_2w": _num(_ft.get("next_2w")), "short_units": _num(_at.get("short_units")),
+                                  "stores_sent": _num(_at.get("stores_sent"))},
+                                 signoff=_so, theme=THEME, show_log=_show_log)
 
             st.markdown("##### Store walkthrough")
             st.caption("One store and style, start to finish: the forecast, the pack the store should hold, what it has, "
@@ -768,7 +773,7 @@ elif ss.run_state == "results":
                 _st_pick = _st_tot.iloc[_st_lbl.index(_wc[0].selectbox("Store", _st_lbl, index=_st_def, key="wk_store",
                                                                         label_visibility="collapsed"))]
                 _sty_o = _so_opt[_so_opt["store"] == _st_pick["store"]].sort_values(["send", "short"], ascending=False)
-                _sty_lbl = [f"{(r.style_name or r.parent).title()} · {r.parent} · " +
+                _sty_lbl = [f"{story_view.style_label(r.style_name or r.parent)} · {r.parent} · " +
                             (f"send {r.send}" if r.send else f"{r.short} wanted, DC empty") for r in _sty_o.itertuples()]
                 _sty_def = next((i for i, r in enumerate(_sty_o.itertuples()) if r.parent == "NKCW2288-111"), 0)
                 _sty_pick = _sty_o.iloc[_sty_lbl.index(_wc[1].selectbox("Style", _sty_lbl, index=_sty_def, key="wk_style",
@@ -782,104 +787,6 @@ elif ss.run_state == "results":
             except Exception as e:
                 st.info(f"Store walkthrough unavailable: {e}")
 
-
-            st.markdown("##### Model contest")
-            st.caption("Each model learned from all sales since March 2024, then forecast the 4 weeks after 3 past cut-off "
-                       "dates three ways: flat, with seasonality + events, and with seasonality + events on demand corrected "
-                       "for stock-outs (weeks where stores ran out are lifted, weeks with no stock anywhere are filled from "
-                       "recent demand). Scored only on weeks the style was well stocked, against what actually sold (error = "
-                       "units missed ÷ units sold). The lowest error per demand pattern wins — no model is fixed up front.")
-            _lb = _fr["leaderboard"].copy()
-            _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce") * 100
-            _lb = _lb[_lb["demand_class"] != "inactive"]
-            _MN = {"MA4": "4-wk avg", "MA12": "12-wk avg", "SES": "Smoothing", "CROSTON_SBA": "Croston", "TSB": "TSB"}
-            _rows = []
-            for _c, _g in _lb.groupby("demand_class"):
-                _w = _g[_g["champion"].astype(str).str.lower() == "true"]
-                _w = _w.iloc[0] if len(_w) else _g.sort_values("wape").iloc[0]
-                _rows.append({"Demand pattern": {"smooth": "Smooth (steady)", "erratic": "Erratic (jumpy volume)",
-                                                 "intermittent": "Intermittent (occasional)",
-                                                 "lumpy": "Lumpy (occasional, jumpy)"}.get(_c, _c),
-                              "Winner": f"{_MN.get(_w['method'], _w['method'])} · {_w['variant']}",
-                              "Winner error %": round(_w["wape"]),
-                              "Best stock-out corrected %": round(_g[_g["variant"] == "seasonal + stock-outs"]["wape"].min()),
-                              "Best seasonal %": round(_g[_g["variant"] == "seasonal"]["wape"].min()),
-                              "Best flat %": round(_g[_g["variant"] == "flat"]["wape"].min()),
-                              "12-wk average %": round(_g[(_g["method"] == "MA12") & (_g["variant"] == "flat")]["wape"].min())})
-            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
-
-            _eb = _fr.get("bands", pd.DataFrame())
-            if not _eb.empty:
-                st.markdown("##### Error by volume")
-                st.caption("One error number mixes very different styles. A style selling one unit a month cannot be "
-                           "forecast week by week — even a perfect rate leaves the error under 'Chance alone'. Judge slow "
-                           "styles on whether the predicted chance of selling matches reality, and fast styles on the gap "
-                           "between error and chance: that gap is what better inputs (price, launches, ranging) can close. "
-                           "Slow styles were forecast too low at every cut-off (the contest rewards forecasting ~0 for "
-                           "styles that sell now and then), so forecasts under 0.25 a week are corrected to what such "
-                           "forecasts actually sold. Bias, chance to sell and high-case cover are checked on the latest "
-                           "cut-off with the correction learned only from earlier ones. 'High case covers' = share of "
-                           "weeks sales stayed at or below P80 (aim 80%).")
-                _p = lambda c: (pd.to_numeric(_eb[c], errors="coerce") * 100).round(0)
-                st.dataframe(pd.DataFrame({
-                    "Units a week (style × country)": _eb["band"], "Styles": pd.to_numeric(_eb["series"], errors="coerce"),
-                    "Share of units %": _p("unit_share"), "Error %": _p("error"), "Chance alone %": _p("chance_floor"),
-                    **({"Bias before %": _p("bias_before"), "Bias after %": _p("bias_after")} if "bias_after" in _eb else {}),
-                    "Chance to sell: predicted %": _p("p_sell_predicted"), "Chance to sell: actual %": _p("p_sell_actual"),
-                    "High case covers %": _p("p80_coverage")}), hide_index=True, use_container_width=True)
-
-            st.markdown("##### Forecast explorer")
-            try:
-                _h = get_fc_hierarchy()
-                _h["units_8w"] = pd.to_numeric(_h["units_8w"], errors="coerce").fillna(0)
-                _xc = st.columns([1.1, 1.3, 2.6])
-                _lvl = _xc[0].selectbox("Level", ["Division", "Category (AH2)"], index=1, key="fc_lvl",
-                                        label_visibility="collapsed")
-                _ctry = _xc[1].selectbox("Country", ["All countries"] + sorted(_h["country"].dropna().unique()),
-                                         key="fc_ctry", label_visibility="collapsed")
-                _hc = _h if _ctry == "All countries" else _h[_h["country"] == _ctry]
-                _key = "division" if _lvl.startswith("Division") else "category"
-                _opts = _hc.groupby(_key)["units_8w"].sum().sort_values(ascending=False)
-                _val = _xc[2].selectbox(_lvl, [f"{k} · {v:,.0f} units next 8 weeks" for k, v in _opts.items()],
-                                        key=f"fc_val_{_key}", label_visibility="collapsed").split(" · ")[0]
-                _cc = None if _ctry == "All countries" else _ctry
-                _ser = get_fc_agg(_key, _val, _cc)
-                for _c in ("units", "p50", "p80"):
-                    _ser[_c] = pd.to_numeric(_ser[_c], errors="coerce")
-                _ser["wk"] = pd.to_datetime(_ser["wk"])
-                st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
-                              height=260)
-                st.caption(f"Weekly units for {_val.title()} in {_ctry.lower() if _cc is None else _ctry}: actual for the last "
-                           "52 weeks, then the 8-week forecast — the sum of every CORE style's forecast in the group "
-                           "(P50 = most likely; P80 = high case for the group as a whole, from the styles' combined "
-                           "spread). The forecast follows the seasonality and events below.")
-                _div = _val if _key == "division" else (_hc[_hc["category"] == _val].sort_values("units_8w")["division"].iloc[-1]
-                                                        if (_hc["category"] == _val).any() else None)
-                _cal = get_fc_calendar_div(_div, _cc) if _div else pd.DataFrame()
-                if not _cal.empty:
-                    for _c in ("season_factor", "factor"):
-                        _cal[_c] = pd.to_numeric(_cal[_c], errors="coerce")
-                    _cal["week_start"] = pd.to_datetime(_cal["week_start"])
-                    st.line_chart(_cal.set_index("week_start")[["season_factor", "factor"]]
-                                  .rename(columns={"season_factor": "Seasonality", "factor": "Seasonality × events"}), height=180)
-                    _up = _cal[(_cal["week_start"] > pd.Timestamp.now()) & (_cal["events"].fillna("") != "")]
-                    st.caption(f"Index 1.0 = an average week for {str(_div).title()}"
-                               f"{'' if _cc else ' (average across countries)'}. Upcoming: " +
-                               ("; ".join(f"week of {d:%d %b} — {e}" for d, e in zip(_up["week_start"], _up["events"]))
-                                if len(_up) else "no events in the next 8 weeks."))
-            except Exception as e:
-                st.info(f"Forecast explorer unavailable: {e}")
-
-            st.markdown("##### Events calendar")
-            st.caption("Events the forecast accounts for, with the lift each showed in past CORE sales (×1.20 = 20% above a "
-                       "normal week). Islamic holiday dates follow the moon sighting and Dubai Shopping Festival dates are "
-                       "announced each year — business should confirm them.")
-            try:
-                _ev = get_fc_events()
-                st.dataframe(_ev.rename(columns={"event": "Event", "start": "Start", "end": "End", "lift": "Past lift (×)"}),
-                             hide_index=True, use_container_width=True, height=300)
-            except Exception as e:
-                st.info(f"Events calendar unavailable: {e}")
 
             st.markdown("##### Allocation plan")
             st.caption("Forecast for the next 14 days (with seasonality + events) → split to stores and sizes by product "
@@ -1038,6 +945,106 @@ elif ss.run_state == "results":
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Could not save manager decisions: {e}")
+
+            st.markdown("")
+            with st.expander("Forecast quality and model detail · for analysts", expanded=False):
+                st.markdown("##### Model contest")
+                st.caption("Each model learned from all sales since March 2024, then forecast the 4 weeks after 3 past cut-off "
+                           "dates three ways: flat, with seasonality + events, and with seasonality + events on demand corrected "
+                           "for stock-outs (weeks where stores ran out are lifted, weeks with no stock anywhere are filled from "
+                           "recent demand). Scored only on weeks the style was well stocked, against what actually sold (error = "
+                           "units missed ÷ units sold). The lowest error per demand pattern wins — no model is fixed up front.")
+                _lb = _fr["leaderboard"].copy()
+                _lb["wape"] = pd.to_numeric(_lb["wape"], errors="coerce") * 100
+                _lb = _lb[_lb["demand_class"] != "inactive"]
+                _MN = {"MA4": "4-wk avg", "MA12": "12-wk avg", "SES": "Smoothing", "CROSTON_SBA": "Croston", "TSB": "TSB"}
+                _rows = []
+                for _c, _g in _lb.groupby("demand_class"):
+                    _w = _g[_g["champion"].astype(str).str.lower() == "true"]
+                    _w = _w.iloc[0] if len(_w) else _g.sort_values("wape").iloc[0]
+                    _rows.append({"Demand pattern": {"smooth": "Smooth (steady)", "erratic": "Erratic (jumpy volume)",
+                                                     "intermittent": "Intermittent (occasional)",
+                                                     "lumpy": "Lumpy (occasional, jumpy)"}.get(_c, _c),
+                                  "Winner": f"{_MN.get(_w['method'], _w['method'])} · {_w['variant']}",
+                                  "Winner error %": round(_w["wape"]),
+                                  "Best stock-out corrected %": round(_g[_g["variant"] == "seasonal + stock-outs"]["wape"].min()),
+                                  "Best seasonal %": round(_g[_g["variant"] == "seasonal"]["wape"].min()),
+                                  "Best flat %": round(_g[_g["variant"] == "flat"]["wape"].min()),
+                                  "12-wk average %": round(_g[(_g["method"] == "MA12") & (_g["variant"] == "flat")]["wape"].min())})
+                st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+
+                _eb = _fr.get("bands", pd.DataFrame())
+                if not _eb.empty:
+                    st.markdown("##### Error by volume")
+                    st.caption("One error number mixes very different styles. A style selling one unit a month cannot be "
+                               "forecast week by week — even a perfect rate leaves the error under 'Chance alone'. Judge slow "
+                               "styles on whether the predicted chance of selling matches reality, and fast styles on the gap "
+                               "between error and chance: that gap is what better inputs (price, launches, ranging) can close. "
+                               "Slow styles were forecast too low at every cut-off (the contest rewards forecasting ~0 for "
+                               "styles that sell now and then), so forecasts under 0.25 a week are corrected to what such "
+                               "forecasts actually sold. Bias, chance to sell and high-case cover are checked on the latest "
+                               "cut-off with the correction learned only from earlier ones. 'High case covers' = share of "
+                               "weeks sales stayed at or below P80 (aim 80%).")
+                    _p = lambda c: (pd.to_numeric(_eb[c], errors="coerce") * 100).round(0)
+                    st.dataframe(pd.DataFrame({
+                        "Units a week (style × country)": _eb["band"], "Styles": pd.to_numeric(_eb["series"], errors="coerce"),
+                        "Share of units %": _p("unit_share"), "Error %": _p("error"), "Chance alone %": _p("chance_floor"),
+                        **({"Bias before %": _p("bias_before"), "Bias after %": _p("bias_after")} if "bias_after" in _eb else {}),
+                        "Chance to sell: predicted %": _p("p_sell_predicted"), "Chance to sell: actual %": _p("p_sell_actual"),
+                        "High case covers %": _p("p80_coverage")}), hide_index=True, use_container_width=True)
+
+                st.markdown("##### Forecast explorer")
+                try:
+                    _h = get_fc_hierarchy()
+                    _h["units_8w"] = pd.to_numeric(_h["units_8w"], errors="coerce").fillna(0)
+                    _xc = st.columns([1.1, 1.3, 2.6])
+                    _lvl = _xc[0].selectbox("Level", ["Division", "Category (AH2)"], index=1, key="fc_lvl",
+                                            label_visibility="collapsed")
+                    _ctry = _xc[1].selectbox("Country", ["All countries"] + sorted(_h["country"].dropna().unique()),
+                                             key="fc_ctry", label_visibility="collapsed")
+                    _hc = _h if _ctry == "All countries" else _h[_h["country"] == _ctry]
+                    _key = "division" if _lvl.startswith("Division") else "category"
+                    _opts = _hc.groupby(_key)["units_8w"].sum().sort_values(ascending=False)
+                    _val = _xc[2].selectbox(_lvl, [f"{k} · {v:,.0f} units next 8 weeks" for k, v in _opts.items()],
+                                            key=f"fc_val_{_key}", label_visibility="collapsed").split(" · ")[0]
+                    _cc = None if _ctry == "All countries" else _ctry
+                    _ser = get_fc_agg(_key, _val, _cc)
+                    for _c in ("units", "p50", "p80"):
+                        _ser[_c] = pd.to_numeric(_ser[_c], errors="coerce")
+                    _ser["wk"] = pd.to_datetime(_ser["wk"])
+                    st.line_chart(_ser.set_index("wk").rename(columns={"units": "Actual", "p50": "Forecast P50", "p80": "Forecast P80"}),
+                                  height=260)
+                    st.caption(f"Weekly units for {_val.title()} in {_ctry.lower() if _cc is None else _ctry}: actual for the last "
+                               "52 weeks, then the 8-week forecast — the sum of every CORE style's forecast in the group "
+                               "(P50 = most likely; P80 = high case for the group as a whole, from the styles' combined "
+                               "spread). The forecast follows the seasonality and events below.")
+                    _div = _val if _key == "division" else (_hc[_hc["category"] == _val].sort_values("units_8w")["division"].iloc[-1]
+                                                            if (_hc["category"] == _val).any() else None)
+                    _cal = get_fc_calendar_div(_div, _cc) if _div else pd.DataFrame()
+                    if not _cal.empty:
+                        for _c in ("season_factor", "factor"):
+                            _cal[_c] = pd.to_numeric(_cal[_c], errors="coerce")
+                        _cal["week_start"] = pd.to_datetime(_cal["week_start"])
+                        st.line_chart(_cal.set_index("week_start")[["season_factor", "factor"]]
+                                      .rename(columns={"season_factor": "Seasonality", "factor": "Seasonality × events"}), height=180)
+                        _up = _cal[(_cal["week_start"] > pd.Timestamp.now()) & (_cal["events"].fillna("") != "")]
+                        st.caption(f"Index 1.0 = an average week for {str(_div).title()}"
+                                   f"{'' if _cc else ' (average across countries)'}. Upcoming: " +
+                                   ("; ".join(f"week of {d:%d %b} — {e}" for d, e in zip(_up["week_start"], _up["events"]))
+                                    if len(_up) else "no events in the next 8 weeks."))
+                except Exception as e:
+                    st.info(f"Forecast explorer unavailable: {e}")
+
+                st.markdown("##### Events calendar")
+                st.caption("Events the forecast accounts for, with the lift each showed in past CORE sales (×1.20 = 20% above a "
+                           "normal week). Islamic holiday dates follow the moon sighting and Dubai Shopping Festival dates are "
+                           "announced each year — business should confirm them.")
+                try:
+                    _ev = get_fc_events()
+                    st.dataframe(_ev.rename(columns={"event": "Event", "start": "Start", "end": "End", "lift": "Past lift (×)"}),
+                                 hide_index=True, use_container_width=True, height=300)
+                except Exception as e:
+                    st.info(f"Events calendar unavailable: {e}")
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:
