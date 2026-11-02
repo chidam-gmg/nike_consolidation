@@ -863,6 +863,8 @@ elif ss.run_state == "results":
                            "to your line manager" + (f" ({_mgr_name or _mgr})" if _mgr else
                            " — none is mapped for you yet (cfg_line_manager; to be replaced by the company directory)") +
                            ". Lines a manager has signed off are locked.")
+                _q = st.text_input("Search", key="al_q", placeholder="Search store, style, style name or article — e.g. Dubai Mall, Air Force, NKDV9330",
+                                   label_visibility="collapsed")
                 _fc = st.columns([1.4, 2, 1.6])
                 _f_ct = _fc[0].multiselect("Country", sorted(_al["country"].dropna().unique()), key="al_ctry",
                                            placeholder="All countries", label_visibility="collapsed")
@@ -874,6 +876,10 @@ elif ss.run_state == "results":
                 _v = _al if _nodc else _al[_al["alloc_qty"] > 0]
                 if _f_ct:
                     _v = _v[_v["country"].isin(_f_ct)]
+                if _q.strip():
+                    _hay = (_v["store_name"].fillna("") + " " + _v["store"].astype(str) + " " + _v["parent"].fillna("") + " " +
+                            _v["art"].fillna("") + " " + _v.get("style_name", pd.Series("", index=_v.index)).fillna("")).str.upper()
+                    _v = _v[_hay.str.contains(_q.strip().upper(), regex=False)]
                 if _f_so:
                     _v = _v[_v["Sign-off"].isin(_f_so) | (_v["alloc_qty"] == 0)]
                 _v = _v.reset_index(drop=True)
@@ -885,7 +891,11 @@ elif ss.run_state == "results":
                     "Sign-off": _v["Sign-off"].where(_v["alloc_qty"] > 0, _v["status"]),
                     "Country": _v["country"], "Store name": _v["store_name"], "Grade": _v["grade"],
                     "Cluster": _v.get("cluster", pd.Series(index=_v.index, dtype=object)), "Style": _v["parent"],
-                    "Article": _v["art"], "Size": _v["size"], "Chance to sell (14d) %": _v["p_sell_pct"],
+                    "Style name": _v.get("style_name", pd.Series(index=_v.index, dtype=object)),
+                    "Article": _v["art"], "Size": _v["size"],
+                    "Style forecast 14d (country)": _v.get("style_fc_14d"), "Store share %": _v.get("store_share_pct"),
+                    "Size share %": _v.get("size_share_pct"), "Demand 14d": _v["demand_14d"],
+                    "Chance to sell (14d) %": _v["p_sell_pct"],
                     "Stock target": _v["target"], "ATP": _v["atp"], "In-transit": _v["intransit"],
                     "Recommended": _v["alloc_qty"], "Source": _v["source"]})
                 _edited = st.data_editor(

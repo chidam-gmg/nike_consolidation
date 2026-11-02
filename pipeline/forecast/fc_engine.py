@@ -703,7 +703,10 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
                                   np.where(need["alloc_qty"] > 0, "Part-allocated",
                                            np.where(need["country"].isin(list(dmap)), "No DC stock", "No DC for country")))
-        out["allocation"] = need[["country", "store", "store_name", "grade", "cluster", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
+        need = need.merge(ks.groupby("parent")["style_name"].max().reset_index() if "style_name" in ks else
+                          pd.DataFrame(columns=["parent", "style_name"]), on="parent", how="left")
+        out["allocation"] = need[["country", "store", "store_name", "grade", "cluster", "parent", "style_name", "art", "size", "key_size",
+                                  "cover_units", "store_share", "size_share", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
         log.say("allocator", "tool", "DC pools: primary first (KSA / BAH), then the shared UAE hub · priority grade, then demand")

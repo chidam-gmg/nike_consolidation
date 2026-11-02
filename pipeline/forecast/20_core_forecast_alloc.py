@@ -68,9 +68,17 @@ WHERE sm.PLANTCAT = 'A' AND sm.`/BIC/ZBU` = 'NIKE' AND sm.COUNTRY <> ''
 GROUP BY sm.COUNTRY, sm.PLANT"""
 
 # every CORE article with its size, key-size flag and the product attributes the store / size clusters are built from
-KEY_SIZES = f"""WITH {_CORE} SELECT c.parent, c.art, c.size, MAX(c.division) division, MAX(c.gender) gender,
+# style name = the parent's own product-master name (MATL_CAT 01), else a child name with the trailing ", <size>" cut
+KEY_SIZES = f"""WITH {_CORE},
+pname AS (SELECT ch.parent, COALESCE(pa.name, ch.stripped) style_name
+          FROM (SELECT RT_CONFMAT parent, MAX(TRIM(regexp_replace(TXTMD, ',[^,]*$', ''))) stripped FROM {PM}
+                WHERE MATL_CAT = '02' GROUP BY RT_CONFMAT) ch
+          LEFT JOIN (SELECT MATERIAL, MAX(NULLIF(TRIM(TXTMD), '')) name FROM {PM} WHERE MATL_CAT = '01' GROUP BY MATERIAL) pa
+            ON pa.MATERIAL = ch.parent)
+SELECT c.parent, c.art, c.size, MAX(pn.style_name) style_name, MAX(c.division) division, MAX(c.gender) gender,
        MAX(c.sport) sport, MAX(c.category) category, MAX(COALESCE(ak.is_key_size, 0)) key_size
-FROM core c LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = c.art GROUP BY 1, 2, 3"""
+FROM core c LEFT JOIN {FQ}.art_size_key ak ON ak.article_code = c.art LEFT JOIN pname pn ON pn.parent = c.parent
+GROUP BY 1, 2, 3"""
 
 DC = f"""SELECT d.pool_id, d.article_code art, d.pool_atp FROM {FQ}.dc_pool_stock d WHERE d.pool_atp > 0 AND d.article_code LIKE 'NK%'"""
 DC_MAP = f"""SELECT country, MAX(CASE WHEN tier = 1 AND pool_id <> 'HUB' THEN pool_id END) primary_pool,
@@ -795,7 +803,10 @@ def run(weekly, store_size, stock, stores, key_sizes, dc, dc_map, current_replen
         need["status"] = np.where(need["alloc_qty"] >= need["need"], "Allocated",
                                   np.where(need["alloc_qty"] > 0, "Part-allocated",
                                            np.where(need["country"].isin(list(dmap)), "No DC stock", "No DC for country")))
-        out["allocation"] = need[["country", "store", "store_name", "grade", "cluster", "parent", "art", "size", "key_size", "demand", "p_sell", "target",
+        need = need.merge(ks.groupby("parent")["style_name"].max().reset_index() if "style_name" in ks else
+                          pd.DataFrame(columns=["parent", "style_name"]), on="parent", how="left")
+        out["allocation"] = need[["country", "store", "store_name", "grade", "cluster", "parent", "style_name", "art", "size", "key_size",
+                                  "cover_units", "store_share", "size_share", "demand", "p_sell", "target",
                                   "atp", "intransit", "need", "alloc_qty", "source", "reason", "status"]]
         a = out["allocation"]
         log.say("allocator", "tool", "DC pools: primary first (KSA / BAH), then the shared UAE hub · priority grade, then demand")

@@ -611,7 +611,9 @@ def load_fc_calendar_div(division: str, country: str | None) -> pd.DataFrame:
 
 
 def load_al_allocation() -> pd.DataFrame:
-    return run_sql(f"""SELECT run_id, country, store, store_name, grade, cluster, parent, art, size, ROUND(demand, 2) demand_14d,
+    return run_sql(f"""SELECT run_id, country, store, store_name, grade, cluster, parent, style_name, art, size,
+                       ROUND(cover_units, 1) style_fc_14d, ROUND(store_share * 100, 1) store_share_pct,
+                       ROUND(size_share * 100, 1) size_share_pct, ROUND(demand, 2) demand_14d,
                        ROUND(p_sell * 100, 0) p_sell_pct, CAST(target AS INT) target,
                        atp, intransit, need, alloc_qty, source, reason, status FROM {FQ}.al_allocation
                        ORDER BY status, alloc_qty DESC, store""")
