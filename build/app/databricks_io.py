@@ -733,6 +733,90 @@ def save_manager_decisions(run_id: str, rows: pd.DataFrame, user: str) -> int:
     return len(rows)
 
 
+# ---- Daily brief: exception management (guardrails, actions, learning) ----
+GUARD_FQ = f"{FQ}.cfg_guardrails"
+ACT_FQ = f"{FQ}.ex_actions"
+
+
+def load_brief_inputs() -> dict:
+    """Plan lines, the full size run, and each style's forecast swing (next 2 weeks vs last 4 weeks sold)."""
+    return {"al": run_sql_full(f"SELECT * FROM {FQ}.al_allocation"),
+            "sr": run_sql_full(f"""SELECT country, store, store_name, grade, cluster, parent, style_name, art, size, atp,
+                                   intransit, target, need, alloc_qty FROM {FQ}.al_size_run"""),
+            "sw": run_sql(f"""WITH f AS (SELECT country, parent, MAX(variant) variant, MAX(demand_class) demand_class,
+                                SUM(CASE WHEN week_start <= date_add((SELECT MIN(week_start) FROM {FQ}.fc_forecast), 7)
+                                         THEN units_p50 END) / 2 fw FROM {FQ}.fc_forecast GROUP BY 1, 2),
+                              h AS (SELECT country, parent, AVG(units) hw FROM {FQ}.fc_history
+                                    WHERE wk >= date_sub((SELECT MIN(week_start) FROM {FQ}.fc_forecast), 28) GROUP BY 1, 2)
+                              SELECT f.*, h.hw FROM f JOIN h USING (country, parent)"""),
+            "events": run_sql(f"""SELECT event, start, `end` FROM {FQ}.fc_events
+                                  WHERE `end` >= current_date() AND start <= date_add(current_date(), 56) ORDER BY start"""),
+            "summary": run_sql(f"SELECT * FROM {FQ}.fc_run_summary")}
+
+
+def load_guardrails() -> dict:
+    try:
+        df = run_sql(f"""SELECT param, value FROM (SELECT *, row_number() OVER (PARTITION BY param ORDER BY updated_at DESC) rn
+                         FROM {GUARD_FQ}) WHERE rn = 1""")
+        return {r.param: float(r.value) for r in df.itertuples()}
+    except Exception:
+        return {}
+
+
+def save_guardrails(values: dict, user: str) -> None:
+    """Append a new version of each changed guardrail (history kept for audit)."""
+    lit = lambda x: "'" + str(x).replace("'", "''") + "'"
+    vals = ", ".join(f"({lit(k)}, {float(v)}, {lit(user)}, current_timestamp())" for k, v in values.items())
+    if vals:
+        run_sql(f"INSERT INTO {GUARD_FQ} VALUES {vals}")
+
+
+def load_actions(run_id: str) -> pd.DataFrame:
+    return run_sql(f"SELECT * FROM {ACT_FQ} WHERE run_id = '{str(run_id).replace(chr(39), chr(39) * 2)}'")
+
+
+def save_action(run_id: str, card: dict, decision: str, rows: list, reason: str | None, note: str | None, user: str) -> str:
+    """Record a move / buy / transfer decision. A changed quantity waits for the line manager; the reason is kept."""
+    import json as _json
+    mgr, mgr_name = line_manager_of(user) if decision == "Modify" else (None, None)
+    status = {"Send": "Requested", "Modify": "Awaiting line manager", "Reject": "Rejected"}[decision]
+    lit = lambda x: "NULL" if x in (None, "") else "'" + str(x).replace("'", "''") + "'"
+    run_sql(f"""MERGE INTO {ACT_FQ} t USING (SELECT {lit(run_id)} run_id, {lit(card['id'])} card_id) s
+                ON t.run_id = s.run_id AND t.card_id = s.card_id
+                WHEN MATCHED AND t.status IN ('Requested', 'Awaiting line manager', 'Rejected') THEN UPDATE SET
+                  decision = {lit(decision)}, detail = {lit(_json.dumps(rows))}, reason = {lit(reason)}, note = {lit(note)},
+                  decided_by = {lit(user)}, decided_at = current_timestamp(), status = {lit(status)},
+                  route_to = {lit(mgr)}, route_to_name = {lit(mgr_name)}
+                WHEN NOT MATCHED THEN INSERT (run_id, card_id, card_type, country, store, parent, title, decision, detail,
+                  reason, note, decided_by, decided_at, status, route_to, route_to_name)
+                VALUES ({lit(run_id)}, {lit(card['id'])}, {lit(card['type'])}, {lit(card.get('country'))}, {lit(card.get('store'))},
+                  {lit(card.get('parent'))}, {lit(card['title'])}, {lit(decision)}, {lit(_json.dumps(rows))}, {lit(reason)},
+                  {lit(note)}, {lit(user)}, current_timestamp(), {lit(status)}, {lit(mgr)}, {lit(mgr_name)})""")
+    return status
+
+
+def load_action_queue(manager_email: str, include_unassigned: bool = False) -> pd.DataFrame:
+    m = str(manager_email or "").replace("'", "''")
+    who = f"lower(route_to) = lower('{m}')" + (" OR route_to IS NULL" if include_unassigned else "")
+    return run_sql(f"""SELECT * FROM {ACT_FQ} WHERE status = 'Awaiting line manager' AND ({who}) ORDER BY decided_at""")
+
+
+def save_action_manager(run_id: str, card_id: str, approve: bool, comment: str, user: str) -> None:
+    lit = lambda x: "'" + str(x or "").replace("'", "''") + "'"
+    run_sql(f"""UPDATE {ACT_FQ} SET status = {lit('Change approved' if approve else 'Change declined')},
+                manager_by = {lit(user)}, manager_at = current_timestamp(), manager_comment = {lit(comment)}
+                WHERE run_id = {lit(run_id)} AND card_id = {lit(card_id)} AND status = 'Awaiting line manager'""")
+
+
+def load_learning(days: int = 28) -> pd.DataFrame:
+    """Reasons behind planners' changes (lines and actions), last `days` days — what the agents learn from."""
+    return run_sql(f"""SELECT reason, store_name, COUNT(*) n, MAX(decided_at) last_at FROM (
+                         SELECT reason, store_name, decided_at FROM {AL_DEC_FQ} WHERE decision IN ('Modified', 'Rejected')
+                         UNION ALL SELECT reason, title AS store_name, decided_at FROM {ACT_FQ} WHERE decision IN ('Modify', 'Reject'))
+                       WHERE reason IS NOT NULL AND decided_at >= date_sub(current_date(), {int(days)})
+                       GROUP BY reason, store_name ORDER BY n DESC LIMIT 8""")
+
+
 def current_user() -> str:
     """Best-effort identity of the logged-in user (for run attribution). In-app: the platform-forwarded
     email header; locally: the CLI profile user."""
