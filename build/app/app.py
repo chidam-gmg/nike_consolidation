@@ -18,6 +18,7 @@ import agent_view
 import brief
 import brief_view
 import forecast_view
+import new_launch_view
 import story_view
 
 # DEV preview (separate Databricks app, APP_MODE=dev): read-only — no runs, no config writes, so it can sit on
@@ -682,7 +683,7 @@ def kpi(col, label, value, accent=False, prov=False, help=""):
                  f"<div class='lblrow'><span class='lbl' style='color:{lblcolor}'>{label}</span>{prov_html}</div>"
                  f"<div class='val' style='color:{fg}'>{value}</div></div>", unsafe_allow_html=True)
 
-def _render_brief_and_forecast(tab_brief, tab_fc):
+def _render_brief_and_forecast(tab_brief, tab_fc, tab_new=None):
     """Daily brief + Forecast & allocation. Independent of the consolidation run, so they render even when no
     consolidation results load (first run, or a viewer without access to them)."""
     # ============ TAB: DAILY BRIEF — exception management: agents handle the routine, people decide the rest ============
@@ -1035,10 +1036,14 @@ def _render_brief_and_forecast(tab_brief, tab_fc):
                 except Exception as e:
                     st.info(f"Events calendar unavailable: {e}")
 
+    if tab_new is not None:
+        with tab_new:
+            new_launch_view.render(THEME)
+
 
 if ss.run_state != "results":
-    _tb, _tf, _tc = st.tabs(["Daily brief", "Forecast & allocation", "Store consolidation"])
-    _render_brief_and_forecast(_tb, _tf)
+    _tb, _tf, _tn, _tc = st.tabs(["Daily brief", "Forecast & allocation", "New launches", "Store consolidation"])
+    _render_brief_and_forecast(_tb, _tf, _tn)
     _cons = _tc
 else:
     _cons = st
@@ -1122,10 +1127,10 @@ elif ss.run_state == "results":
                 st.warning(f"Could not refresh: {e}")
             st.rerun()
 
-    tab_brief, tab_fc, tab_agent, tab_all, tab_replen = st.tabs(
-        ["Daily brief", "Forecast & allocation", "Agent lab", "Store consolidation", "Replenishment (DC → store)"])
+    tab_brief, tab_fc, tab_new, tab_agent, tab_all, tab_replen = st.tabs(
+        ["Daily brief", "Forecast & allocation", "New launches", "Agent lab", "Store consolidation", "Replenishment (DC → store)"])
 
-    _render_brief_and_forecast(tab_brief, tab_fc)
+    _render_brief_and_forecast(tab_brief, tab_fc, tab_new)
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:

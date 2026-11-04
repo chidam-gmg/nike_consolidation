@@ -6,7 +6,7 @@ Running backlog of known shortcuts / deferred work. Newest first.
 
 ## TD-10 · New-article (no history) forecast and opening pack (2026-11-04)
 
-**Status:** Proposed, not built. Waiting on product image links (owner: Chidambaram, sourcing the data).
+**Status:** v1 BUILT 2026-11-04 for Spring 2027 (`pipeline/newlaunch/`, notebook `newlaunch/21_new_launch_forecast`, one-off submit; tables `nl_forecast`, `nl_forecast_country`, `nl_forecast_weekly`, `nl_analogues`, `nl_backtest`; app tab New launches). 5,851 SP27 styles, 398K units in first 13 weeks. Back-test SP26: ±10% by country, ±12% division × gender, ±16% division × gender × country, style-level 83% (44% within 2×), bias +8%, P80 covers 80%. Open: buyer launch list + dates (dates assumed from last spring), ranging (which stores), images for SP27 not in Akeneo yet (similarity by image not used), opening pack per store/size, schedule the job.
 - **Why:** the forecast covers only articles with sales history (CORE/YEAR). About 1,500 new Nike styles launch a
   month (seasonal); 45% are new colourways of a model that already sold (62% of footwear launches).
 - **Approach:** borrow from the closest thing with history — A) sibling colourways of the same model; B) the 10–20
