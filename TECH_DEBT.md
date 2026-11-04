@@ -17,6 +17,7 @@ Running backlog of known shortcuts / deferred work. Newest first.
 - **Data gaps:** colour fields (`RT_COLOR`, `/BIC/ZCHCOLOR`) are empty for Nike articles — derive colour family from
   the colourway code (e.g. `-060`) until a colour feed exists; images are not in any table (user is sourcing links);
   buyer launch list source/owner open (SAP open POs or buyer file); ranging owner (who picks launch stores) open.
+- **Image links (samples 2026-11-04):** Nike → `omniversemedia` S3, keyed by the size-level barcode (`EANUPC`, 99.9% filled; `685068170041` = NK805160-09104) — the sample host `s3.eu-central1` is a typo, `s3.eu-central-1` works; UA → `athlocity.asset.akeneo.cloud/.../U_V5_<model>_<colour>_1740.jpg`, derivable from the article code. Both public, 2000px studio shots on white. Open: full link extract, Databricks egress to both hosts (or copy into a UC volume), usage rights.
 - **First step:** back-test on the last 12 months of launches — first 8 weeks from pre-launch information only:
   cluster average vs analogues vs + attributes vs + images (shows the CEO what images add).
 
