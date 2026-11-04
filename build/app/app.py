@@ -141,6 +141,15 @@ def get_actions(run_id, ver: int = 0):
     return dbio.load_actions(run_id)
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_images() -> dict:
+    try:
+        df = dbio.load_images()
+    except Exception:                       # images are decoration — never block a page on them
+        return {}
+    return {r.parent: {"url": r.url, "colour": r.colour, "franchise": r.franchise} for r in df.itertuples()}
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def get_story_options():
     return dbio.load_story_options()
@@ -687,7 +696,8 @@ def _render_brief_and_forecast(tab_brief, tab_fc):
             _bdec = get_al_decisions(_brid, _bver) if _brid else pd.DataFrame()
             _bact = get_actions(_brid, _bver) if _brid else pd.DataFrame()
             brief_view.render(_b, _brid, THEME, dbio.current_user(), DEV, _bdec, _bact, _bi,
-                              {"size_run": get_size_run, "series": get_fc_series, "calendar": get_fc_calendar})
+                              {"size_run": get_size_run, "series": get_fc_series, "calendar": get_fc_calendar,
+                               "images": get_images()})
         except Exception as e:
             st.warning(access_message(e)) if is_access_error(e) else st.info(f"The daily brief is not available yet ({e}).")
 
@@ -759,7 +769,8 @@ def _render_brief_and_forecast(tab_brief, tab_fc):
                 _calw = get_fc_calendar(_st_pick["country"], _sty_pick["parent"])
                 _evs = ({str(pd.Timestamp(k).date()): v for k, v in zip(_calw["week_start"], _calw["events"].fillna(""))}
                         if not _calw.empty else {})
-                story_view.render(_sr, _ser, _evs, theme=THEME)
+                _img = get_images().get(_sty_pick["parent"]) or {}
+                story_view.render(_sr, _ser, _evs, theme=THEME, image=_img.get("url"), colour=_img.get("colour"))
             except Exception as e:
                 st.info(f"Store walkthrough unavailable: {e}")
 
@@ -815,6 +826,7 @@ def _render_brief_and_forecast(tab_brief, tab_fc):
                     "Sign-off": _v["Sign-off"].where(_v["alloc_qty"] > 0, _v["status"]),
                     "Country": _v["country"], "Store name": _v["store_name"], "Grade": _v["grade"],
                     "Cluster": _v.get("cluster", pd.Series(index=_v.index, dtype=object)), "Style": _v["parent"],
+                    "Image": _v["parent"].map(lambda p: (get_images().get(p) or {}).get("url")),
                     "Style name": _v.get("style_name", pd.Series(index=_v.index, dtype=object)),
                     "Article": _v["art"], "Size": _v["size"],
                     "Style forecast 14d (country)": _v.get("style_fc_14d"), "Store share %": _v.get("store_share_pct"),
@@ -835,6 +847,7 @@ def _render_brief_and_forecast(tab_brief, tab_fc):
                         "Comment": st.column_config.TextColumn(width="medium"),
                         "Sign-off": st.column_config.TextColumn(width="medium"),
                         "Recommended": st.column_config.NumberColumn(width="small"),
+                        "Image": st.column_config.ImageColumn(width="small"),
                     })
 
                 def _al_save(rows, msg):

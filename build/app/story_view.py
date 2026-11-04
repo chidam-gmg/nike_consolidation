@@ -161,7 +161,8 @@ def _size_chart(sr: pd.DataFrame, unit: str, c: dict, W=1180, H=210) -> str:
     return "".join(out)
 
 
-def build(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light") -> str:
+def build(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light", image: str | None = None,
+          colour: str | None = None) -> str:
     """sr = al_size_run rows for one store x style; ser = weekly actual + forecast for the style in the country."""
     c = THEMES.get(theme, THEMES["light"])
     for col in ("cover_units", "store_share", "size_share", "demand", "p_sell", "target", "atp", "intransit", "need",
@@ -211,6 +212,8 @@ def build(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light
     * {{ box-sizing:border-box; margin:0; }}
     body {{ background:{c['bg']}; color:{c['ink']}; font:14px/1.5 'Source Sans 3', system-ui, sans-serif; padding:4px 2px; }}
     .hd {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; }}
+    .who {{ display:flex; gap:16px; align-items:center; min-width:0; }}
+    .prod {{ width:96px; height:96px; object-fit:contain; background:#FFFFFF; border:1px solid {c['line']}; border-radius:12px; padding:4px; }}
     .eyebrow {{ font-size:11px; letter-spacing:.12em; font-weight:700; color:{c['dim']}; text-transform:uppercase; }}
     h1 {{ font:600 26px/1.2 Georgia, serif; margin-top:4px; }}
     .meta {{ color:{c['dim']}; margin-top:4px; }}
@@ -266,9 +269,10 @@ def build(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light
     ev_s = html.escape(", ".join(ev_next)) if ev_next else "none in the next 8 weeks"
     return f"""<html><head><meta charset="utf-8"><style>{css}</style></head><body>
     <div class="hd">
-      <div><div class="eyebrow">Store walkthrough</div>
+      <div class="who">{f'<img class="prod" src="{html.escape(image)}" alt="{html.escape(style)}">' if image else ''}
+        <div><div class="eyebrow">Store walkthrough</div>
         <h1>{html.escape(style)}</h1>
-        <div class="meta">{html.escape(str(r0['parent']))} &nbsp; {''.join(f'<span class="chip">{html.escape(p)}</span>' for p in cl)}</div></div>
+        <div class="meta">{html.escape(str(r0['parent']))} &nbsp; {''.join(f'<span class="chip">{html.escape(p)}</span>' for p in cl + ([colour] if colour else []))}</div></div></div>
       <div class="pill">{html.escape(status_txt)}</div>
     </div>
 
@@ -323,5 +327,6 @@ def build(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light
     </body></html>"""
 
 
-def render(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light", height: int = 1190):
-    components.html(build(sr, ser, events, theme), height=height, scrolling=False)
+def render(sr: pd.DataFrame, ser: pd.DataFrame, events: dict, theme: str = "light", height: int = 1210,
+           image: str | None = None, colour: str | None = None):
+    components.html(build(sr, ser, events, theme, image, colour), height=height, scrolling=False)

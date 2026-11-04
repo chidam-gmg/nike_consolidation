@@ -40,6 +40,9 @@ def _css(t: dict) -> str:
     .bf-gap {{ background:{t['warm_soft']}; color:{t['warm']}; }} .bf-big, .bf-swing {{ background:{t['acc_soft']}; color:{t['accent']}; }}
     .bf-over {{ background:{t['ok_soft']}; color:{t['ok']}; }} .bf-data {{ background:{t['soft']}; color:{t['dim']}; }}
     .bf-kind {{ font-size:11.5px; color:{t['dim']}; letter-spacing:.06em; text-transform:uppercase; font-weight:700; }}
+    .bf-head {{ display:flex; gap:14px; align-items:flex-start; }} .bf-body {{ flex:1; min-width:0; }}
+    .bf-img {{ width:84px; height:84px; object-fit:contain; background:#FFFFFF; border:1px solid {t['line']};
+              border-radius:10px; padding:3px; flex:0 0 auto; }}
     .bf-impact {{ float:right; font-size:13px; color:{t['dim']}; }} .bf-impact b {{ color:{t['ink']}; }}
     .bf-title {{ font-size:16.5px; font-weight:700; color:{t['ink']}; margin:6px 0 2px; }}
     .bf-title span {{ font-weight:400; color:{t['dim']}; }}
@@ -123,10 +126,14 @@ def _save_lines(card, rec: pd.DataFrame, qty: dict, decision_all: str | None, re
 def _card(card, b, t, run_id, me, dec_lines, acts, theme, loaders, ver):
     cls = TYPE_CLS.get(card["type"], "data")
     trail = "".join(f"<div>{html.escape(x)}</div>" for x in card["trail"])
-    st.markdown(f"""<div class="bf-impact"><b>{html.escape(card['impact'])}</b></div>
+    img = loaders.get("images", {}).get(card.get("parent")) or {}
+    pic = (f'<img class="bf-img" src="{html.escape(img["url"])}" alt="{html.escape(card["title"])}">'
+           if img.get("url") else "")
+    colour = f" · {html.escape(img['colour'])}" if img.get("colour") else ""
+    st.markdown(f"""<div class="bf-head">{pic}<div class="bf-body"><div class="bf-impact"><b>{html.escape(card['impact'])}</b></div>
         <span class="bf-type bf-{cls}">{card['type']}</span><span class="bf-kind">{'decide' if card['kind'] == 'decide' else 'act'}</span>
-        <div class="bf-title">{html.escape(card['title'])} <span>· {html.escape(card['sub'])}</span></div>
-        <p class="bf-why">{html.escape(card['why'])}</p><div class="bf-trail">{trail}</div>
+        <div class="bf-title">{html.escape(card['title'])} <span>· {html.escape(card['sub'])}{colour}</span></div>
+        <p class="bf-why">{html.escape(card['why'])}</p></div></div><div class="bf-trail">{trail}</div>
         <div class="bf-rec">Recommended: <b>{html.escape(card['rec'])}</b></div>""", unsafe_allow_html=True)
     status = _card_status(card, dec_lines, acts)
     if status:
@@ -187,7 +194,8 @@ def _card(card, b, t, run_id, me, dec_lines, acts, theme, loaders, ver):
             ser = loaders["series"](sr["country"].iloc[0], card["parent"])
             cal = loaders["calendar"](sr["country"].iloc[0], card["parent"])
             ev = {str(pd.Timestamp(x).date()): y for x, y in zip(cal["week_start"], cal["events"].fillna(""))} if not cal.empty else {}
-            story_view.render(sr, ser, ev, theme=theme)
+            img = loaders.get("images", {}).get(card["parent"]) or {}
+            story_view.render(sr, ser, ev, theme=theme, image=img.get("url"), colour=img.get("colour"))
 
 
 def render(b: dict, run_id: str, theme: str, me: str, dev: bool, dec_lines: pd.DataFrame, acts: pd.DataFrame,
@@ -321,7 +329,7 @@ def render(b: dict, run_id: str, theme: str, me: str, dev: bool, dec_lines: pd.D
                     if not ln.empty else '<span class="bf-note">No changes recorded yet. Each reason you give will show here.</span>')
             st.markdown(f'<div class="bf-panel"><h4>Learning from your changes</h4><span class="bf-note">Reasons behind changes in '
                         f'the last 4 weeks. When one keeps coming back, the agents propose a rule for your manager to '
-                        f'approve.</span>{body}</div>', unsafe_allow_html=True)
+                        f'approve.</span><br>{body}</div>', unsafe_allow_html=True)
 
         g = b["guard"]
         with st.container(border=True):

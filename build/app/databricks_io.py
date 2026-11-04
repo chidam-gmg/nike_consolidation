@@ -614,6 +614,12 @@ def load_fc_calendar_div(division: str, country: str | None) -> pd.DataFrame:
                        GROUP BY week_start ORDER BY week_start""")
 
 
+def load_images() -> pd.DataFrame:
+    """Image link + colour for every style in today's plan (dim_product_image, copied from Akeneo)."""
+    return run_sql(f"""SELECT i.parent, i.url, i.colour, i.franchise FROM {FQ}.dim_product_image i
+                       WHERE i.parent IN (SELECT DISTINCT parent FROM {FQ}.al_size_run) AND i.url IS NOT NULL""")
+
+
 def load_story_options() -> pd.DataFrame:
     """Store x style pairs in the plan, with units to send and units wanted but not in any DC."""
     return run_sql(f"""SELECT country, store, MAX(store_name) store_name, parent, MAX(style_name) style_name,

@@ -97,6 +97,25 @@ WHERE a.storage_location = 'SL01' AND dayofweek(a.c_file_date) = 4 AND a.atp_qty
   AND a.c_file_date >= DATE'2025-01-20' AND a.c_file_date <= (SELECT last_day FROM bounds)
 GROUP BY 1, 2, 3"""
 
+# product image + attributes per style, from Akeneo (akeneo_gmg_datalake.gold.product_images — the only image source,
+# business decision 2026-11-04). gmg_fluent_image is the most reliable link; the other columns are fallbacks.
+# Colour is normalised to one family ("BLACK/WHITE" -> "Black"). Copied into the project schema so app viewers need
+# no Akeneo access.
+IMAGES = f"""CREATE OR REPLACE TABLE {FQ}.dim_product_image
+COMMENT 'Style image link + colour / franchise / price from Akeneo product_images (refreshed by the forecast run)' AS
+WITH a AS (
+  SELECT sap_generic_article parent,
+         coalesce(nullif(trim(gmg_fluent_image), ''), nullif(trim(gmg_fluent_image_new), ''),
+                  nullif(trim(gmg_fluent_image_new_1), ''), nullif(trim(fluent_image), '')) url,
+         initcap(trim(regexp_replace(split(nullif(trim(color), ''), '/')[0], '[()]', ''))) colour,
+         nullif(trim(gmg_franchise), '') franchise, brand, try_cast(current_srp AS DOUBLE) srp, online_from
+  FROM akeneo_gmg_datalake.gold.product_images
+  WHERE sap_generic_article LIKE 'NK%')
+SELECT parent, MAX_BY(url, url IS NOT NULL) url,
+       CASE WHEN MAX(colour) IN ('Multi', 'Multicolour', 'Multi-colour') THEN 'Multi-Colour' ELSE MAX(colour) END colour,
+       MAX(franchise) franchise, MAX(brand) brand, MAX(srp) srp, MIN(online_from) online_from, current_timestamp() refreshed_at
+FROM a GROUP BY parent"""
+
 
 # COMMAND ----------
 """CORE forecast + allocation engine (dev, 2026-10-30).
@@ -860,6 +879,10 @@ from datetime import datetime, timezone
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
 names = ["WEEKLY", "STORE_SIZE", "STOCK", "STORES", "KEY_SIZES", "DC", "DC_MAP", "CURRENT_REPLEN", "AVAIL"]
 inp = {n: spark.sql(globals()[n]).toPandas() for n in names}
+try:                                   # product images for the app (Akeneo); a failure must not stop the forecast
+    spark.sql(IMAGES)
+except Exception as e:
+    print("dim_product_image not refreshed:", e)
 o = run(*[inp[n] for n in names])
 log = o["log"]
 

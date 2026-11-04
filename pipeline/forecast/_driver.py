@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
 names = ["WEEKLY", "STORE_SIZE", "STOCK", "STORES", "KEY_SIZES", "DC", "DC_MAP", "CURRENT_REPLEN", "AVAIL"]
 inp = {n: spark.sql(globals()[n]).toPandas() for n in names}
+try:                                   # product images for the app (Akeneo); a failure must not stop the forecast
+    spark.sql(IMAGES)
+except Exception as e:
+    print("dim_product_image not refreshed:", e)
 o = run(*[inp[n] for n in names])
 log = o["log"]
 
