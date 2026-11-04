@@ -4,6 +4,22 @@ Running backlog of known shortcuts / deferred work. Newest first.
 
 ---
 
+## TD-10 · New-article (no history) forecast and opening pack (2026-11-04)
+
+**Status:** Proposed, not built. Waiting on product image links (owner: Chidambaram, sourcing the data).
+- **Why:** the forecast covers only articles with sales history (CORE/YEAR). About 1,500 new Nike styles launch a
+  month (seasonal); 45% are new colourways of a model that already sold (62% of footwear launches).
+- **Approach:** borrow from the closest thing with history — A) sibling colourways of the same model; B) the 10–20
+  most similar past launches (cluster, sport, silhouette `CM_CDT4`, retail price band, season, life cycle `/BIC/ZZPLC`,
+  colour family, image similarity); C) cluster-level demand × typical new-style share. Blend with the buyer's plan
+  (weight from history); weekly launch curve + P80; hand over to the regular forecast after ~6 weeks of in-stock sales.
+  Store + size split reuses the cluster logic → opening pack per store and size; Launch planner cards in the brief.
+- **Data gaps:** colour fields (`RT_COLOR`, `/BIC/ZCHCOLOR`) are empty for Nike articles — derive colour family from
+  the colourway code (e.g. `-060`) until a colour feed exists; images are not in any table (user is sourcing links);
+  buyer launch list source/owner open (SAP open POs or buyer file); ranging owner (who picks launch stores) open.
+- **First step:** back-test on the last 12 months of launches — first 8 weeks from pre-launch information only:
+  cluster average vs analogues vs + attributes vs + images (shows the CEO what images add).
+
 ## TD-9 · Allocation sign-off: connect directory, notifications, SAP (2026-10-30)
 
 **Status:** Flow built in the dev app (Forecast & allocation → Allocation plan + Line manager review); three stubs

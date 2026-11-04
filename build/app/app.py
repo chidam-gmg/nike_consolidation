@@ -238,6 +238,17 @@ def full_csv_ui(col, key, loader, fname, sig, gz_loader=None):
     elif saved:
         col.caption("Filters changed — Prepare again.")
 
+def is_access_error(e) -> bool:
+    t = str(e).upper()
+    return any(k in t for k in ("PERMISSION_DENIED", "INSUFFICIENT_PERMISSIONS", "DOES NOT HAVE", "NOT AUTHORIZED",
+                                "USE CATALOG", "USE SCHEMA", "403", "TABLE_OR_VIEW_NOT_FOUND"))
+
+
+def access_message(e) -> str:
+    return ("You don't have access to the plan data yet. Ask the app owner to give you read access to "
+            "sports_analytics_test.nike_consolidation and use of the SQL warehouse, then reload this page.")
+
+
 # ---------- palette ----------
 SAPPHIRE, COBALT, SILVER, COPPER = "#20274C", "#2658F2", "#E9EFEF", "#B15940"
 
@@ -402,8 +413,8 @@ if ss.recs is None and ss.run_state == "empty" and not ss.get("_results_loaded")
             ss.recs = dbio.load_recommendations()
             ss.stats = stats
             ss.run_state = "results"
-    except Exception:
-        pass  # no results yet, or token not ready — stay on empty prompt
+    except Exception as e:
+        ss["_access_error"] = str(e) if is_access_error(e) else None   # no results yet, or token not ready
 
 DEFAULTS = dict(ROS_WINDOW_DAYS=14, IN_TRANSIT_LOOKBACK_DAYS=14, SLOW_MOVING_THRESHOLD_DAYS=30,
                 NEW_TO_STORE_DAYS=14, PROTECT_COVER_DAYS=7, TARGET_COVER_DAYS=14)
@@ -662,85 +673,9 @@ def kpi(col, label, value, accent=False, prov=False, help=""):
                  f"<div class='lblrow'><span class='lbl' style='color:{lblcolor}'>{label}</span>{prov_html}</div>"
                  f"<div class='val' style='color:{fg}'>{value}</div></div>", unsafe_allow_html=True)
 
-if ss.run_state == "empty":
-    st.info("Set parameters and run to see recommended moves. The engine proposes moves across all "
-            "countries — you review, filter, and export.")
-
-elif ss.run_state == "error":
-    st.error("The stock movement job did not complete.")
-    st.code(ss.error_msg or "Unknown error", language="text")
-
-elif ss.run_state == "no-results":
-    st.success("No recommended moves — the job completed but found nothing to move "
-               "(stock looks healthy, or all candidates were held by constraints).")
-
-elif ss.run_state == "results":
-    stats = ss.stats
-    def sv(k, d=0):
-        v = stats.get(k, d)
-        try: return int(float(v))
-        except Exception: return d
-
-    VRID = ss.get("view_run_id")            # the run this user is viewing (None => latest global)
-    df = ss.recs.copy()
-    if "movement_note" in df:  # ASCII-clean the tag separator for display + export
-        df["movement_note"] = df["movement_note"].astype(str).str.replace("·", "-", regex=False)
-    BRANDS = get_brands(str(stats.get("computed_at", "")), VRID)   # article-master brands for the Brand filter
-
-    if ss.get("last_elapsed") is not None:
-        st.success(f"✓ Run completed in {ss.last_elapsed}s — results below.")
-        ss.last_elapsed = None
-
-    # the consolidation run picker matters to the consolidation tabs; in the dev app the daily brief comes first
-    with st.expander(f"Consolidation engine run · {human_ts(stats.get('run_ts', stats.get('computed_at', '—')))}",
-                     expanded=not DEV):
-        # provenance — whose run, when, what scope — so a viewer is never silently shown someone else's run
-        if VRID:
-            st.caption(f"Viewing **your run** · by **{_who(stats.get('triggered_by'))}** · "
-                       f"{human_ts(stats.get('run_ts', stats.get('computed_at', '—')))} · "
-                       f"scope **{stats.get('country_scope', 'ALL')}**"
-                       + (f" · category **{stats.get('category_scope')}**"
-                          if str(stats.get('category_scope') or 'ALL') not in ('ALL', 'None', 'nan') else "")
-                       + f"  ·  run `{VRID}`")
-        else:
-            st.caption("Viewing the **latest completed run** (shared across users). "
-                       "Run the engine to get your own isolated view.")
-
-        # run picker — view any recent run (each user can always return to their own or a full-scope run)
-        _log = dbio.list_run_log(25)
-        fh = st.columns([4, 1], vertical_alignment="bottom")
-        if not _log.empty:
-            _labels, _map = [], {}
-            for _, r in _log.iterrows():
-                lbl = (f"{human_ts(r['run_ts'])} · {_who(r.get('triggered_by'))} · "
-                       f"{r['country_scope']}"
-                       + (f" · {r['category_scope']}" if str(r.get('category_scope') or 'ALL') != 'ALL' else "")
-                       + f" · {int(float(r['recommended_moves'] or 0))} moves")
-                _labels.append(lbl); _map[lbl] = r["run_id"]
-            _idx = next((i for i, l in enumerate(_labels) if _map[l] == VRID), 0)
-            pick = fh[0].selectbox("View a run", _labels, index=_idx, key="run_picker")
-            if _map[pick] != VRID:
-                try:
-                    ss.view_run_id = _map[pick]
-                    ss.recs = dbio.load_recommendations(run_id=ss.view_run_id)
-                    ss.stats = dbio.load_run_stats(run_id=ss.view_run_id)
-                    ss.run_state = "results" if len(ss.recs) else "no-results"
-                except Exception as e:
-                    st.warning(f"Could not load that run: {e}")
-                st.rerun()
-        else:
-            fh[0].caption(f"Latest results computed: **{human_ts(stats.get('computed_at', '—'))}**  ·  "
-                          f"{sv('countries')} countries")
-        if fh[1].button("↻ Refresh results", use_container_width=True):
-            try:
-                ss.recs = dbio.load_recommendations(run_id=VRID); ss.stats = dbio.load_run_stats(run_id=VRID)
-            except Exception as e:
-                st.warning(f"Could not refresh: {e}")
-            st.rerun()
-
-    tab_brief, tab_fc, tab_agent, tab_all, tab_replen = st.tabs(
-        ["Daily brief", "Forecast & allocation", "Agent lab", "Store consolidation", "Replenishment (DC → store)"])
-
+def _render_brief_and_forecast(tab_brief, tab_fc):
+    """Daily brief + Forecast & allocation. Independent of the consolidation run, so they render even when no
+    consolidation results load (first run, or a viewer without access to them)."""
     # ============ TAB: DAILY BRIEF — exception management: agents handle the routine, people decide the rest ============
     with tab_brief:
         try:
@@ -754,7 +689,7 @@ elif ss.run_state == "results":
             brief_view.render(_b, _brid, THEME, dbio.current_user(), DEV, _bdec, _bact, _bi,
                               {"size_run": get_size_run, "series": get_fc_series, "calendar": get_fc_calendar})
         except Exception as e:
-            st.info(f"The daily brief is not available yet ({e}).")
+            st.warning(access_message(e)) if is_access_error(e) else st.info(f"The daily brief is not available yet ({e}).")
 
     # ============ TAB: FORECAST + ALLOCATION (dev) — CORE styles: forecast -> store -> size -> DC rationing ============
     with tab_fc:
@@ -762,7 +697,7 @@ elif ss.run_state == "results":
             _fr = get_fc_run()
         except Exception as e:
             _fr = None
-            st.info(f"The forecast run is not available yet ({e}).")
+            st.warning(access_message(e)) if is_access_error(e) else st.info(f"The forecast run is not available yet ({e}).")
         if _fr is not None and not _fr["summary"].empty:
             _sm = _fr["summary"].iloc[0].to_dict()
             _ft, _at = _fr["fc_tot"].iloc[0], _fr["al_tot"].iloc[0]
@@ -1086,6 +1021,98 @@ elif ss.run_state == "results":
                                  hide_index=True, use_container_width=True, height=300)
                 except Exception as e:
                     st.info(f"Events calendar unavailable: {e}")
+
+
+if ss.run_state != "results":
+    _tb, _tf, _tc = st.tabs(["Daily brief", "Forecast & allocation", "Store consolidation"])
+    _render_brief_and_forecast(_tb, _tf)
+    _cons = _tc
+else:
+    _cons = st
+
+if ss.run_state == "empty":
+    if ss.get("_access_error"):
+        _cons.warning(access_message(ss["_access_error"]))
+    else:
+        _cons.info("Set parameters and run to see recommended moves. The engine proposes moves across all "
+                   "countries — you review, filter, and export.")
+
+elif ss.run_state == "error":
+    _cons.error("The stock movement job did not complete.")
+    _cons.code(ss.error_msg or "Unknown error", language="text")
+
+elif ss.run_state == "no-results":
+    _cons.success("No recommended moves — the job completed but found nothing to move "
+                  "(stock looks healthy, or all candidates were held by constraints).")
+
+elif ss.run_state == "results":
+    stats = ss.stats
+    def sv(k, d=0):
+        v = stats.get(k, d)
+        try: return int(float(v))
+        except Exception: return d
+
+    VRID = ss.get("view_run_id")            # the run this user is viewing (None => latest global)
+    df = ss.recs.copy()
+    if "movement_note" in df:  # ASCII-clean the tag separator for display + export
+        df["movement_note"] = df["movement_note"].astype(str).str.replace("·", "-", regex=False)
+    BRANDS = get_brands(str(stats.get("computed_at", "")), VRID)   # article-master brands for the Brand filter
+
+    if ss.get("last_elapsed") is not None:
+        st.success(f"✓ Run completed in {ss.last_elapsed}s — results below.")
+        ss.last_elapsed = None
+
+    # the consolidation run picker matters to the consolidation tabs; in the dev app the daily brief comes first
+    with st.expander(f"Consolidation engine run · {human_ts(stats.get('run_ts', stats.get('computed_at', '—')))}",
+                     expanded=not DEV):
+        # provenance — whose run, when, what scope — so a viewer is never silently shown someone else's run
+        if VRID:
+            st.caption(f"Viewing **your run** · by **{_who(stats.get('triggered_by'))}** · "
+                       f"{human_ts(stats.get('run_ts', stats.get('computed_at', '—')))} · "
+                       f"scope **{stats.get('country_scope', 'ALL')}**"
+                       + (f" · category **{stats.get('category_scope')}**"
+                          if str(stats.get('category_scope') or 'ALL') not in ('ALL', 'None', 'nan') else "")
+                       + f"  ·  run `{VRID}`")
+        else:
+            st.caption("Viewing the **latest completed run** (shared across users). "
+                       "Run the engine to get your own isolated view.")
+
+        # run picker — view any recent run (each user can always return to their own or a full-scope run)
+        _log = dbio.list_run_log(25)
+        fh = st.columns([4, 1], vertical_alignment="bottom")
+        if not _log.empty:
+            _labels, _map = [], {}
+            for _, r in _log.iterrows():
+                lbl = (f"{human_ts(r['run_ts'])} · {_who(r.get('triggered_by'))} · "
+                       f"{r['country_scope']}"
+                       + (f" · {r['category_scope']}" if str(r.get('category_scope') or 'ALL') != 'ALL' else "")
+                       + f" · {int(float(r['recommended_moves'] or 0))} moves")
+                _labels.append(lbl); _map[lbl] = r["run_id"]
+            _idx = next((i for i, l in enumerate(_labels) if _map[l] == VRID), 0)
+            pick = fh[0].selectbox("View a run", _labels, index=_idx, key="run_picker")
+            if _map[pick] != VRID:
+                try:
+                    ss.view_run_id = _map[pick]
+                    ss.recs = dbio.load_recommendations(run_id=ss.view_run_id)
+                    ss.stats = dbio.load_run_stats(run_id=ss.view_run_id)
+                    ss.run_state = "results" if len(ss.recs) else "no-results"
+                except Exception as e:
+                    st.warning(f"Could not load that run: {e}")
+                st.rerun()
+        else:
+            fh[0].caption(f"Latest results computed: **{human_ts(stats.get('computed_at', '—'))}**  ·  "
+                          f"{sv('countries')} countries")
+        if fh[1].button("↻ Refresh results", use_container_width=True):
+            try:
+                ss.recs = dbio.load_recommendations(run_id=VRID); ss.stats = dbio.load_run_stats(run_id=VRID)
+            except Exception as e:
+                st.warning(f"Could not refresh: {e}")
+            st.rerun()
+
+    tab_brief, tab_fc, tab_agent, tab_all, tab_replen = st.tabs(
+        ["Daily brief", "Forecast & allocation", "Agent lab", "Store consolidation", "Replenishment (DC → store)"])
+
+    _render_brief_and_forecast(tab_brief, tab_fc)
 
     # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
     with tab_agent:
