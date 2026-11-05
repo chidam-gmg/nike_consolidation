@@ -18,6 +18,24 @@ import pandas as pd
 WEEKS = 13
 K = 10
 W_MODEL = 0.5
+IMAGE_TAGS = ["fit", "pattern", "graphic_size", "text_graphic", "logo_size", "style", "base_colour"]
+MASTER_W = {"ah2": 3.0, "sport": 2.0, "silhouette": 1.5, "plc": 1.0, "colour_family": 1.0, "price": 2.0}
+# Image + attribute weights, learned per scope where they have been validated (tees launched Mar-Oct 2025, checked on
+# Spring 2026 tees). A style uses them only if it is in scope AND has an image read; otherwise MASTER_W (fallback).
+IMAGE_WEIGHTS = {
+    ("APPAREL", "MENS", "TEES AND T-SHIRTS"): {
+        "weights": {"sport": 5.0, "silhouette": 5.0, "plc": 0.5, "family": 2.0, "price": 3.0, "colour_family": 0.0,
+                    "fit": 0.5, "pattern": 1.0, "graphic_size": 0.0, "text_graphic": 1.0, "logo_size": 5.0,
+                    "style": 0.0, "base_colour": 1.0},
+        "validation": {"styles": 301, "error": 0.79, "within_2x": 0.45, "rank": 0.48,
+                       "error_fallback": 0.86, "within_2x_fallback": 0.38, "rank_fallback": 0.42},
+    },
+}
+
+
+def family(name) -> str:
+    """Product family from the name's first three words, e.g. 'AIR JORDAN 4', 'M NK DF'."""
+    return " ".join("".join(ch if ch.isalnum() or ch == " " else " " for ch in str(name).upper()).split()[:3])
 
 
 def colour_map(attrs: pd.DataFrame, colour: pd.DataFrame) -> dict:
@@ -27,8 +45,14 @@ def colour_map(attrs: pd.DataFrame, colour: pd.DataFrame) -> dict:
     return x.groupby("c0")["colour"].agg(lambda s: s.value_counts().index[0]).to_dict()
 
 
-def attributes(attrs: pd.DataFrame, colour: pd.DataFrame, cmap: dict) -> pd.DataFrame:
+def attributes(attrs: pd.DataFrame, colour: pd.DataFrame, cmap: dict, tags: pd.DataFrame | None = None) -> pd.DataFrame:
     a = attrs.merge(colour[["parent", "colour", "url"]], on="parent", how="left")
+    a["family"] = a["name"].map(family)
+    if tags is not None and len(tags):
+        a = a.merge(tags[["parent"] + IMAGE_TAGS + ["source"]].rename(columns={"source": "image_source"}), on="parent", how="left")
+    else:
+        for c in IMAGE_TAGS + ["image_source"]:
+            a[c] = None
     a["rrp"] = pd.to_numeric(a["rrp"], errors="coerce")
     a["colour_family"] = a["colour"].fillna(a["colourway"].fillna("").str[:1].map(cmap))
     for c in ("division", "ah2", "gender", "sport", "silhouette", "plc", "colour_family"):
@@ -51,19 +75,34 @@ def history(launch: pd.DataFrame, attr: pd.DataFrame) -> tuple:
     return tot, share[["parent", "country", "share"]].fillna(0), curve
 
 
+def _price(t, H):
+    if not t.rrp or not t.rrp > 0:
+        return np.zeros(len(H))
+    r = H["rrp"].values
+    return np.nan_to_num(np.exp(-np.abs(np.log(np.where(r > 0, r, np.nan) / t.rrp)) / 0.25))
+
+
+def _parts(t, H, w: dict) -> tuple:
+    """Weighted similarity of target t to every row of H, plus each attribute's match (1/0, price 0-1)."""
+    parts = {}
+    for f in ("ah2", "sport", "silhouette", "plc", "colour_family", "family") + tuple(IMAGE_TAGS):
+        if w.get(f, 0) and f in H:
+            v = getattr(t, f, None)
+            parts[f] = ((H[f].values == v) & pd.notna(v)).astype(float)
+    if w.get("price", 0):
+        parts["price"] = _price(t, H)
+    total = sum(w[f] * m for f, m in parts.items()) if parts else np.zeros(len(H))
+    return np.asarray(total, float), parts
+
+
 def _score(t, H):
-    """Similarity of target row t to history H (same division x gender already)."""
-    s = (3.0 * (H["ah2"].values == t.ah2) + 2.0 * (H["sport"].values == t.sport)
-         + 1.5 * (H["silhouette"].values == t.silhouette) + 1.0 * (H["plc"].values == t.plc)
-         + 1.0 * (H["colour_family"].values == t.colour_family))
-    if t.rrp and t.rrp > 0:
-        r = H["rrp"].values
-        s = s + 2.0 * np.exp(-np.abs(np.log(np.where(r > 0, r, np.nan) / t.rrp)) / 0.25)
-    return np.nan_to_num(s)
+    """Similarity of target row t to history H with the fallback (master attribute) weights."""
+    return _parts(t, H, MASTER_W)[0]
 
 
 def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL, k: int = K) -> pd.DataFrame:
-    """One row per target style: tier, A / B / C estimates (13-week region units), blend, analogue list."""
+    """One row per target style: tier, method, A / B / C estimates (13-week region units), blend, analogues with the
+    score and the attributes each one matched."""
     H = hist.reset_index(drop=True)
     by_dg = {key: g for key, g in H.groupby(["division", "gender"])}
     by_model = {m: g for m, g in H.groupby("model")}
@@ -74,11 +113,24 @@ def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL
         sib = sib[sib["parent"] != t.parent] if sib is not None else None
         a = float(sib["units"].mean()) if sib is not None and len(sib) else np.nan
         g = by_dg.get((t.division, t.gender))
-        b, ana = np.nan, []
+        b, ana, detail, method = np.nan, [], [], "attributes"
         if g is not None and len(g):
-            sc = _score(t, g)
-            top = g.assign(sc=sc).sort_values(["sc", "first_sale"], ascending=[False, False]).head(k)
+            img = IMAGE_WEIGHTS.get((t.division, t.gender, t.ah2))
+            if img and pd.notna(getattr(t, "fit", None)):
+                cand = g[(g["ah2"] == t.ah2) & g["fit"].notna()]
+                if len(cand) >= 5 * k:
+                    g, w, method = cand, img["weights"], "image + attributes"
+                else:
+                    w = MASTER_W
+            else:
+                w = MASTER_W
+            sc, parts = _parts(t, g, w)
+            order = np.lexsort((-g["first_sale"].values.astype("int64"), -sc))[:k]
+            top = g.iloc[order]
             b, ana = float(top["units"].mean()), top["parent"].tolist()
+            for j in order:
+                detail.append({"analogue": g["parent"].iloc[j], "score": float(sc[j]),
+                               "matched": ", ".join(f for f, m in parts.items() if (m[j] >= 0.5))})
         c = float(clus.get((t.division, t.ah2, t.gender), np.nan))
         if not np.isnan(a) and not np.isnan(b):
             est, tier = w_model * a + (1 - w_model) * b, "A · same model"
@@ -88,9 +140,9 @@ def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL
             est, tier = b, "B · look-alikes"
         else:
             est, tier = c, "C · cluster"
-        rows.append({"parent": t.parent, "tier": tier, "est_a": a, "est_b": b, "est_c": c,
+        rows.append({"parent": t.parent, "tier": tier, "method": method, "est_a": a, "est_b": b, "est_c": c,
                      "units_13w": max(0.0, float(est)) if not np.isnan(est) else 0.0,
-                     "siblings": 0 if sib is None else len(sib), "analogues": ana})
+                     "siblings": 0 if sib is None else len(sib), "analogues": ana, "detail": detail})
     return pd.DataFrame(rows)
 
 
@@ -134,12 +186,14 @@ def p80_multiplier(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
     return m.groupby("tier")["r"].quantile(0.8).clip(lower=1.0).to_dict()
 
 
-def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season: str, year: str) -> dict:
-    """Back-test on last year's same season, then forecast the target season from all launch history."""
+def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season: str, year: str,
+        tags: pd.DataFrame | None = None) -> dict:
+    """Back-test on last year's same season, then forecast the target season from all launch history.
+    tags: product attributes read from images (nl_image_tags); styles without them use the attribute fallback."""
     for c in ("units", "wk", "stores"):
         launch[c] = pd.to_numeric(launch[c], errors="coerce").fillna(0)
     cmap = colour_map(attrs0, colour)
-    A = attributes(attrs0, colour, cmap)
+    A = attributes(attrs0, colour, cmap, tags)
     tot, share, curve = history(launch, A)
     prev_year = str(int(year) - 1)
 
@@ -162,6 +216,9 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
         j = pd.concat([p, y], axis=1, keys=["p", "y"]).fillna(0)
         rows.append({"level": " x ".join(by), "groups": len(j), "styles": len(T),
                      "wape": float(np.abs(j.p - j.y).sum() / j.y.sum()), "bias": float(j.p.sum() / j.y.sum() - 1), "within_2x": np.nan})
+    for meth in sorted(bt["method"].unique()):
+        sub = bt[bt["method"] == meth]
+        rows.append({"level": f"style · {meth}", "groups": len(sub), **score(sub, T)})
     m = bt.merge(T[["parent", "units"]], on="parent")
     backtest = pd.DataFrame(rows).assign(season=f"{season} {prev_year}", cutoff=str(cut.date()),
                                          p80_cover=float(np.mean(m["units"] <= m["units_13w"] * m["tier"].map(mult))))
@@ -176,7 +233,7 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
     lw = prev.groupby("division")["first_sale"].median() + pd.DateOffset(years=1)
     lw = lw.apply(lambda d: (d - pd.Timedelta(days=d.weekday())).normalize())
     styles = fc.merge(tgt[["parent", "name", "model", "colourway", "division", "ah2", "gender", "sport", "silhouette",
-                           "plc", "rrp", "colour_family", "url"]], on="parent", how="left")
+                           "plc", "rrp", "colour_family", "family", "url", "image_source"] + IMAGE_TAGS], on="parent", how="left")
     styles["launch_week"] = styles["division"].map(lw).fillna(lw.median() if len(lw) else pd.NaT)
     lc = launch_curve(tot, curve)
     wk = []
@@ -187,15 +244,24 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
                        "units_p50": r.units_13w * float(shp[w]), "units_p80": r.units_p80 * float(shp[w])})
     names = attrs0.set_index("parent")["name"].to_dict()
     ana = []
+    units = tot.set_index("parent")["units"].to_dict(); first = tot.set_index("parent")["first_sale"].to_dict()
     for r in styles.itertuples():
-        src = [(p, "same model") for p in sib.get(r.parent, [])[:5]] + [(p, "look-alike") for p in list(r.analogues)[:5]]
-        for rank, (p, kind) in enumerate(src):
-            h = tot.loc[tot["parent"] == p]
-            if len(h):
+        src = [(p, "same model", None, "same model") for p in sib.get(r.parent, [])[:5]] + \
+              [(d["analogue"], "look-alike", d["score"], d["matched"]) for d in r.detail]
+        for rank, (p, kind, sc, matched) in enumerate(src):
+            if p in units:
                 ana.append({"parent": r.parent, "rank": rank, "kind": kind, "analogue": p, "analogue_name": names.get(p),
-                            "analogue_units_13w": float(h["units"].iloc[0]), "analogue_first_sale": h["first_sale"].iloc[0].date()})
+                            "analogue_units_13w": float(units[p]), "analogue_first_sale": first[p].date(),
+                            "score": sc, "matched": matched})
     styles["siblings"] = styles["siblings"].astype(int)
+    styles = styles.drop(columns="detail")
     styles["analogues"] = styles["analogues"].apply(lambda x: ",".join(list(x)[:5]))
     styles["launch_week"] = styles["launch_week"].dt.date
+    wrows = [{"scope": "fallback · all styles", "attribute": f, "kind": "image" if f in IMAGE_TAGS else "master", "weight": v}
+             for f, v in MASTER_W.items()]
+    for key, cfg in IMAGE_WEIGHTS.items():
+        for f, v in cfg["weights"].items():
+            wrows.append({"scope": " · ".join(key), "attribute": f, "kind": "image" if f in IMAGE_TAGS else "master", "weight": v,
+                          **{f"val_{k}": x for k, x in cfg["validation"].items()}})
     return {"styles": styles, "country": country, "weekly": pd.DataFrame(wk), "analogues": pd.DataFrame(ana),
-            "backtest": backtest, "mult": mult}
+            "backtest": backtest, "mult": mult, "weights": pd.DataFrame(wrows)}

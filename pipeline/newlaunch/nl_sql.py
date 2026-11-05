@@ -31,3 +31,7 @@ ATTRS = f"""SELECT RT_CONFMAT parent, MAX(split(RT_CONFMAT, '-')[0]) model, MAX(
 FROM {PM} WHERE MATL_CAT = '02' AND MATERIAL LIKE 'NK%' GROUP BY RT_CONFMAT"""
 
 COLOUR = f"""SELECT parent, colour, url FROM {FQ}.dim_product_image"""
+
+# Product attributes read from images (Databricks vision endpoint); styles without a row use the attribute fallback
+IMAGE_TAGS_SQL = f"""SELECT parent, source, fit, pattern, graphic_size, text_graphic, logo_size, style, base_colour
+FROM {FQ}.nl_image_tags"""

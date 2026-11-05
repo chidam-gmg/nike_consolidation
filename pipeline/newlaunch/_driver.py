@@ -8,7 +8,11 @@ RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid
 L = spark.sql(LAUNCH).toPandas()
 A0 = spark.sql(ATTRS).toPandas()
 C = spark.sql(COLOUR).toPandas()
-o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR)
+try:
+    TG = spark.sql(IMAGE_TAGS_SQL).toPandas()
+except Exception as e:                       # no image tags yet: every style uses the attribute fallback
+    print("no image tags:", e); TG = None
+o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR, TG)
 
 
 def save(pdf, table):
@@ -22,5 +26,6 @@ def save(pdf, table):
 
 
 for name, table in (("styles", "nl_forecast"), ("country", "nl_forecast_country"), ("weekly", "nl_forecast_weekly"),
-                    ("analogues", "nl_analogues"), ("backtest", "nl_backtest")):
+                    ("analogues", "nl_analogues"), ("backtest", "nl_backtest"),
+                    ("weights", "nl_weights")):
     save(o[name], table)

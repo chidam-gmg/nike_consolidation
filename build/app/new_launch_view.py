@@ -9,6 +9,7 @@ import streamlit as st
 
 import brief_view
 import databricks_io as dbio
+import launch_story
 
 COUNTRY = {"AE": "UAE", "SA": "KSA", "KW": "Kuwait", "QA": "Qatar", "BH": "Bahrain", "OM": "Oman", "EG": "Egypt"}
 
@@ -19,7 +20,10 @@ def _label(name) -> str:
 
 @st.cache_data(show_spinner="Reading the launch forecast…", ttl=600)
 def _styles() -> pd.DataFrame:
-    df = dbio.run_sql(f"""SELECT f.*, i.url img FROM {dbio.FQ}.nl_forecast f LEFT JOIN {dbio.FQ}.dim_product_image i USING (parent)""")
+    df = dbio.run_sql(f"""SELECT f.*, coalesce(i.url, t.image_data_uri) img,
+                                 CASE WHEN i.url IS NOT NULL THEN 'Akeneo' WHEN t.image_data_uri IS NOT NULL THEN t.source END img_source
+                          FROM {dbio.FQ}.nl_forecast f LEFT JOIN {dbio.FQ}.dim_product_image i USING (parent)
+                          LEFT JOIN {dbio.FQ}.nl_target_images t USING (parent)""")
     for c in ("units_13w", "units_p80", "rrp", "siblings", "est_a", "est_b", "est_c"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -42,10 +46,23 @@ def _detail(parent: str):
     p = str(parent).replace("'", "''")
     wk = dbio.run_sql(f"SELECT week_start, units_p50, units_p80 FROM {dbio.FQ}.nl_forecast_weekly WHERE parent = '{p}' ORDER BY week_start")
     cc = dbio.run_sql(f"SELECT country, units_13w FROM {dbio.FQ}.nl_forecast_country WHERE parent = '{p}' ORDER BY units_13w DESC")
-    an = dbio.run_sql(f"""SELECT a.kind, a.analogue, a.analogue_name, a.analogue_units_13w, a.analogue_first_sale, i.url img, i.colour
-                          FROM {dbio.FQ}.nl_analogues a LEFT JOIN {dbio.FQ}.dim_product_image i ON i.parent = a.analogue
-                          WHERE a.parent = '{p}' ORDER BY a.rank""")
+    an = dbio.run_sql(f"""SELECT a.kind, a.analogue, a.analogue_name, a.analogue_units_13w, a.analogue_first_sale, a.score, a.matched,
+                                 i.url img, i.colour FROM {dbio.FQ}.nl_analogues a
+                          LEFT JOIN {dbio.FQ}.dim_product_image i ON i.parent = a.analogue WHERE a.parent = '{p}' ORDER BY a.rank""")
+    for c in ("analogue_units_13w", "score"):
+        an[c] = pd.to_numeric(an[c], errors="coerce")
+    for c in ("units_p50", "units_p80"):
+        wk[c] = pd.to_numeric(wk[c], errors="coerce")
+    cc["units_13w"] = pd.to_numeric(cc["units_13w"], errors="coerce")
     return wk, cc, an
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _weights() -> pd.DataFrame:
+    w = dbio.run_sql(f"SELECT * FROM {dbio.FQ}.nl_weights")
+    for c in [c for c in w.columns if c == "weight" or c.startswith("val_")]:
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    return w
 
 
 def _analogue_card(x) -> str:
@@ -129,9 +146,9 @@ def render(theme: str):
     v = v.sort_values("units_13w", ascending=False)
     tab = pd.DataFrame({"Image": v["img"], "Style": v["parent"], "Name": v["name"].map(_label), "Division": v["division"],
                         "Category": v["ah2"], "Gender": v["gender"], "Colour": v["colour_family"],
-                        "Price (AED)": v["rrp"].round(0), "Launch week": v["launch_week"],
+                        "Global price": v["rrp"].round(0), "Launch week": v["launch_week"],
                         "Forecast (13 wks)": v["units_13w"].round(0), "High case": v["units_p80"].round(0),
-                        "Based on": v["tier"]})
+                        "Based on": v["tier"], "Method": v["method"]})
     if v["img"].notna().mean() < 0.2:          # most new-season styles have no image in Akeneo yet
         tab = tab.drop(columns="Image")
     st.dataframe(tab, hide_index=True, use_container_width=True, height=380,
@@ -139,38 +156,24 @@ def render(theme: str):
     st.download_button(f"Download ({len(tab):,} styles)", data=dbio.to_csv_bytes(tab.drop(columns="Image", errors="ignore")),
                        file_name="new_launch_forecast.csv", mime="text/csv", key="nl_dl")
 
-    st.markdown("##### Why this number")
+    st.markdown("##### New article walkthrough")
+    st.caption("Pick any style: its image, what we know about it, how much each attribute counts, the past launches it "
+               "looks like and what they sold, and how the number is worked out.")
     if v.empty:
         st.caption("No styles match the filters.")
         return
-    opts = [f"{_label(r.name)} · {r.parent} · {r.units_13w:,.0f}" for r in v.head(300).itertuples()]
-    pick = st.selectbox("Style", opts, key="nl_pick", label_visibility="collapsed")
-    r = v.iloc[opts.index(pick)]
+    pool = pd.concat([v[v["method"] == "image + attributes"], v.head(300)]).drop_duplicates("parent")   # image-read styles first
+    opts = [f"{_label(x.name)} · {x.parent} · {x.method} · {x.units_13w:,.0f}" for x in pool.itertuples()]
+    default = next((i for i, x in enumerate(pool.itertuples()) if x.parent == "NKIR2969-010"), 0)
+    pick = st.selectbox("Style", opts, index=default, key="nl_pick", label_visibility="collapsed")
+    r = pool.iloc[opts.index(pick)]
     wk, cty, an = _detail(r["parent"])
-    d = st.columns([1, 1.6], gap="large")
-    with d[0]:
-        if isinstance(r.get("img"), str) and r["img"]:
-            st.image(r["img"], use_container_width=True)
-        st.markdown(f"**{html.escape(_label(r['name']))}** · {r['parent']}  \n"
-                    f"{r['division'].title()} · {str(r['ah2']).title()} · {r['gender'].title()} · {str(r['sport']).title()} · "
-                    f"{r['colour_family']} · AED {r['rrp']:,.0f} · {r['plc']}")
-        st.metric("Forecast · first 13 weeks", f"{r['units_13w']:,.0f}", help="Most likely, all countries")
-        st.caption(f"High case {r['units_p80']:,.0f} (8 in 10 similar launches sold less) · launch week {r['launch_week']} "
-                   f"(assumed) · based on {str(r['tier']).split('·')[1].strip()}")
-        if not cty.empty:
-            cty["units_13w"] = pd.to_numeric(cty["units_13w"], errors="coerce")
-            st.caption("By country: " + " · ".join(f"{COUNTRY.get(c, c)} {u:,.0f}" for c, u in zip(cty["country"], cty["units_13w"])))
-    with d[1]:
-        if not wk.empty:
-            for c in ("units_p50", "units_p80"):
-                wk[c] = pd.to_numeric(wk[c], errors="coerce")
-            wk["week_start"] = pd.to_datetime(wk["week_start"])
-            st.line_chart(wk.set_index("week_start").rename(columns={"units_p50": "Most likely", "units_p80": "High case"}), height=220)
-        if not an.empty:
-            an["analogue_units_13w"] = pd.to_numeric(an["analogue_units_13w"], errors="coerce")
-            cards = "".join(_analogue_card(x) for x in an.itertuples())
-            st.markdown(f"<div class='bf-note' style='margin:4px 0 8px'>The past launches this forecast borrows from — "
-                        f"their actual first 13 weeks:</div><div class='nl-ana'>{cards}</div>", unsafe_allow_html=True)
+    w = _weights()
+    scope = " · ".join([str(r["division"]), str(r["gender"]), str(r["ah2"])])
+    ws = w[w["scope"] == scope] if r["method"] == "image + attributes" else w[w["scope"].str.startswith("fallback")]
+    mult = (r["units_p80"] / r["units_13w"]) if r["units_13w"] else None
+    launch_story.render(r.to_dict(), r["img"] if isinstance(r["img"], str) else None,
+                        r["img_source"] if isinstance(r.get("img_source"), str) else None, an, ws, cty, wk, bt, mult, theme=theme)
 
     with st.expander("How accurate is this? Back-test on last spring"):
         b = bt.copy()
