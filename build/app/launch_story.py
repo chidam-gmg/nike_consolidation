@@ -14,10 +14,10 @@ THEMES = {
     "dark": dict(bg="#0A0D16", card="#111626", line="#252E48", ink="#E5E9F4", dim="#8F98B3", faint="#4A5372",
                  accent="#6B92FF", accent_soft="#18244A", warm="#EB9677", warm_soft="#3A2219", ok="#5FD49A", ok_soft="#123024"),
 }
-LABEL = {"ah2": "Category", "sport": "Sport", "silhouette": "Silhouette", "plc": "Life cycle", "colour_family": "Colour (code)",
+LABEL = {"look": "Looks alike (image)", "ah2": "Category", "sport": "Sport", "silhouette": "Silhouette", "plc": "Life cycle", "colour_family": "Colour (code)",
          "family": "Name family", "price": "Price", "fit": "Fit", "pattern": "Pattern", "graphic_size": "Graphic size",
          "text_graphic": "Text graphic", "logo_size": "Logo size", "style": "Style", "base_colour": "Base colour"}
-IMAGE = {"fit", "pattern", "graphic_size", "text_graphic", "logo_size", "style", "base_colour"}
+IMAGE = {"fit", "pattern", "graphic_size", "text_graphic", "logo_size", "style", "base_colour", "look"}
 COUNTRY = {"AE": "UAE", "SA": "KSA", "KW": "Kuwait", "QA": "Qatar", "BH": "Bahrain", "OM": "Oman", "EG": "Egypt"}
 
 
@@ -34,6 +34,8 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
     c = THEMES.get(theme, THEMES["light"])
     unit = "pairs" if str(r.get("division")).upper() == "FOOTWEAR" else "units"
     image_method = str(r.get("method")) == "image + attributes"
+    look_sim = r.get("look_similarity")
+    low = str(r.get("confidence", "")).startswith("low")
     look = ana[ana["kind"] == "look-alike"].copy()
     sibs = ana[ana["kind"] == "same model"].copy()
     est_b = float(look["analogue_units_13w"].mean()) if len(look) else float("nan")
@@ -65,7 +67,8 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
         pic = f'<img src="{_e(x.img)}" alt="">' if isinstance(x.img, str) and x.img else '<div class="noimg">no image</div>'
         chips = "".join(f'<span class="chip{" img" if m.strip() in IMAGE else ""}">{_e(LABEL.get(m.strip(), m.strip()))}</span>'
                         for m in str(x.matched or "").split(",") if m.strip() and x.kind == "look-alike")
-        sc = f'<span class="sc">score {x.score:.1f}</span>' if pd.notna(x.score) else '<span class="sc">same model</span>'
+        sc = (f'<span class="sc">score {x.score:.1f}' + (f' · looks {x.look:.2f} alike' if pd.notna(getattr(x, "look", None)) else '')
+              + '</span>') if pd.notna(x.score) else '<span class="sc">same model</span>'
         return (f'<div class="ana">{pic}<div class="an">{_e(_label(x.analogue_name))}</div>{sc}'
                 f'<div class="au"><b>{x.analogue_units_13w:,.0f}</b> {unit} in 13 wks</div><div class="chips">{chips}</div></div>')
     cards = "".join(card(x) for x in pd.concat([sibs, look]).itertuples())
@@ -105,10 +108,20 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
                      f"{float(st_['within_2x']) * 100:.0f}% of the time, but totals land within "
                      f"<b>±{float(ct_['wape']) * 100:.0f}%</b> by country and <b>±{float(dg_['wape']) * 100:.0f}%</b> by "
                      f"division × gender — the level buys are planned at.")
+    if low:
+        trust.insert(0, "<b>Low confidence:</b> an image was read, but no past launch looks much like this one (visual "
+                        f"similarity {float(look_sim):.2f}, below 0.45). It is a new look for the range, so treat the number as a "
+                        "starting point for the buyer, not a forecast to plan on.")
+    if image_method and len(vrow) and pd.notna(vrow.iloc[0].get("val_bias", None)):
+        trust.append(f"Image look-alikes forecast on the high side in the test (bias {vrow.iloc[0].val_bias * 100:+.0f}% vs "
+                     f"{vrow.iloc[0].val_bias_fallback * 100:+.0f}% for attributes alone) — the price of choosing look-alikes that "
+                     "really look alike.")
     trust.append("This style has not sold yet, so its own error cannot be measured; these figures come from forecasting last "
                  "spring as if it were new and comparing with what actually sold.")
 
     method_pill = ("Image + attributes" if image_method else "Attributes (no image read)")
+    conf_pill = (f'<span class="pill warn">Low confidence · closest look-alikes only {float(look_sim):.2f} alike</span>' if low else
+                 (f'<span class="pill ok">Look-alikes {float(look_sim):.2f} alike</span>' if look_sim is not None and look_sim == look_sim else ""))
     css = f"""
     @import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap');
     * {{ box-sizing:border-box; margin:0; }}
@@ -121,6 +134,7 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
     .pill {{ display:inline-block; border-radius:999px; padding:3px 11px; font-size:12px; font-weight:700; margin-right:6px;
              background:{c['accent_soft']}; color:{c['accent']}; }}
     .pill.warm {{ background:{c['warm_soft']}; color:{c['warm']}; }}
+    .pill.warn {{ background:{c['warm']}; color:#FFFFFF; }} .pill.ok {{ background:{c['ok_soft']}; color:{c['ok']}; }}
     .big {{ margin-left:auto; text-align:right; }} .big .v {{ font-size:40px; font-weight:700; line-height:1; }}
     .sec {{ border:1px solid {c['line']}; border-radius:14px; padding:14px 16px; margin-top:14px; }}
     .sec h2 {{ font:600 16px/1.3 'Source Sans 3', sans-serif; margin-bottom:8px; }}
@@ -152,7 +166,7 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
       <div><div class="eyebrow">New article walkthrough · Spring 2027 · no sales yet</div>
         <h1>{_e(_label(r.get('name')))}</h1>
         <div class="dim">{_e(r.get('parent'))} · launch week {_e(r.get('launch_week'))} (assumed)</div>
-        <div style="margin-top:6px"><span class="pill">{method_pill}</span><span class="pill warm">{_e(r.get('tier'))}</span>
+        <div style="margin-top:6px"><span class="pill">{method_pill}</span><span class="pill warm">{_e(r.get('tier'))}</span>{conf_pill}
           {f'<span class="dim small">image: {_e(img_src)}</span>' if img_src else ''}</div></div>
       <div class="big"><div class="eyebrow">Forecast · first 13 weeks</div><div class="v">{p50:,.0f}</div>
         <div class="dim">{unit} · high case {p80:,.0f}</div></div>
@@ -165,7 +179,7 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
     <div class="sec"><h2><span class="n">2</span>How much each attribute counts</h2>
       <div class="two"><div>{wbars}<div class="legend"><i style="background:{c['ink']}"></i>product master
         <i style="background:{c['accent']}"></i>read from the image</div></div>
-        <div class="dim">{'These weights were learned from data: men’s tees launched March–October 2025, each forecast only from launches that had finished their first 13 weeks before it. Sport, silhouette and logo size matter most; style and graphic size added nothing, so they carry no weight.' if image_method else 'This style uses the standard attribute weights (no image read yet, or its category has no validated image weights). Once an image is read and its category is validated, it moves to the image + attribute weights.'}</div></div></div>
+        <div class="dim">{'Learned from data: men’s tees launched March–October 2025, each forecast only from launches that had finished their first 13 weeks before it. Each attribute scores 1 when it matches. “Looks alike” is a 0–1 visual similarity from the image fingerprints, so it carries a larger weight, but between close candidates it moves the score about as much as one matched attribute. Sport, silhouette and logo size matter most among the rest; style and graphic size added nothing, so they carry no weight.' if image_method else 'This style uses the standard attribute weights (no image read yet, or its category has no validated image weights). Once an image is read and its category is validated, it moves to the image + attribute weights.'}</div></div></div>
 
     <div class="sec"><h2><span class="n">3</span>Who it looks like — and what actually sold</h2>
       <div class="dim small" style="margin-bottom:8px">Each past launch is scored on the attributes above; blue chips were matched from the image.</div>
@@ -178,5 +192,5 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
     </body></html>"""
 
 
-def render(*args, theme: str = "light", height: int = 1900, **kw):
+def render(*args, theme: str = "light", height: int = 2050, **kw):
     components.html(build(*args, theme=theme, **kw), height=height, scrolling=True)

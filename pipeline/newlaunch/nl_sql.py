@@ -35,3 +35,6 @@ COLOUR = f"""SELECT parent, colour, url FROM {FQ}.dim_product_image"""
 # Product attributes read from images (Databricks vision endpoint); styles without a row use the attribute fallback
 IMAGE_TAGS_SQL = f"""SELECT parent, source, fit, pattern, graphic_size, text_graphic, logo_size, style, base_colour
 FROM {FQ}.nl_image_tags"""
+
+# Image fingerprints (CLIP) for visual similarity in the image + attribute look-alikes
+EMBEDDINGS_SQL = f"""SELECT parent, embedding FROM {FQ}.nl_image_embeddings"""

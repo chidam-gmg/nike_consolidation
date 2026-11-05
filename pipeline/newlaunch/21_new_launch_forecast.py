@@ -43,6 +43,9 @@ COLOUR = f"""SELECT parent, colour, url FROM {FQ}.dim_product_image"""
 IMAGE_TAGS_SQL = f"""SELECT parent, source, fit, pattern, graphic_size, text_graphic, logo_size, style, base_colour
 FROM {FQ}.nl_image_tags"""
 
+# Image fingerprints (CLIP) for visual similarity in the image + attribute look-alikes
+EMBEDDINGS_SQL = f"""SELECT parent, embedding FROM {FQ}.nl_image_embeddings"""
+
 # COMMAND ----------
 """New-article (launch) forecast — styles with no sales history.
 
@@ -63,6 +66,7 @@ import pandas as pd
 WEEKS = 13
 K = 10
 W_MODEL = 0.5
+LOW_LOOK = 0.45                   # look-alikes below this visual similarity are not really alike
 IMAGE_TAGS = ["fit", "pattern", "graphic_size", "text_graphic", "logo_size", "style", "base_colour"]
 MASTER_W = {"ah2": 3.0, "sport": 2.0, "silhouette": 1.5, "plc": 1.0, "colour_family": 1.0, "price": 2.0}
 # Image + attribute weights, learned per scope where they have been validated (tees launched Mar-Oct 2025, checked on
@@ -71,9 +75,12 @@ IMAGE_WEIGHTS = {
     ("APPAREL", "MENS", "TEES AND T-SHIRTS"): {
         "weights": {"sport": 5.0, "silhouette": 5.0, "plc": 0.5, "family": 2.0, "price": 3.0, "colour_family": 0.0,
                     "fit": 0.5, "pattern": 1.0, "graphic_size": 0.0, "text_graphic": 1.0, "logo_size": 5.0,
-                    "style": 0.0, "base_colour": 1.0},
-        "validation": {"styles": 301, "error": 0.79, "within_2x": 0.45, "rank": 0.48,
-                       "error_fallback": 0.86, "within_2x_fallback": 0.38, "rank_fallback": 0.42},
+                    "style": 0.0, "base_colour": 1.0, "look": 20.0},
+        # look = visual similarity of the image fingerprints (CLIP cosine). It adds nothing to accuracy on its own
+        # (learning set it to 0) but at 20 accuracy holds (80% vs 79% error, within 2x 48% vs 45%) and the look-alikes
+        # actually look alike (similarity 0.69 vs 0.63); forecasts run higher on these styles (bias +19% vs +10%).
+        "validation": {"styles": 301, "error": 0.80, "within_2x": 0.48, "rank": 0.48, "bias": 0.19,
+                       "error_fallback": 0.86, "within_2x_fallback": 0.38, "rank_fallback": 0.42, "bias_fallback": 0.05},
     },
 }
 
@@ -127,9 +134,12 @@ def _price(t, H):
     return np.nan_to_num(np.exp(-np.abs(np.log(np.where(r > 0, r, np.nan) / t.rrp)) / 0.25))
 
 
-def _parts(t, H, w: dict) -> tuple:
-    """Weighted similarity of target t to every row of H, plus each attribute's match (1/0, price 0-1)."""
+def _parts(t, H, w: dict, emb: dict | None = None) -> tuple:
+    """Weighted similarity of target t to every row of H, plus each attribute's match (1/0, price 0-1, look = visual
+    similarity 0-1 from image fingerprints)."""
     parts = {}
+    if w.get("look", 0) and emb is not None and t.parent in emb:
+        parts["look"] = np.array([float(emb[p] @ emb[t.parent]) if p in emb else 0.0 for p in H["parent"]])
     for f in ("ah2", "sport", "silhouette", "plc", "colour_family", "family") + tuple(IMAGE_TAGS):
         if w.get(f, 0) and f in H:
             v = getattr(t, f, None)
@@ -145,7 +155,7 @@ def _score(t, H):
     return _parts(t, H, MASTER_W)[0]
 
 
-def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL, k: int = K) -> pd.DataFrame:
+def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL, k: int = K, emb: dict | None = None) -> pd.DataFrame:
     """One row per target style: tier, method, A / B / C estimates (13-week region units), blend, analogues with the
     score and the attributes each one matched."""
     H = hist.reset_index(drop=True)
@@ -163,19 +173,22 @@ def forecast(targets: pd.DataFrame, hist: pd.DataFrame, w_model: float = W_MODEL
             img = IMAGE_WEIGHTS.get((t.division, t.gender, t.ah2))
             if img and pd.notna(getattr(t, "fit", None)):
                 cand = g[(g["ah2"] == t.ah2) & g["fit"].notna()]
+                if img["weights"].get("look") and emb is not None:
+                    cand = cand[cand["parent"].isin(emb.keys())] if t.parent in emb else cand.iloc[0:0]
                 if len(cand) >= 5 * k:
                     g, w, method = cand, img["weights"], "image + attributes"
                 else:
                     w = MASTER_W
             else:
                 w = MASTER_W
-            sc, parts = _parts(t, g, w)
+            sc, parts = _parts(t, g, w, emb)
             order = np.lexsort((-g["first_sale"].values.astype("int64"), -sc))[:k]
             top = g.iloc[order]
             b, ana = float(top["units"].mean()), top["parent"].tolist()
             for j in order:
                 detail.append({"analogue": g["parent"].iloc[j], "score": float(sc[j]),
-                               "matched": ", ".join(f for f, m in parts.items() if (m[j] >= 0.5))})
+                               "look": float(parts["look"][j]) if "look" in parts else None,
+                               "matched": ", ".join(f for f, m in parts.items() if f != "look" and m[j] >= 0.5)})
         c = float(clus.get((t.division, t.ah2, t.gender), np.nan))
         if not np.isnan(a) and not np.isnan(b):
             est, tier = w_model * a + (1 - w_model) * b, "A · same model"
@@ -232,13 +245,15 @@ def p80_multiplier(pred: pd.DataFrame, actual: pd.DataFrame) -> dict:
 
 
 def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season: str, year: str,
-        tags: pd.DataFrame | None = None) -> dict:
+        tags: pd.DataFrame | None = None, emb_df: pd.DataFrame | None = None) -> dict:
     """Back-test on last year's same season, then forecast the target season from all launch history.
     tags: product attributes read from images (nl_image_tags); styles without them use the attribute fallback."""
     for c in ("units", "wk", "stores"):
         launch[c] = pd.to_numeric(launch[c], errors="coerce").fillna(0)
     cmap = colour_map(attrs0, colour)
     A = attributes(attrs0, colour, cmap, tags)
+    emb = ({r.parent: np.asarray(r.embedding, dtype=float) for r in emb_df.itertuples()}
+           if emb_df is not None and len(emb_df) else None)
     tot, share, curve = history(launch, A)
     prev_year = str(int(year) - 1)
 
@@ -247,7 +262,7 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
     cut = prev["first_sale"].quantile(0.1) - pd.Timedelta(days=30)
     H = tot[tot["first_sale"] + pd.Timedelta(days=91) <= cut]
     T = prev[prev["first_sale"] >= cut]
-    bt = forecast(A[A["parent"].isin(T["parent"])], H)
+    bt = forecast(A[A["parent"].isin(T["parent"])], H, emb=emb)
     mult = p80_multiplier(bt, T)
     rows = [{"level": "style", "groups": len(T), **score(bt, T)}]
     sib_bt = {t.parent: H.loc[(H["model"] == t.model) & (H["parent"] != t.parent), "parent"].tolist()
@@ -270,7 +285,7 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
 
     # target season: every style tagged season x year that has not sold yet, from all launch history
     tgt = A[(A["season"] == season) & (A["season_year"] == year) & ~A["parent"].isin(tot["parent"])]
-    fc = forecast(tgt, tot)
+    fc = forecast(tgt, tot, emb=emb)
     fc["units_p80"] = fc["units_13w"] * fc["tier"].map(mult).fillna(max(mult.values()) if mult else 1.5)
     sib = {t.parent: tot.loc[(tot["model"] == t.model) & (tot["parent"] != t.parent), "parent"].tolist() for t in tgt.itertuples()}
     country = country_split(fc, share, sib, {})
@@ -291,14 +306,19 @@ def run(launch: pd.DataFrame, attrs0: pd.DataFrame, colour: pd.DataFrame, season
     ana = []
     units = tot.set_index("parent")["units"].to_dict(); first = tot.set_index("parent")["first_sale"].to_dict()
     for r in styles.itertuples():
-        src = [(p, "same model", None, "same model") for p in sib.get(r.parent, [])[:5]] + \
-              [(d["analogue"], "look-alike", d["score"], d["matched"]) for d in r.detail]
-        for rank, (p, kind, sc, matched) in enumerate(src):
+        src = [(p, "same model", None, "same model", None) for p in sib.get(r.parent, [])[:5]] + \
+              [(d["analogue"], "look-alike", d["score"], d["matched"], d.get("look")) for d in r.detail]
+        for rank, (p, kind, sc, matched, look) in enumerate(src):
             if p in units:
                 ana.append({"parent": r.parent, "rank": rank, "kind": kind, "analogue": p, "analogue_name": names.get(p),
                             "analogue_units_13w": float(units[p]), "analogue_first_sale": first[p].date(),
-                            "score": sc, "matched": matched})
+                            "score": sc, "matched": matched, "look": look})
     styles["siblings"] = styles["siblings"].astype(int)
+    looks = styles["detail"].apply(lambda d: [x["look"] for x in d if x.get("look") is not None])
+    styles["look_similarity"] = looks.apply(lambda v: float(np.mean(v)) if v else np.nan)
+    # an image was read but even the closest past launches do not look like it: novel product, low confidence
+    styles["confidence"] = np.where(styles["look_similarity"] < LOW_LOOK, "low · no close look-alike",
+                                    np.where(styles["look_similarity"].notna(), "normal", "attributes only"))
     styles = styles.drop(columns="detail")
     styles["analogues"] = styles["analogues"].apply(lambda x: ",".join(list(x)[:5]))
     styles["launch_week"] = styles["launch_week"].dt.date
@@ -325,7 +345,11 @@ try:
     TG = spark.sql(IMAGE_TAGS_SQL).toPandas()
 except Exception as e:                       # no image tags yet: every style uses the attribute fallback
     print("no image tags:", e); TG = None
-o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR, TG)
+try:
+    EM = spark.sql(EMBEDDINGS_SQL).toPandas()
+except Exception as e:
+    print("no image embeddings:", e); EM = None
+o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR, TG, EM)
 
 
 def save(pdf, table):

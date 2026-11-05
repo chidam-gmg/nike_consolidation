@@ -12,7 +12,11 @@ try:
     TG = spark.sql(IMAGE_TAGS_SQL).toPandas()
 except Exception as e:                       # no image tags yet: every style uses the attribute fallback
     print("no image tags:", e); TG = None
-o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR, TG)
+try:
+    EM = spark.sql(EMBEDDINGS_SQL).toPandas()
+except Exception as e:
+    print("no image embeddings:", e); EM = None
+o = run(L, A0, C, TARGET_SEASON, TARGET_YEAR, TG, EM)
 
 
 def save(pdf, table):

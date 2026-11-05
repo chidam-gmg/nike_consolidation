@@ -24,7 +24,7 @@ def _styles() -> pd.DataFrame:
                                  CASE WHEN i.url IS NOT NULL THEN 'Akeneo' WHEN t.image_data_uri IS NOT NULL THEN t.source END img_source
                           FROM {dbio.FQ}.nl_forecast f LEFT JOIN {dbio.FQ}.dim_product_image i USING (parent)
                           LEFT JOIN {dbio.FQ}.nl_target_images t USING (parent)""")
-    for c in ("units_13w", "units_p80", "rrp", "siblings", "est_a", "est_b", "est_c"):
+    for c in ("units_13w", "units_p80", "rrp", "siblings", "est_a", "est_b", "est_c", "look_similarity"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
@@ -46,10 +46,10 @@ def _detail(parent: str):
     p = str(parent).replace("'", "''")
     wk = dbio.run_sql(f"SELECT week_start, units_p50, units_p80 FROM {dbio.FQ}.nl_forecast_weekly WHERE parent = '{p}' ORDER BY week_start")
     cc = dbio.run_sql(f"SELECT country, units_13w FROM {dbio.FQ}.nl_forecast_country WHERE parent = '{p}' ORDER BY units_13w DESC")
-    an = dbio.run_sql(f"""SELECT a.kind, a.analogue, a.analogue_name, a.analogue_units_13w, a.analogue_first_sale, a.score, a.matched,
+    an = dbio.run_sql(f"""SELECT a.kind, a.analogue, a.analogue_name, a.analogue_units_13w, a.analogue_first_sale, a.score, a.matched, a.look,
                                  i.url img, i.colour FROM {dbio.FQ}.nl_analogues a
                           LEFT JOIN {dbio.FQ}.dim_product_image i ON i.parent = a.analogue WHERE a.parent = '{p}' ORDER BY a.rank""")
-    for c in ("analogue_units_13w", "score"):
+    for c in ("analogue_units_13w", "score", "look"):
         an[c] = pd.to_numeric(an[c], errors="coerce")
     for c in ("units_p50", "units_p80"):
         wk[c] = pd.to_numeric(wk[c], errors="coerce")
@@ -148,7 +148,7 @@ def render(theme: str):
                         "Category": v["ah2"], "Gender": v["gender"], "Colour": v["colour_family"],
                         "Global price": v["rrp"].round(0), "Launch week": v["launch_week"],
                         "Forecast (13 wks)": v["units_13w"].round(0), "High case": v["units_p80"].round(0),
-                        "Based on": v["tier"], "Method": v["method"]})
+                        "Based on": v["tier"], "Method": v["method"], "Confidence": v.get("confidence")})
     if v["img"].notna().mean() < 0.2:          # most new-season styles have no image in Akeneo yet
         tab = tab.drop(columns="Image")
     st.dataframe(tab, hide_index=True, use_container_width=True, height=380,
@@ -164,7 +164,7 @@ def render(theme: str):
         return
     pool = pd.concat([v[v["method"] == "image + attributes"], v.head(300)]).drop_duplicates("parent")   # image-read styles first
     opts = [f"{_label(x.name)} · {x.parent} · {x.method} · {x.units_13w:,.0f}" for x in pool.itertuples()]
-    default = next((i for i, x in enumerate(pool.itertuples()) if x.parent == "NKIR2969-010"), 0)
+    default = next((i for i, x in enumerate(pool.itertuples()) if x.parent == "NKIU5193-010"), 0)
     pick = st.selectbox("Style", opts, index=default, key="nl_pick", label_visibility="collapsed")
     r = pool.iloc[opts.index(pick)]
     wk, cty, an = _detail(r["parent"])
