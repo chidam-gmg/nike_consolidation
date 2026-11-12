@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 import databricks_io as dbio
-import agent_view
+import monitor_view
 import brief
 import brief_view
 import forecast_view
@@ -70,10 +70,15 @@ def get_brands(computed_at: str, run_id=None):
         return []
 
 
-@st.cache_data(show_spinner=False, ttl=60)
-def get_agent_runs():
-    """Recent job runs with task timings (short TTL: the board should follow new runs)."""
-    return dbio.agent_job_runs(30)
+@st.cache_data(show_spinner=False, ttl=55)
+def get_monitor():
+    """Run history for the Live monitor (short TTL: the monitor refreshes every minute)."""
+    return dbio.load_monitor(30)
+
+
+@st.cache_data(show_spinner=False, ttl=25)
+def get_monitor_jobs():
+    return dbio.monitor_job_runs(30)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -171,11 +176,6 @@ def get_al_decisions(run_id, ver: int = 0):
 def get_review_items(run_id, ver: int = 0):
     """Review queue for a run; `ver` bumps after every save so the cache refreshes."""
     return dbio.load_review_items(run_id)
-
-
-@st.cache_data(show_spinner=False)
-def get_agent_metrics(run_id=None, computed_at: str = ""):
-    return dbio.agent_run_metrics(run_id)
 
 
 @st.cache_data(show_spinner=False)
@@ -316,7 +316,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Dark mode — one switch for the whole page (app chrome + Agent lab), so nothing renders half light / half dark.
+# Dark mode — one switch for the whole page (app chrome + every tab), so nothing renders half light / half dark.
 _tg = st.columns([6, 1], vertical_alignment="center")
 DARK = _tg[1].toggle("Dark mode", key="dark_mode", help="Switch the whole app between GMG light and dark.")
 if DARK:
@@ -379,7 +379,8 @@ if DARK:
 THEME = "dark" if DARK else "light"
 
 if DEV:
-    st.warning("DEV PREVIEW — read-only copy on live data. Running the engine and config uploads are disabled here.")
+    st.warning("DEV PREVIEW on live data — running the engine and config uploads are disabled. Workbench decisions and "
+               "sends are saved to wb_decisions / wb_sap_sends; nothing reaches SAP.")
 
 # ATP freshness stamp — snapshot the run used + when that snapshot was loaded upstream (etl_timetsamp)
 try:
@@ -390,6 +391,14 @@ try:
         _tg[0].caption(f"Inventory (ATP) as of **{_atp['atp_snapshot_date']}**{_dmd} · upstream loaded **{_upd}**")
 except Exception:
     pass
+
+# ---------- role pages (workbench) ----------
+# Allocator / Line manager / Executive get the workbench pages; "Engine" falls through to the full analyst app below.
+import workbench
+ROLE = workbench.role_picker()
+if ROLE != "Engine":
+    workbench.render(ROLE, THEME, DEV)
+    st.stop()
 
 # ---------- session ----------
 ss = st.session_state
@@ -666,10 +675,6 @@ if ss.run_state == "running":
                 cols[1].markdown(f"[Open in Databricks ↗]({ss.run_url})")
             if cols[2].button("↻ Refresh now"):
                 st.rerun()
-        try:   # agent lab, live: same board, current task states (no replay while running)
-            agent_view.render(dbio.agent_job_run(ss.run_id), {}, live=True, theme=THEME)
-        except Exception:
-            pass
         time.sleep(4)
         st.rerun()
 
@@ -1041,9 +1046,25 @@ def _render_brief_and_forecast(tab_brief, tab_fc, tab_new=None):
             new_launch_view.render(THEME)
 
 
+@st.fragment(run_every=60)
+def _monitor_body():
+    try:
+        jobs, jobs_err = get_monitor_jobs()
+        monitor_view.render(THEME, get_monitor(), jobs, jobs_err)
+    except Exception as e:
+        st.warning(access_message(e) if is_access_error(e) else f"Live monitor unavailable: {e}")
+
+
+def _render_monitor(tab):
+    with tab:
+        _monitor_body()
+
+
 if ss.run_state != "results":
-    _tb, _tf, _tn, _tc = st.tabs(["Daily brief", "Forecast & allocation", "New launches", "Store consolidation"])
+    _tm, _tb, _tf, _tn, _tc = st.tabs(["Live monitor", "Daily brief", "Forecast & allocation", "New launches",
+                                       "Store consolidation"])
     _render_brief_and_forecast(_tb, _tf, _tn)
+    _render_monitor(_tm)
     _cons = _tc
 else:
     _cons = st
@@ -1127,187 +1148,12 @@ elif ss.run_state == "results":
                 st.warning(f"Could not refresh: {e}")
             st.rerun()
 
-    tab_brief, tab_fc, tab_new, tab_agent, tab_all, tab_replen = st.tabs(
-        ["Daily brief", "Forecast & allocation", "New launches", "Agent lab", "Store consolidation", "Replenishment (DC → store)"])
+    tab_mon, tab_brief, tab_fc, tab_new, tab_all, tab_replen = st.tabs(
+        ["Live monitor", "Daily brief", "Forecast & allocation", "New launches", "Store consolidation",
+         "Replenishment (DC → store)"])
 
     _render_brief_and_forecast(tab_brief, tab_fc, tab_new)
-
-    # ============ TAB: AGENT LAB (visual layer over the engine's real run — changes nothing) ============
-    with tab_agent:
-        try:
-            _arid = VRID
-            if not _arid:
-                _lg = dbio.list_run_log(1)
-                _arid = str(_lg.iloc[0]["run_id"]) if not _lg.empty else None
-            try:
-                _runs = get_agent_runs()
-            except Exception:   # no job view permission → results-only board (no stage timings)
-                _runs = []
-            _jr = dbio.agent_match_run(_runs, _arid) if (_arid and _runs) else None
-            ss.setdefault("review_ver", 0)
-            try:
-                _rv = get_review_items(_arid, ss.review_ver) if _arid else None
-            except Exception:
-                _rv = None
-            _rvs = None
-            if _rv is not None:
-                _dec = _rv["decision"].fillna("PENDING")
-                _top = _rv["review_reason"].fillna("").str.contains("Full-size top-up")
-                _rvs = {"total": int(len(_rv)), "pending": int((_dec == "PENDING").sum()),
-                        "approved": int((_dec == "APPROVED").sum()), "rejected": int((_dec == "REJECTED").sum()),
-                        "topup": int(_top.sum()), "other": int((~_top).sum())}
-            agent_view.render(_jr, get_agent_metrics(_arid, str(stats.get("computed_at", ""))), run_id=_arid,
-                              theme=THEME, review=_rvs, height=984)
-        except Exception as e:
-            _rv = None
-            st.info(f"Agent lab unavailable for this run: {e}")
-
-        # ---------- Human review: the approver node's queue — decide right here ----------
-        st.markdown("##### Human review")
-        st.caption(f"Approve or reject the lines that need a person: DC full-size top-ups, and any line worth "
-                   f"≥ AED {dbio.REVIEW_MIN_AED:,.0f} or moving ≥ {dbio.REVIEW_MIN_QTY} units. Every other line is "
-                   "routine and auto-approved. Decisions are saved for this run with your name.")
-        if _rv is None:
-            st.info("No review queue for this run.")
-        elif _rv.empty:
-            st.success("Nothing needs review in this run — every line is routine.")
-        else:
-            _LBL = dbio.REVIEW_STATUS; _CODE = {v: k for k, v in _LBL.items()}
-            _rf = st.columns([1.2, 2, 1.4])
-            _f_type = _rf[0].multiselect("Type", sorted(_rv["line_type"].unique()), key="rv_type",
-                                         placeholder="All types", label_visibility="collapsed")
-            _reasons = sorted({x for r in _rv["review_reason"].fillna("") for x in r.split(" · ") if x})
-            _f_reason = _rf[1].multiselect("Reason", _reasons, key="rv_reason", placeholder="All reasons",
-                                           label_visibility="collapsed")
-            _f_status = _rf[2].multiselect("Status", list(_LBL.values()), default=["Pending"], key="rv_status",
-                                           placeholder="All statuses", label_visibility="collapsed")
-            _view = _rv.copy()
-            _view["Decision"] = _view["decision"].fillna("PENDING").map(_LBL)
-            if _f_type:
-                _view = _view[_view["line_type"].isin(_f_type)]
-            if _f_reason:
-                _view = _view[_view["review_reason"].fillna("").apply(lambda r: any(x in r for x in _f_reason))]
-            if _f_status:
-                _view = _view[_view["Decision"].isin(_f_status)]
-            _show = _view.rename(columns={
-                "line_type": "Type", "review_reason": "Why review", "parent_article": "Parent",
-                "generic_article_name": "Style", "article": "Article", "size": "Size", "from_site": "From",
-                "to_site": "To", "qty": "Qty", "value_aed": "Value (AED)", "comment": "Comment", "decided_by": "Decided by"})
-            for _c in ("Comment", "Decided by"):
-                _show[_c] = _show[_c].fillna("").astype(str).replace({"None": "", "nan": ""})
-            _cols = ["Decision", "Why review", "Type", "Style", "Article", "Size", "From", "To", "Qty", "Value (AED)",
-                     "Comment", "Decided by"]
-            _edited = st.data_editor(
-                _show[_cols], key=f"rv_editor_{_arid}_{ss.review_ver}", hide_index=True, use_container_width=True,
-                height=360, disabled=[c for c in _cols if c not in ("Decision", "Comment")],
-                column_config={
-                    "Decision": st.column_config.SelectboxColumn(options=list(_LBL.values()), required=True, width="medium"),
-                    "Comment": st.column_config.TextColumn(width="medium", help="Optional note saved with the decision"),
-                    "Value (AED)": st.column_config.NumberColumn(format="%,.0f", width="small"),
-                    "Type": st.column_config.TextColumn(width="small"), "Size": st.column_config.TextColumn(width="small"),
-                    "To": st.column_config.TextColumn(width="small"), "Qty": st.column_config.NumberColumn(width="small"),
-                    "Decided by": st.column_config.TextColumn(width="small"),
-                })
-            _bc = st.columns([1.3, 1.3, 1.3, 3])
-            _pend = _view[_view["decision"].fillna("PENDING") == "PENDING"]
-
-            def _save(rows, msg):
-                try:
-                    n = dbio.save_review_decisions(_arid, rows, dbio.current_user())
-                    ss.review_ver += 1
-                    st.toast(f"{msg}: {n:,} line{'s' if n != 1 else ''}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not save decisions: {e}. You need write access to "
-                             f"{dbio.REVIEW_FQ}; ask the app owner.")
-
-            if _bc[0].button("Save decisions", type="primary", use_container_width=True, key="rv_save"):
-                _chg = _view.assign(decision=_edited["Decision"].map(_CODE).values, comment=_edited["Comment"].values)
-                _orig = _view.assign(decision=_view["decision"].fillna("PENDING"))
-                _mask = (_chg["decision"].values != _orig["decision"].values) | (
-                    _chg["comment"].fillna("").values != _orig["comment"].fillna("").values)
-                if _mask.any():
-                    _save(_chg[_mask], "Saved")
-                else:
-                    st.toast("No changes to save")
-            if _bc[1].button(f"Approve {len(_pend):,} pending shown", use_container_width=True, key="rv_appr",
-                             disabled=_pend.empty):
-                _save(_pend.assign(decision="APPROVED"), "Approved")
-            if _bc[2].button(f"Reject {len(_pend):,} pending shown", use_container_width=True, key="rv_rej",
-                             disabled=_pend.empty):
-                _save(_pend.assign(decision="REJECTED"), "Rejected")
-            _bc[3].caption(f"{len(_view):,} of {len(_rv):,} review lines shown · filter, then decide in the "
-                           "Decision column and Save, or use the bulk buttons.")
-        # ---------- Ask the agents: a chat about this run's results, answered as the signed-in user ----------
-        _ask_on = bool(dbio.ASK_SPACE_ID)
-        ss.setdefault("ask_history", [])        # chronological [(question, answer dict)] for this session
-        ss.setdefault("ask_conv", None)
-        _ah = st.columns([6, 1])
-        _ah[0].markdown("##### Ask the agents")
-        if _ah[1].button("New chat", key="ask_new", use_container_width=True, disabled=not (_ask_on and ss.ask_history)):
-            ss.ask_history, ss.ask_conv = [], None
-            st.rerun()
-
-        def _fmt_answer_table(cols, rows):
-            df = pd.DataFrame(rows, columns=cols)
-            for c in df.columns:
-                num = pd.to_numeric(df[c], errors="coerce")
-                if num.notna().all() and len(num):
-                    whole = (num.round(0) == num).all()
-                    money = any(k in c.lower() for k in ("aed", "value", "price"))
-                    df[c] = num.map(lambda v: f"{v:,.0f}" if (whole or money) else f"{v:,.2f}")
-            return df
-
-        def _render_answer(a):
-            if a.get("error"):
-                st.warning(f"Couldn't answer: {a['error']}")
-                return
-            if a.get("text"):
-                st.markdown(a["text"])
-            if a.get("rows"):
-                st.dataframe(_fmt_answer_table(a["columns"], a["rows"]), hide_index=True, use_container_width=True,
-                             height=min(38 + 35 * len(a["rows"]), 320))
-            if a.get("sql"):
-                with st.expander("How this was answered"):
-                    st.code(a["sql"], language="sql")
-
-        _chat = st.container(height=520 if ss.ask_history else 140, border=True)
-        with _chat:
-            if not ss.ask_history:
-                st.caption("Ask about this run's store moves, held stock, DC lines or approvals — e.g. "
-                           "*Why did store 1122 get size M of NKIF1911-010?* or *Top 10 DC lines by value*. "
-                           "Follow-up questions continue the conversation." if _ask_on else
-                           "Coming soon: ask questions about this run's moves, holds and DC lines.")
-            for _qq, _aa in ss.ask_history:
-                with st.chat_message("user", avatar=":material/person:"):
-                    st.markdown('<span class="chat-u"></span>', unsafe_allow_html=True)
-                    st.markdown(_qq)
-                with st.chat_message("assistant", avatar=":material/hub:"):
-                    st.markdown('<span class="chat-a"></span>', unsafe_allow_html=True)
-                    _render_answer(_aa)
-        _prompt = st.chat_input("Ask the agents a question about this run…", key="ask_input", disabled=not _ask_on)
-        if _prompt and _prompt.strip():
-            _q = _prompt.strip()
-            with _chat:
-                with st.chat_message("user", avatar=":material/person:"):
-                    st.markdown('<span class="chat-u"></span>', unsafe_allow_html=True)
-                    st.markdown(_q)
-                with st.chat_message("assistant", avatar=":material/hub:"):
-                    st.markdown('<span class="chat-a"></span>', unsafe_allow_html=True)
-                    with st.spinner("The agents are looking into it…"):
-                        try:
-                            _latest = dbio.list_run_log(1)
-                            _ctx = _arid if (_arid and not _latest.empty and str(_latest.iloc[0]["run_id"]) != _arid) else None
-                            _ans = dbio.ask_agents(_q, ss.ask_conv, run_id=_ctx)
-                            ss.ask_conv = _ans["conversation_id"]
-                        except Exception as e:
-                            _ans = {"error": str(e)}
-                    _render_answer(_ans)
-            ss.ask_history.append((_q, _ans))
-            st.rerun()
-        if ss.ask_history:
-            st.caption("Answers come from this engine's results only. Follow-ups continue the same conversation; "
-                       "New chat starts over.")
+    _render_monitor(tab_mon)
 
     # ============ TAB: DC → STORE REPLENISHMENT (P1) ============
     with tab_replen:
@@ -1387,6 +1233,93 @@ elif ss.run_state == "results":
 
     # ============ TAB 0: ALL — one combined table, all move columns + Action ============
     with tab_all:
+        # ---------- Approvals: lines a person must sign off (DC full-size top-ups, high-value / high-qty moves) ----------
+        _arid = VRID
+        if not _arid:
+            _lg = dbio.list_run_log(1)
+            _arid = str(_lg.iloc[0]["run_id"]) if not _lg.empty else None
+        ss.setdefault("review_ver", 0)
+        try:
+            _rv = get_review_items(_arid, ss.review_ver) if _arid else None
+        except Exception:
+            _rv = None
+        _npend = int((_rv["decision"].fillna("PENDING") == "PENDING").sum()) if _rv is not None else 0
+        with st.expander(f"Approvals · {_npend:,} pending" if _npend else "Approvals", expanded=False):
+            st.caption(f"Approve or reject the lines that need a person: DC full-size top-ups, and any line worth "
+                       f"≥ AED {dbio.REVIEW_MIN_AED:,.0f} or moving ≥ {dbio.REVIEW_MIN_QTY} units. Every other line is "
+                       "routine and auto-approved. Decisions are saved for this run with your name.")
+            if _rv is None:
+                st.info("No review queue for this run.")
+            elif _rv.empty:
+                st.success("Nothing needs review in this run — every line is routine.")
+            else:
+                _LBL = dbio.REVIEW_STATUS; _CODE = {v: k for k, v in _LBL.items()}
+                _rf = st.columns([1.2, 2, 1.4])
+                _f_type = _rf[0].multiselect("Type", sorted(_rv["line_type"].unique()), key="rv_type",
+                                             placeholder="All types", label_visibility="collapsed")
+                _reasons = sorted({x for r in _rv["review_reason"].fillna("") for x in r.split(" · ") if x})
+                _f_reason = _rf[1].multiselect("Reason", _reasons, key="rv_reason", placeholder="All reasons",
+                                               label_visibility="collapsed")
+                _f_status = _rf[2].multiselect("Status", list(_LBL.values()), default=["Pending"], key="rv_status",
+                                               placeholder="All statuses", label_visibility="collapsed")
+                _view = _rv.copy()
+                _view["Decision"] = _view["decision"].fillna("PENDING").map(_LBL)
+                if _f_type:
+                    _view = _view[_view["line_type"].isin(_f_type)]
+                if _f_reason:
+                    _view = _view[_view["review_reason"].fillna("").apply(lambda r: any(x in r for x in _f_reason))]
+                if _f_status:
+                    _view = _view[_view["Decision"].isin(_f_status)]
+                _show = _view.rename(columns={
+                    "line_type": "Type", "review_reason": "Why review", "parent_article": "Parent",
+                    "generic_article_name": "Style", "article": "Article", "size": "Size", "from_site": "From",
+                    "to_site": "To", "qty": "Qty", "value_aed": "Value (AED)", "comment": "Comment", "decided_by": "Decided by"})
+                for _c in ("Comment", "Decided by"):
+                    _show[_c] = _show[_c].fillna("").astype(str).replace({"None": "", "nan": ""})
+                _cols = ["Decision", "Why review", "Type", "Style", "Article", "Size", "From", "To", "Qty", "Value (AED)",
+                         "Comment", "Decided by"]
+                _edited = st.data_editor(
+                    _show[_cols], key=f"rv_editor_{_arid}_{ss.review_ver}", hide_index=True, use_container_width=True,
+                    height=360, disabled=[c for c in _cols if c not in ("Decision", "Comment")],
+                    column_config={
+                        "Decision": st.column_config.SelectboxColumn(options=list(_LBL.values()), required=True, width="medium"),
+                        "Comment": st.column_config.TextColumn(width="medium", help="Optional note saved with the decision"),
+                        "Value (AED)": st.column_config.NumberColumn(format="%,.0f", width="small"),
+                        "Type": st.column_config.TextColumn(width="small"), "Size": st.column_config.TextColumn(width="small"),
+                        "To": st.column_config.TextColumn(width="small"), "Qty": st.column_config.NumberColumn(width="small"),
+                        "Decided by": st.column_config.TextColumn(width="small"),
+                    })
+                _bc = st.columns([1.3, 1.3, 1.3, 3])
+                _pend = _view[_view["decision"].fillna("PENDING") == "PENDING"]
+
+                def _save(rows, msg):
+                    try:
+                        n = dbio.save_review_decisions(_arid, rows, dbio.current_user())
+                        ss.review_ver += 1
+                        st.toast(f"{msg}: {n:,} line{'s' if n != 1 else ''}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save decisions: {e}. You need write access to "
+                                 f"{dbio.REVIEW_FQ}; ask the app owner.")
+
+                if _bc[0].button("Save decisions", type="primary", use_container_width=True, key="rv_save"):
+                    _chg = _view.assign(decision=_edited["Decision"].map(_CODE).values, comment=_edited["Comment"].values)
+                    _orig = _view.assign(decision=_view["decision"].fillna("PENDING"))
+                    _mask = (_chg["decision"].values != _orig["decision"].values) | (
+                        _chg["comment"].fillna("").values != _orig["comment"].fillna("").values)
+                    if _mask.any():
+                        _save(_chg[_mask], "Saved")
+                    else:
+                        st.toast("No changes to save")
+                if _bc[1].button(f"Approve {len(_pend):,} pending shown", use_container_width=True, key="rv_appr",
+                                 disabled=_pend.empty):
+                    _save(_pend.assign(decision="APPROVED"), "Approved")
+                if _bc[2].button(f"Reject {len(_pend):,} pending shown", use_container_width=True, key="rv_rej",
+                                 disabled=_pend.empty):
+                    _save(_pend.assign(decision="REJECTED"), "Rejected")
+                _bc[3].caption(f"{len(_view):,} of {len(_rv):,} review lines shown · filter, then decide in the "
+                               "Decision column and Save, or use the bulk buttons.")
+
         st.caption("Every store×article line in **one table** — moves, held and not-moved combined — with **all the "
                    "columns from Recommended moves**. Where a value doesn't apply (e.g. no receiver for a *dont move* "
                    "row) it shows **NA**. Final column = **Action** (move / held / dont move).")
@@ -1460,7 +1393,7 @@ elif ss.run_state == "results":
                    "(move + held + dont move).")
         st.dataframe(cdf, hide_index=True, use_container_width=True, height=460)
 
-    # ---- definitions (brief) — reference material, kept at the bottom so the Agent lab sits higher ----
+    # ---- definitions (brief) — reference material, kept at the bottom ----
     with st.expander("Definitions"):
         st.markdown("""
 - **ROS** — units sold/day at a store over the ROS window (0 = dead).

@@ -1,0 +1,220 @@
+<title>Stock Movement Agents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: a building read bottom-up. Bedrock (data) -> foundation (the 13-task agent crew) -> floors built on it -> next floors (dashed). */
+:root {
+  --bg: #F5F6F9; --surface: #FFFFFF; --ink: #1C2347; --dim: #5A6278; --line: #DDE2EB;
+  --accent: #2658F2; --accent-soft: #E7EDFE;
+  --sense: #5E6884; --store: #2658F2; --dc: #B15940; --guard: #6B4FC8; --memory: #12704D;
+  --sense-soft: #EEF0F5; --store-soft: #E7EDFE; --dc-soft: #FBEDE6; --guard-soft: #EFEBFB; --memory-soft: #E4F3EB;
+  --found: #1C2347; --found-ink: #FFFFFF; --found-dim: #B8C2E6; --found-card: #262E57; --found-line: #3A4373;
+  --f-display: "Source Serif 4", Georgia, serif; --f-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif; --f-mono: "JetBrains Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0C0F1C; --surface: #141A2E; --ink: #E6EAF5; --dim: #929BB6; --line: #262E49;
+  --accent: #7C9DFF; --accent-soft: #1B2652;
+  --sense: #9BA4C0; --store: #7C9DFF; --dc: #E8977A; --guard: #A890F2; --memory: #5FD49A;
+  --sense-soft: #1A2036; --store-soft: #1B2652; --dc-soft: #3A2219; --guard-soft: #251E44; --memory-soft: #123024;
+  --found: #0F1530; --found-ink: #F2F4FB; --found-dim: #A3AED6; --found-card: #1B2349; --found-line: #33407A; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0C0F1C; --surface: #141A2E; --ink: #E6EAF5; --dim: #929BB6; --line: #262E49;
+  --accent: #7C9DFF; --accent-soft: #1B2652;
+  --sense: #9BA4C0; --store: #7C9DFF; --dc: #E8977A; --guard: #A890F2; --memory: #5FD49A;
+  --sense-soft: #1A2036; --store-soft: #1B2652; --dc-soft: #3A2219; --guard-soft: #251E44; --memory-soft: #123024;
+  --found: #0F1530; --found-ink: #F2F4FB; --found-dim: #A3AED6; --found-card: #1B2349; --found-line: #33407A; color-scheme: dark }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--f-body); margin: 0; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 20px; padding-block: 36px 56px; display: flex; flex-direction: column; gap: 14px; }
+.eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+h1 { font: 700 clamp(30px, 4.2vw, 44px)/1.08 var(--f-display); margin: 6px 0 8px; letter-spacing: -.015em; text-wrap: balance; }
+.lede { font-size: 17.5px; color: var(--dim); max-width: 74ch; margin: 0; }
+.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 6px; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 0; }
+.stat b { display: block; font: 700 25px/1.1 var(--f-body); font-variant-numeric: tabular-nums; }
+.stat span { font-size: 12.5px; color: var(--dim); }
+
+/* floors */
+.floor { border-radius: 14px; padding: 14px 16px; display: grid; grid-template-columns: 170px 1fr; gap: 16px; align-items: stretch; }
+.floor-label { display: flex; flex-direction: column; gap: 4px; justify-content: center; }
+.floor-label .tag { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.floor-label h2 { font: 700 19px/1.15 var(--f-display); margin: 0; }
+.floor-label p { font-size: 12.5px; color: var(--dim); margin: 0; }
+.items { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.item { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.item h3 { font-size: 15px; margin: 0 0 3px; }
+.item p { font-size: 13px; color: var(--dim); margin: 0; }
+.item .n { font-weight: 700; color: var(--ink); }
+.next { border: 1.5px dashed var(--line); background: transparent; }
+.next .tag { color: var(--dim); }
+.next .item { background: transparent; border-style: dashed; }
+.built { background: var(--surface); border: 1px solid var(--line); }
+.built .tag { color: var(--accent); }
+.channels { background: transparent; padding-block: 4px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 5px 13px; font-size: 13.5px; font-weight: 600; }
+.chip small { font-weight: 400; color: var(--dim); }
+
+/* connector between floors */
+.up { display: flex; justify-content: center; height: 14px; }
+.up i { width: 2px; background: var(--line); position: relative; }
+.up i::before { content: ""; position: absolute; top: -5px; left: -5px; border: 6px solid transparent; border-bottom-color: var(--line); border-top: 0; }
+
+/* foundation */
+.foundation { background: var(--found); color: var(--found-ink); border-radius: 16px; padding: 18px 18px 16px; display: flex; flex-direction: column; gap: 14px; }
+.f-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 20px; align-items: flex-end; }
+.f-head .tag { font-size: 11px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--found-dim); }
+.f-head h2 { font: 700 24px/1.15 var(--f-display); margin: 2px 0 0; }
+.f-head p { margin: 0; color: var(--found-dim); font-size: 14px; max-width: 60ch; }
+.supervisor { border: 1px solid var(--found-line); background: var(--found-card); border-radius: 10px; padding: 9px 14px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 14px; }
+.supervisor b { font-size: 15px; }
+.supervisor span { color: var(--found-dim); }
+.crew { display: grid; grid-template-columns: 1.15fr 18px 1fr 18px 0.9fr 18px 1fr 18px 0.85fr; align-items: stretch; }
+.stage { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.stage-name { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--found-dim); }
+.lanes { display: grid; grid-template-rows: 1fr 1fr; gap: 8px; flex: 1; }
+.lane { display: flex; flex-direction: column; gap: 8px; }
+.arrow { display: flex; align-items: center; justify-content: center; color: var(--found-dim); font-size: 16px; padding-top: 18px; }
+.agent { background: var(--surface); color: var(--ink); border-radius: 9px; padding: 8px 10px 9px; border-left: 4px solid var(--sense); min-width: 0; flex: 1; }
+.agent .no { font: 500 11px/1 var(--f-mono); color: var(--dim); }
+.agent h4 { margin: 2px 0 2px; font-size: 14.5px; line-height: 1.2; }
+.agent p { margin: 0; font-size: 12.3px; color: var(--dim); line-height: 1.35; }
+.agent .k { display: inline-block; margin-top: 5px; font-size: 12px; font-weight: 700; color: var(--ink); background: var(--sense-soft); border-radius: 5px; padding: 1px 6px; font-variant-numeric: tabular-nums; }
+.a-sense { border-left-color: var(--sense); } .a-sense .k { background: var(--sense-soft); }
+.a-store { border-left-color: var(--store); } .a-store .k { background: var(--store-soft); }
+.a-dc { border-left-color: var(--dc); } .a-dc .k { background: var(--dc-soft); }
+.a-guard { border-left-color: var(--guard); } .a-guard .k { background: var(--guard-soft); }
+.a-memory { border-left-color: var(--memory); } .a-memory .k { background: var(--memory-soft); }
+.guard-tall { display: flex; flex-direction: column; justify-content: center; flex: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12.5px; color: var(--found-dim); }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+.bedrock { border-radius: 14px; background: var(--surface); border: 1px solid var(--line); padding: 12px 16px; display: grid; grid-template-columns: 170px 1fr; gap: 16px; align-items: center; }
+.bedrock .tag { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+.bedrock h2 { font: 700 17px/1.2 var(--f-display); margin: 2px 0 0; }
+.foot { font-size: 12.5px; color: var(--dim); margin-top: 4px; }
+
+@media (max-width: 1000px) {
+  .crew { grid-template-columns: 1fr; gap: 10px; }
+  .arrow { padding: 0; transform: rotate(90deg); height: 14px; }
+  .lanes { grid-template-rows: auto; grid-template-columns: 1fr 1fr; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .floor, .bedrock { grid-template-columns: 1fr; gap: 10px; }
+  .lanes { grid-template-columns: 1fr; }
+}
+</style>
+
+<div class="wrap">
+  <div>
+    <div class="eyebrow">Nike stock movement · agent mode</div>
+    <h1>Thirteen agents move the right stock to the right store, every morning</h1>
+    <p class="lede">The 13 tasks of the stock movement engine now work as a crew of agents. They are the foundation: every new capability, from explaining a decision to placing an order in SAP, is built on top of them. People stay in charge of the exceptions.</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>194,626</b><span>store × size lines checked today</span></div>
+    <div class="stat"><b>2,247</b><span>store-to-store moves · 3,434 units</span></div>
+    <div class="stat"><b>3,147</b><span>DC-to-store lines · AED 923K</span></div>
+    <div class="stat"><b>873</b><span>actions sent to a person to approve</span></div>
+    <div class="stat"><b>~8 min · 0</b><span>per run · failures in 60 runs</span></div>
+  </div>
+
+  <div class="floor channels">
+    <div class="floor-label"><span class="tag" style="color:var(--dim)">People</span><h2>Ask, approve, decide</h2></div>
+    <div class="chips">
+      <span class="chip">Planners <small>approve exceptions</small></span>
+      <span class="chip">Line managers <small>sign off changes</small></span>
+      <span class="chip">Leadership <small>ask why</small></span>
+      <span class="chip">Stock movement app</span><span class="chip">Genie</span><span class="chip">Claude</span><span class="chip">E-mail review pack</span>
+    </div>
+  </div>
+
+  <div class="floor next">
+    <div class="floor-label"><span class="tag">Next floors</span><h2>Improve on the foundation</h2><p>Designed, not built yet</p></div>
+    <div class="items">
+      <div class="item"><h3>Supervisor agent</h3><p>One front door that picks the right agent for any question or action.</p></div>
+      <div class="item"><h3>Learning agent</h3><p>Learns from every approve, change and reject, and tunes the rules.</p></div>
+      <div class="item"><h3>Execution agent</h3><p>Turns approved moves into SAP transfer orders, with approvals and audit.</p></div>
+      <div class="item"><h3>GCC rollout</h3><p>Same crew for KSA, Kuwait, Qatar, Bahrain and Oman stores.</p></div>
+    </div>
+  </div>
+  <div class="up"><i></i></div>
+
+  <div class="floor built">
+    <div class="floor-label"><span class="tag">Built on top</span><h2>Explain, plan ahead, keep people in control</h2><p>Live or ready to roll out</p></div>
+    <div class="items">
+      <div class="item"><h3>Explain agents</h3><p>Four Genie agents answer "why did this store get this?" step by step, in plain words.</p></div>
+      <div class="item"><h3>Forecast agent</h3><p>Weekly demand per style and country; allocates to <span class="n">85 stores</span> by store and size.</p></div>
+      <div class="item"><h3>New-launch agent</h3><p><span class="n">5,851</span> Spring 2027 styles forecast from look-alikes and images, with opening packs.</p></div>
+      <div class="item"><h3>Human in the loop</h3><p>Only exceptions reach people: a daily brief, approvals and a pre-filled review e-mail.</p></div>
+    </div>
+  </div>
+  <div class="up"><i></i></div>
+
+  <section class="foundation" aria-label="The foundation: 13 agents">
+    <div class="f-head">
+      <div><div class="tag">The foundation · live</div><h2>The 13-task agent crew</h2></div>
+      <p>Runs every day at 10:30 and whenever a planner presses Run. Each agent does one job, hands its result to the next, and records what it did.</p>
+    </div>
+    <div class="supervisor"><b>Run orchestrator</b><span>starts the crew, runs the store and DC branches side by side, one run at a time, every step logged</span></div>
+
+    <div class="crew">
+      <div class="stage">
+        <div class="stage-name">1 · Sense</div>
+        <div class="agent a-sense"><div class="no">00</div><h4>Gatekeeper</h4><p>Checks and locks the day's settings.</p></div>
+        <div class="agent a-sense"><div class="no">01</div><h4>Stock scout</h4><p>Sees every unit in stores, in transit and in DCs.</p><span class="k">194,626 lines</span></div>
+        <div class="agent a-sense"><div class="no">02</div><h4>Demand reader</h4><p>Rate of sale and cover; labels dead, slow, healthy.</p></div>
+        <div class="agent a-sense"><div class="no">03</div><h4>Opportunity finder</h4><p>Who can give, who needs stock; applies the guards.</p></div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="stage-name">2 · Decide</div>
+        <div class="lanes">
+          <div class="lane">
+            <div class="agent a-store"><div class="no">04</div><h4>Matchmaker</h4><p>Pairs surplus with need, store to store.</p></div>
+            <div class="agent a-store"><div class="no">05</div><h4>Size keeper</h4><p>Never breaks a store's full size run.</p></div>
+          </div>
+          <div class="lane">
+            <div class="agent a-dc"><div class="no">10</div><h4>Need planner</h4><p>What each store needs from the DC, per size.</p></div>
+            <div class="agent a-dc"><div class="no">11</div><h4>Fair-share allocator</h4><p>Shares scarce DC stock by store priority.</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="stage-name">3 · Guard</div>
+        <div class="guard-tall"><div class="agent a-guard" style="flex:0"><div class="no">08</div><h4>Display guardian</h4><p>Checks store moves and DC lines together: every receiving store must show a full size run, or nothing goes.</p><span class="k">tops up or holds</span></div></div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="stage-name">4 · Deliver</div>
+        <div class="lanes">
+          <div class="lane"><div class="agent a-store"><div class="no">06</div><h4>Value scorer</h4><p>Scores each move by expected sales uplift.</p><span class="k">2,247 moves</span></div></div>
+          <div class="lane"><div class="agent a-dc"><div class="no">12</div><h4>DC dispatcher</h4><p>Writes DC lines and the needs it could not fill.</p><span class="k">3,147 lines</span></div></div>
+        </div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="stage-name">5 · Remember</div>
+        <div class="lanes">
+          <div class="lane"><div class="agent a-memory"><div class="no">07</div><h4>Store memory</h4><p>Keeps every run's moves for audit.</p></div></div>
+          <div class="lane"><div class="agent a-memory"><div class="no">13</div><h4>DC memory</h4><p>Keeps every run's DC lines.</p></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="legend"><span><i style="background:var(--sense)"></i>Shared sensing</span><span><i style="background:var(--store)"></i>Store-to-store branch</span><span><i style="background:var(--dc)"></i>DC-to-store branch</span><span><i style="background:var(--guard)"></i>Joint guard</span><span><i style="background:var(--memory)"></i>Memory</span></div>
+  </section>
+
+  <div class="bedrock">
+    <div><div class="tag">Bedrock</div><h2>One governed data platform</h2></div>
+    <div class="chips">
+      <span class="chip">SAP stock <small>sellable, in transit</small></span>
+      <span class="chip">SAP sales</span>
+      <span class="chip">Product and store masters</span>
+      <span class="chip">Product images</span>
+      <span class="chip">Databricks lakehouse <small>Unity Catalog permissions</small></span>
+    </div>
+  </div>
+  <p class="foot">Figures: scheduled run of 9 Nov 2026, 10:30 GST (UAE, 21 stores); reliability over 60 runs, 5 Oct to 5 Nov 2026. Agents recommend; people approve the exceptions. Nothing is written to SAP today.</p>
+</div>

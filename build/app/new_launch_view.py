@@ -58,6 +58,28 @@ def _detail(parent: str):
 
 
 @st.cache_data(show_spinner=False, ttl=600)
+def _pack(parent: str):
+    """Opening pack for one style (country summary + store x size lines); None until the pack has been run."""
+    p = str(parent).replace("'", "''")
+    try:
+        cc = dbio.run_sql(f"SELECT * FROM {dbio.FQ}.nl_pack_country WHERE parent = '{p}'")
+        ln = dbio.run_sql(f"SELECT * FROM {dbio.FQ}.nl_opening_pack WHERE parent = '{p}'")
+    except Exception:
+        return None
+    for c in ("units_13w", "units_p80", "demand_3w"):
+        cc[c] = pd.to_numeric(cc[c], errors="coerce")
+    for c in ("buy_qty", "pack_cap", "pack_need", "pack_units", "reserve_units", "key_sizes", "stores_eligible", "stores_ranged"):
+        if c in cc:
+            cc[c] = pd.to_numeric(cc[c], errors="coerce").fillna(0).astype(int)
+    for c in ("store_share", "size_share", "demand", "p_sell"):
+        ln[c] = pd.to_numeric(ln[c], errors="coerce")
+    for c in ("key_size", "cover_qty", "target", "pack_qty"):
+        ln[c] = pd.to_numeric(ln[c], errors="coerce").fillna(0).astype(int)
+    return {"country": cc, "lines": ln,
+            "params": {"cover_weeks": 3, "service": 0.8, "reserve_share": 0.4, "min_store_share": 0.01}}
+
+
+@st.cache_data(show_spinner=False, ttl=600)
 def _weights() -> pd.DataFrame:
     w = dbio.run_sql(f"SELECT * FROM {dbio.FQ}.nl_weights")
     for c in [c for c in w.columns if c == "weight" or c.startswith("val_")]:
@@ -158,7 +180,7 @@ def render(theme: str):
 
     st.markdown("##### New article walkthrough")
     st.caption("Pick any style: its image, what we know about it, how much each attribute counts, the past launches it "
-               "looks like and what they sold, and how the number is worked out.")
+               "looks like and what they sold, how the number is worked out, and its opening pack by store and size.")
     if v.empty:
         st.caption("No styles match the filters.")
         return
@@ -173,7 +195,8 @@ def render(theme: str):
     ws = w[w["scope"] == scope] if r["method"] == "image + attributes" else w[w["scope"].str.startswith("fallback")]
     mult = (r["units_p80"] / r["units_13w"]) if r["units_13w"] else None
     launch_story.render(r.to_dict(), r["img"] if isinstance(r["img"], str) else None,
-                        r["img_source"] if isinstance(r.get("img_source"), str) else None, an, ws, cty, wk, bt, mult, theme=theme)
+                        r["img_source"] if isinstance(r.get("img_source"), str) else None, an, ws, cty, wk, bt, mult, theme=theme,
+                        pack=_pack(r["parent"]))
 
     with st.expander("How accurate is this? Back-test on last spring"):
         b = bt.copy()

@@ -15,7 +15,7 @@ from databricks.sdk.service.sql import StatementState
 from databricks.sdk.service import jobs
 
 CATALOG = "sports_analytics_test"
-SCHEMA = "nike_consolidation"
+SCHEMA = os.environ.get("NIKE_SCHEMA", "nike_consolidation")   # dev app: nike_consolidation_dev (71 stores)
 FQ = f"{CATALOG}.{SCHEMA}"
 
 WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "1c9706d9594f1f2f")
@@ -812,6 +812,44 @@ def save_action_manager(run_id: str, card_id: str, approve: bool, comment: str, 
     run_sql(f"""UPDATE {ACT_FQ} SET status = {lit('Change approved' if approve else 'Change declined')},
                 manager_by = {lit(user)}, manager_at = current_timestamp(), manager_comment = {lit(comment)}
                 WHERE run_id = {lit(run_id)} AND card_id = {lit(card_id)} AND status = 'Awaiting line manager'""")
+
+
+# ---- Live monitor: run history of every pipeline behind the app ----
+# History tables are read as the viewer (SQL scope). Failed / in-flight runs never reach history, so the job API
+# (app service principal, needs CAN_VIEW on the job) adds them when available; without it the monitor shows
+# completed runs only.
+def load_monitor(limit: int = 30) -> dict:
+    out = {"consol": run_sql(f"""
+        SELECT s.run_id, s.run_ts, s.archived_at, s.triggered_by, s.country_scope,
+               COALESCE(s.category_scope, 'ALL') AS category_scope, s.as_of_date, s.recommended_moves, s.total_units,
+               s.held_lines, s.not_moved_lines, s.partition_reconciles,
+               r.replen_lines, r.replen_units, r.stores AS replen_stores
+        FROM {FQ}.run_stats_history s LEFT JOIN {FQ}.replen_stats_history r ON r.run_id = s.run_id
+        ORDER BY s.run_ts DESC LIMIT {int(limit)}""")}
+    for key, sql in (
+            ("fc", f"SELECT * FROM {FQ}.fc_run_summary"),
+            ("fc_stages", f"SELECT * FROM {FQ}.fc_run_stages ORDER BY start"),
+            ("nl", f"""SELECT run_id, COUNT(*) AS styles, SUM(units_13w) AS units,
+                              COUNT_IF(look_similarity IS NOT NULL) AS with_image, COUNT_IF(confidence = 'low') AS low_conf
+                       FROM {FQ}.nl_forecast GROUP BY run_id"""),
+            ("nl_bt", f"SELECT run_id, wape, within_2x FROM {FQ}.nl_backtest WHERE level = 'style'"),
+            ("nl_pack", f"""SELECT run_id, SUM(pack_units) AS pack_units, SUM(reserve_units) AS reserve_units,
+                                   SUM(stores_ranged) AS store_styles FROM {FQ}.nl_pack_country GROUP BY run_id""")):
+        try:
+            out[key] = run_sql(sql)
+        except Exception:
+            out[key] = pd.DataFrame()
+    return out
+
+
+def monitor_job_runs(limit: int = 30) -> tuple:
+    """(runs, error) for the daily stock-movement job — includes failed and running attempts."""
+    if not JOB_ID:
+        return [], "no job configured"
+    try:
+        return agent_job_runs(limit), None
+    except Exception as e:
+        return [], str(e)
 
 
 def load_learning(days: int = 28) -> pd.DataFrame:

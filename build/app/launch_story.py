@@ -1,6 +1,6 @@
 """New-article walkthrough — one style with no sales history, told end to end: the image, what we know about it
 (master attributes and attributes read from the image), how much each attribute counts, the past launches it looks
-like and what they matched, the arithmetic to the forecast, and how far to trust it. One self-contained HTML panel."""
+like and what they matched, the arithmetic to the forecast, how far to trust it, and the opening pack by store and size. One self-contained HTML panel."""
 from __future__ import annotations
 
 import html
@@ -29,8 +29,86 @@ def _e(x) -> str:
     return html.escape("" if x is None or (isinstance(x, float) and x != x) else str(x))
 
 
+SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "XXL", "3XL", "XXXL", "4XL"]
+
+
+def _size_key(z):
+    z = str(z).upper().strip()
+    if z in SIZE_ORDER:
+        return (0, SIZE_ORDER.index(z), z)
+    try:
+        return (1, float(z.replace("C", "").replace("Y", "")), z)
+    except ValueError:
+        return (2, 0, z)
+
+
+def _pack_section(pk: dict | None, unit: str, c: dict) -> str:
+    """6 · stores and opening pack: buy -> packs + DC reserve per country, then the store x size grid."""
+    if not pk or pk.get("country") is None or pk["country"].empty:
+        return ('<div class="sec"><h2><span class="n">6</span>Stores and opening pack</h2><p class="dim">The opening pack '
+                'has not been worked out for this style yet.</p></div>')
+    cc, ln = pk["country"].copy(), pk["lines"].copy()
+    assumed = (cc["buy_source"] != "Buy file").any()
+    mx = max(float(cc["buy_qty"].max()), 1)
+    rows = []
+    for x in cc.sort_values("units_13w", ascending=False).itertuples():
+        pw, rw = x.pack_units / mx * 100, x.reserve_units / mx * 100
+        flag = f'<span class="flag">{_e(x.review)}</span>' if isinstance(x.review, str) and x.review else ""
+        rows.append(f'<tr><td><b>{_e(COUNTRY.get(x.country, x.country))}</b></td><td class="r">{x.units_13w:,.0f}</td>'
+                    f'<td class="r">{x.buy_qty:,}</td><td><div class="bb"><i class="p" style="width:{pw:.1f}%"></i>'
+                    f'<i class="d" style="width:{rw:.1f}%"></i></div></td><td class="r"><b>{x.pack_units:,}</b></td>'
+                    f'<td class="r">{x.reserve_units:,}</td><td class="r">{x.stores_ranged} of {x.stores_eligible}</td>'
+                    f'<td class="dim small">{_e(x.status)}{flag}</td></tr>')
+    ctab = ('<table class="pt"><tr><th>Country</th><th class="r">Forecast 13 wks</th><th class="r">Buy</th><th></th>'
+            '<th class="r">Opening pack</th><th class="r">Kept at DC</th><th class="r">Stores</th><th></th></tr>'
+            + "".join(rows) + "</table>")
+    sizes = sorted(ln["size"].unique(), key=_size_key) if len(ln) else []
+    keyset = set(ln.loc[ln["key_size"] == 1, "size"])
+    grid = ""
+    if len(ln):
+        cmax = max(int(ln["pack_qty"].max()), 1)
+        head = "".join(f'<th class="r">{_e(z)}{"<sup>●</sup>" if z in keyset else ""}</th>' for z in sizes)
+        body = []
+        st_ = (ln.groupby(["country", "store", "store_name", "grade"], dropna=False)
+                 .agg(share=("store_share", "max"), tot=("pack_qty", "sum")).reset_index())
+        st_["co"] = st_["country"].map(lambda k: list(cc.sort_values("units_13w", ascending=False)["country"]).index(k)
+                                       if k in set(cc["country"]) else 99)
+        q = ln.set_index(["store", "size"])["pack_qty"].to_dict()
+        for x in st_.sort_values(["co", "tot"], ascending=[True, False]).itertuples():
+            cells = "".join(
+                (lambda v: f'<td class="r q" style="background:rgba(38,88,242,{0.08 + 0.55 * v / cmax:.2f})">{v}</td>' if v
+                 else '<td class="r q z">·</td>')(int(q.get((x.store, z), 0))) for z in sizes)
+            body.append(f'<tr><td class="small dim">{_e(COUNTRY.get(x.country, x.country))}</td><td><b>{_e(_label(x.store_name))}</b>'
+                        f' <span class="dim small">{_e(x.store)}</span></td><td><span class="gr">{_e(x.grade)}</span></td>'
+                        f'<td class="r dim small">{x.share * 100:.0f}%</td>{cells}<td class="r"><b>{x.tot}</b></td></tr>')
+        grid = (f'<div class="gwrap"><table class="pt g"><tr><th></th><th>Store</th><th>Grade</th><th class="r">Share</th>{head}'
+                f'<th class="r">Total</th></tr>{"".join(body)}</table></div>')
+    p = pk.get("params", {})
+    how = [f"<b>Which stores:</b> full-price Nike stores that sell at least {p.get('min_store_share', 0.01) * 100:.0f}% of the "
+           "country's units in this division × gender (outlets, e-commerce and Converse stores do not take launches). "
+           "When the buy cannot dress every store with a full run, the best grades go first.",
+           "<b>Store share:</b> the store's share of the country's division × gender sales over the last 26 weeks.",
+           "<b>Sizes:</b> the country's size curve for this division × category × gender — the curve the live allocation uses.",
+           f"<b>Pack per store and size:</b> the larger of 1 per key size (●, so the full run is on display) and the units that "
+           f"cover {p.get('service', 0.8) * 100:.0f}% of the first {p.get('cover_weeks', 3)} weeks of demand.",
+           f"<b>Within the buy:</b> packs use at most {(1 - p.get('reserve_share', 0.4)) * 100:.0f}% of it — key sizes first, "
+           "then breadth before depth — and the rest stays at the DC to replenish what sells."]
+    nxt = ("Approved as planned unless flagged; a planner who changes a quantity sends it to their line manager with the reason. "
+           "When the stock is received at the DC the pack becomes the first allocation. From the first sale, DC replenishment and "
+           "store consolidation take over, and the forecast moves from look-alikes to the style's own sales (blended from week 4, "
+           "own sales only from week 8).")
+    warn = ('<span class="pill warm">Provisional · buy assumed = 13-week high case until the buy file arrives</span>'
+            if assumed else '<span class="pill ok">Buy from the buy file</span>')
+    return f"""<div class="sec"><h2><span class="n">6</span>Stores and opening pack</h2>
+      <div style="margin-bottom:8px">{warn}</div>
+      {ctab}<div class="legend"><i style="background:{c['accent']}"></i>opening pack<i style="background:{c['line']}"></i>kept at the DC</div>
+      <div class="sub" style="margin-top:14px">Opening pack by store and size ({unit})</div>{grid}
+      <div class="two" style="margin-top:12px"><ol>{''.join(f'<li>{x}</li>' for x in how)}</ol>
+        <div><div class="sub">What happens next</div><p class="dim">{nxt}</p></div></div></div>"""
+
+
 def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weights: pd.DataFrame, cty: pd.DataFrame,
-          wk: pd.DataFrame, bt: pd.DataFrame, mult: float | None, theme: str = "light") -> str:
+          wk: pd.DataFrame, bt: pd.DataFrame, mult: float | None, theme: str = "light", pack: dict | None = None) -> str:
     c = THEMES.get(theme, THEMES["light"])
     unit = "pairs" if str(r.get("division")).upper() == "FOOTWEAR" else "units"
     image_method = str(r.get("method")) == "image + attributes"
@@ -159,6 +237,18 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
     .chip {{ font-size:10.5px; border-radius:999px; padding:1px 7px; background:{c['bg']}; border:1px solid {c['line']}; color:{c['dim']}; }}
     .chip.img {{ border-color:{c['accent']}; color:{c['accent']}; }}
     ol {{ padding-left:20px; display:grid; gap:4px; }}
+    .pt {{ border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }}
+    .pt th {{ font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:{c['dim']}; font-weight:700; text-align:left;
+              padding:4px 6px; border-bottom:1px solid {c['line']}; white-space:nowrap; }}
+    .pt td {{ padding:4px 6px; border-bottom:1px solid {c['line']}; }} .pt .r {{ text-align:right; }}
+    .pt sup {{ color:{c['accent']}; font-size:8px; margin-left:2px; }}
+    .bb {{ display:flex; width:160px; height:10px; border-radius:3px; overflow:hidden; background:{c['card']}; }}
+    .bb i {{ display:block; height:100%; }} .bb .p {{ background:{c['accent']}; }} .bb .d {{ background:{c['line']}; }}
+    .flag {{ display:inline-block; margin-left:6px; border-radius:999px; padding:0 8px; background:{c['warm_soft']}; color:{c['warm']};
+             font-weight:700; font-size:11px; }}
+    .gwrap {{ overflow-x:auto; }} .g td.q {{ min-width:38px; color:{c['ink']}; font-weight:600; }}
+    .g td.z {{ color:{c['faint']}; font-weight:400; }}
+    .gr {{ font-size:11px; font-weight:700; border-radius:5px; padding:1px 6px; background:{c['accent_soft']}; color:{c['accent']}; }}
     """
     return f"""<html><head><meta charset="utf-8"><style>{css}</style></head><body>
     <div class="hd">
@@ -189,8 +279,12 @@ def build(r: dict, img: str | None, img_src: str | None, ana: pd.DataFrame, weig
       <div class="two"><ol>{''.join(f'<li>{x}</li>' for x in steps)}</ol><div>{spark}</div></div></div>
 
     <div class="sec"><h2><span class="n">5</span>How far to trust it</h2><ol>{''.join(f'<li>{x}</li>' for x in trust)}</ol></div>
+    {_pack_section(pack, unit, c)}
     </body></html>"""
 
 
 def render(*args, theme: str = "light", height: int = 2050, **kw):
+    pk = kw.get("pack")
+    if pk and pk.get("lines") is not None:
+        height += 430 + 31 * pk["lines"]["store"].nunique()
     components.html(build(*args, theme=theme, **kw), height=height, scrolling=True)
